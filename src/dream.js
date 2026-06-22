@@ -8,7 +8,9 @@
 //   ingest-harness  --file F [--prune]   harness -> db, memory_id-keyed, lossless (sync)
 //   verify-sync     --file F             hard gate: every harness id present in db (exit 3 if not)
 //   dream           [--advance-days N]   decay + auto-reactivate + evaporate + housekeeping (+journal)
-//   weave                                co-mention + vector links; GUARANTEES zero fact islands
+//   weave [--llm]                        co-mention + vector links; GUARANTEES zero fact islands
+//                                        (--llm adds typed entity extraction + alias canonicalization)
+//   reflect                              LLM judgment pass: salience tagging + semantic merge (needs DREAM_LLM)
 //   consolidate                          report duplicate-fact merge candidates (agent confirms)
 //   doctor                               health report; exit 3 if islands or dangling edges
 //   export-harness                       FACTS only, inject-ready, strongest first
@@ -28,6 +30,8 @@ const { embedTexts, embedOne, toVecBlob } = require("./embed");
 const { buildNodeText } = require("./graphtext");
 const ent = require("./entities");
 const { ensureSchema } = require("./schema");
+const { getLLM } = require("./llm");
+const judge = require("./judge");
 const cfg = require("../config");
 
 const DATA_DIR = cfg.DATA_DIR;
@@ -407,34 +411,94 @@ function dreamCore(db, flags) {
 }
 
 // ---- WEAVE: connect every fact (zero islands) -------------------------------
+// Build a forms-aware entity vocab: label-derived forms (formsFor) UNION any extra
+// surface forms stored on the hub node's text column (set by LLM/corpus extraction
+// and alias folding), so abbreviations and first-name aliases still match.
+function vocabWithForms(db) {
+  const rows = db.prepare("SELECT signature, text FROM nodes WHERE kind='entity'").all();
+  return rows.map((r) => {
+    const base = ent.formsFor(r.signature);
+    const extra = (r.text || "").split("|").map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 3);
+    return { sig: r.signature, type: ent.typeOf(r.signature), forms: [...new Set([...base, ...extra])] };
+  });
+}
+
+// Fold an alias entity hub into a canonical one: move its surface forms onto the
+// canonical hub, repoint its mention edges, then delete the alias node + vec row.
+function mergeEntityHub(db, canonicalSig, aliasSig) {
+  if (canonicalSig === aliasSig) return;
+  const can = db.prepare("SELECT id, text FROM nodes WHERE signature=? AND kind='entity'").get(canonicalSig);
+  const al = db.prepare("SELECT id, text FROM nodes WHERE signature=? AND kind='entity'").get(aliasSig);
+  if (!can || !al) return;
+  const forms = new Set([...(can.text || "").split("|"), ...(al.text || "").split("|"), ent.labelOf(aliasSig)]
+    .map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 3));
+  db.prepare("UPDATE nodes SET text=? WHERE id=?").run([...forms].join("|"), can.id);
+  // repoint mention edges dst alias -> canonical (dedup), drop self/dupes
+  for (const e of db.prepare("SELECT rowid, src, rel FROM edges WHERE dst=?").all(aliasSig)) {
+    const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel=? AND dst=?").get(e.src, e.rel, canonicalSig);
+    if (dup || e.src === canonicalSig) db.prepare("DELETE FROM edges WHERE rowid=?").run(e.rowid);
+    else db.prepare("UPDATE edges SET dst=? WHERE rowid=?").run(canonicalSig, e.rowid);
+  }
+  db.prepare("DELETE FROM edges WHERE src=?").run(aliasSig);
+  db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(al.id));
+  db.prepare("DELETE FROM nodes WHERE id=?").run(al.id);
+}
+
 async function weave(db, opts) {
   const now = (opts && opts.asOf) ? new Date(opts.asOf).toISOString() : new Date().toISOString();
   const K = (opts && opts.k) || 3;
   const SIM = (opts && opts.sim) || 0.45;
+  const llm = (opts && opts.llm) ? getLLM() : { available: false };
 
   // 1) entity vocab from existing entity hubs
-  let entityRows = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all();
-  let vocab = ent.buildVocab(entityRows);
+  let vocab = vocabWithForms(db);
 
   // 2) extract new entities from facts -> create hubs. SELF-BOOTSTRAPPING: the corpus
   //    extractor learns the entity vocabulary from recurrence (no seed/deny lists), so a
   //    candidate becomes a hub only if it recurs across facts (or has a strong email signal).
+  //    When an LLM is enabled it ADDS a typed read (catches single-name principals and
+  //    types orgs/places correctly); the two are unioned for best recall.
   const factRows = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact'").all();
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
   const corpusEnts = ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 });
+  let llmEnts = [];
+  if (llm.available) {
+    try { llmEnts = await judge.extractEntitiesLLM(factRows.map((f) => f.fact || ""), llm); }
+    catch (e) { process.stderr.write(`[weave] llm extract failed: ${e.message}\n`); }
+  }
+  const allEnts = new Map();
+  for (const e of [...corpusEnts, ...llmEnts]) {
+    if (!allEnts.has(e.sig)) allEnts.set(e.sig, { sig: e.sig, type: e.type, forms: new Set(e.forms) });
+    else e.forms.forEach((f) => allEnts.get(e.sig).forms.add(f));
+  }
   const tx1 = db.transaction(() => {
-    for (const e of corpusEnts) {
+    for (const e of allEnts.values()) {
       if (haveSig.has(e.sig)) continue;
       const id = nextId(db);
+      const formsStr = [...e.forms].filter((f) => f.length >= 3).join("|");
       db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", "");
+        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", formsStr);
       haveSig.add(e.sig); newHubs += 1;
     }
   });
   tx1();
-  entityRows = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all();
-  vocab = ent.buildVocab(entityRows);
+
+  // 2.5) CANONICALIZATION (LLM): fold alias hubs ("Jamie" -> "person:jamie-chen",
+  //      "SF" -> "place:san-francisco") into one canonical hub before linking.
+  let aliasesMerged = 0;
+  if (llm.available) {
+    const hubs = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all()
+      .map((r) => ({ sig: r.signature, label: ent.labelOf(r.signature) }));
+    let groups = [];
+    try { groups = await judge.canonicalizeLLM(hubs, llm); }
+    catch (e) { process.stderr.write(`[weave] llm canon failed: ${e.message}\n`); }
+    const tx = db.transaction(() => {
+      for (const g of groups) for (const a of g.aliases) { mergeEntityHub(db, g.canonical, a); aliasesMerged += 1; }
+    });
+    tx();
+  }
+  vocab = vocabWithForms(db);
 
   // 3) co-mention edges fact -> entity
   const hasEdge = db.prepare("SELECT 1 FROM edges WHERE src=? AND dst=? AND rel=?");
@@ -527,7 +591,87 @@ async function weave(db, opts) {
 
   repairGraph(db);
   const islands = [...db.prepare("SELECT signature FROM nodes WHERE kind='fact'").all().map((r) => r.signature)].filter((s) => !degreeMap(db).get(s));
-  return { new_entity_hubs: newHubs, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, rescued_islands: rescued, remaining_islands: islands.length };
+  return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, rescued_islands: rescued, remaining_islands: islands.length };
+}
+
+// ---- REFLECT: the LLM JUDGMENT pass (salience + semantic merge) -------------
+// The headline LLM stage of a nightly dream. Two judgments the engine can't make
+// mechanically:
+//   SALIENCE  — tag the genuinely important facts so they survive cap-eviction and
+//               decay slowly (importance != frequency).
+//   MERGE     — roll up near-duplicate/incremental clusters into one richer fact,
+//               so the bank stays under the entry cap by CONSOLIDATING rather than
+//               blindly evicting. This is what lifts long-horizon synthesis recall.
+// No-op (returns zeros) when no LLM is configured.
+async function reflect(db, opts) {
+  const now = (opts && opts.asOf) ? new Date(opts.asOf).toISOString() : new Date().toISOString();
+  const llm = getLLM();
+  if (!llm.available) return { llm: "none", note: "reflect requires DREAM_LLM; skipped", salient_tagged: 0, clusters_merged: 0, entries_reclaimed: 0 };
+
+  // SALIENCE: judge importance over facts not already salient.
+  let salientTagged = 0;
+  const candidates = db.prepare("SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'").all();
+  let flagged = new Set();
+  try { flagged = await judge.salienceLLM(candidates, llm); }
+  catch (e) { process.stderr.write(`[reflect] salience failed: ${e.message}\n`); }
+  const txS = db.transaction(() => {
+    for (const sig of flagged) {
+      db.prepare("UPDATE nodes SET class='salient', salience='decision', strength=? , last_reactivated=? WHERE signature=? AND kind='fact'")
+        .run(clamp01((db.prepare("SELECT strength FROM nodes WHERE signature=?").get(sig) || {}).strength + 0.05 || 0.9), now, sig);
+      salientTagged += 1;
+    }
+  });
+  txS();
+
+  // MERGE: get near-duplicate clusters, let the LLM decide + write the rollup, apply.
+  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0 });
+  const clusters = cons.clusters || [];
+  let decisions = [];
+  if (clusters.length) {
+    try { decisions = await judge.mergeClustersLLM(clusters, llm); }
+    catch (e) { process.stderr.write(`[reflect] merge failed: ${e.message}\n`); }
+  }
+  let clustersMerged = 0, reclaimed = 0;
+  const txM = db.transaction(() => {
+    for (const dec of decisions) {
+      if (!dec) continue;
+      const survivor = db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(dec.survivorSig);
+      if (!survivor) continue;
+      const members = dec.memberSigs.map((s) => db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(s)).filter(Boolean);
+      if (members.length < 2) continue;
+      // survivor inherits the consolidated text + the strongest signal in the cluster.
+      const maxStrength = Math.max(...members.map((m) => m.strength || 0));
+      const anySalient = members.some((m) => m.class === "salient");
+      const maxReacts = Math.max(...members.map((m) => m.reactivations || 0));
+      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=? WHERE id=?")
+        .run(dec.fact, dec.fact, anySalient ? "salient" : (survivor.class === "episodic" ? "semantic" : survivor.class),
+          anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survivor.id);
+      // re-embed survivor to its new text so retrieval matches the merged content
+      db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
+      // forget the other members; copy their mention edges onto the survivor first.
+      for (const m of members) {
+        if (m.id === survivor.id) continue;
+        for (const e of db.prepare("SELECT dst, rel, weight FROM edges WHERE src=? AND rel='mentions'").all(m.signature)) {
+          const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='mentions' AND dst=?").get(survivor.signature, e.dst);
+          if (!dup && survivor.signature !== e.dst) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "mentions", e.dst, e.weight, now, now);
+        }
+        db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(m.signature, m.memory_id || "", now, `merged into ${survivor.signature}`);
+        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
+        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(m.id));
+        db.prepare("DELETE FROM nodes WHERE id=?").run(m.id);
+        reclaimed += 1;
+      }
+      clustersMerged += 1;
+    }
+  });
+  txM();
+
+  // re-embed any survivor whose vec row we dropped, then re-weave to heal islands.
+  const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes)").all().map((r) => r.id);
+  if (missing.length) await reembed(db, missing);
+  await weave(db, { asOf: opts && opts.asOf, llm: false });
+  repairGraph(db);
+  return { llm: llm.label, salient_tagged: salientTagged, clusters_seen: clusters.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed };
 }
 
 // ---- CONSOLIDATE (report merge candidates; pressure-aware threshold) --------
@@ -694,7 +838,8 @@ async function main() {
     else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"]); gate = !r.complete; }
     else if (cmd === "verify-sync") { r = verifySync(db, flags.file); gate = !r.complete; }
     else if (cmd === "dream") r = dreamCore(db, flags);
-    else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || process.env.MEMORY_SUPERSEDE === "1" });
+    else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], llm: flags.llm === true || flags.llm === "true", supersede: flags.supersede === true || flags.supersede === "true" || process.env.MEMORY_SUPERSEDE === "1" });
+    else if (cmd === "reflect") r = await reflect(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
     else if (cmd === "consolidate") r = await consolidate(db, { sim: Number(flags.sim) || 0 });
     else if (cmd === "budget") r = await budget(db);
     else if (cmd === "doctor") { r = doctor(db); gate = !r.healthy; }
@@ -702,7 +847,7 @@ async function main() {
     else if (cmd === "record-projection") r = recordProjection(db, flags.file);
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
-    else { console.error("Usage: node lib/dream.js <init|migrate-model|ingest-harness|verify-sync|dream|weave|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats> [flags]"); process.exitCode = 2; return; }
+    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|dream|weave|reflect|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats> [flags]"); process.exitCode = 2; return; }
     console.log(JSON.stringify(r, null, 2));
     if (gate) process.exitCode = 3;
   } finally { db.close(); }

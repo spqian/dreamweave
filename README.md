@@ -26,6 +26,31 @@ package fixes both:
 
 The result is a small (~250-entry target), atomic, mostly-semantic, **fully connected** memory.
 
+### Optional: LLM judgment layer
+
+The engine runs fully on **local embeddings with zero API keys** — entity extraction is
+self-bootstrapping (recurrence + case evidence, no seed/deny lists), and the bank stays bounded by
+decay + deterministic eviction. That is the default, and it is portable and free.
+
+Set **`DREAM_LLM`** to a small/cheap model spec to add a *judgment* layer a regex can't do — the same
+role a person's sleeping brain plays, deciding what matters and what to fold together:
+
+```
+export DREAM_LLM=azure:gpt-5.4-mini     # or openai:gpt-4o-mini, anthropic:claude-...
+```
+
+- **Typed extraction + canonicalization** (`weave --llm`) — reads the real subjects of each fact,
+  types them correctly (person/org/place/project/system), catches single-name principals, and folds
+  aliases ("Jamie" → `person:jamie-chen`, "SF" → `place:san-francisco`) into one hub.
+- **`reflect`** — the nightly judgment pass: **salience** (score each fact 0–2; only the rare critical
+  ones are tagged to survive eviction and decay slowly — importance, not frequency) and **semantic
+  merge** (roll up near-duplicate clusters into one richer fact, so the bank stays under cap by
+  *consolidating* rather than blindly evicting).
+
+The model is a **judge, not an author**: it never invents facts, only decides types, aliases, merges,
+and importance over content the engine already holds. A mini model is the right tool. Every stage
+degrades gracefully — no key, no problem; the mechanical path still runs.
+
 ---
 
 ## Architecture (one minute)
@@ -43,11 +68,11 @@ The result is a small (~250-entry target), atomic, mostly-semantic, **fully conn
 
 ```
   your agent's memories  ──dump──▶  snapshot.json
-                                       │ ingest
-                                       ▼
-                                  memory.db  ──dream / weave / consolidate──▶  memory.db
-                                       │ export-harness (diff)
-                                       ▼
+                                      │ ingest
+                                      ▼
+                                 memory.db  ──dream / weave / reflect / consolidate──▶  memory.db
+                                      │ export-harness (diff)
+                                      ▼
                           add/remove memories in the agent
 ```
 
@@ -102,25 +127,28 @@ Run these in order (the **`dream`** skill orchestrates them with the host's memo
 #    category ∈ decision (salient) | fact (semantic) | context (episodic) | preference
 
 # 2. INGEST + verify (lossless, memory_id-keyed)
-node lib/dream.js ingest-harness --file snapshot.json
-node lib/dream.js verify-sync   --file snapshot.json   # exit 3 if any memory is missing
+node src/dream.js ingest-harness --file snapshot.json
+node src/dream.js verify-sync   --file snapshot.json   # exit 3 if any memory is missing
 
 # 3. CONSOLIDATE: decay, reactivate, evaporate, housekeeping
-node lib/dream.js dream
-node lib/dream.js consolidate         # reports merge candidates (agent confirms)
+node src/dream.js dream
+node src/dream.js consolidate         # reports merge candidates (agent confirms)
 
 # 4. WEAVE: connect every fact (guarantees zero islands)
-node lib/dream.js weave
-node lib/dream.js doctor              # health gate: exit 3 on islands/dangling edges
+node src/dream.js weave               # add --llm for typed extraction + alias canonicalization
+node src/dream.js doctor              # health gate: exit 3 on islands/dangling edges
+
+# 4b. REFLECT (optional, needs DREAM_LLM): salience tagging + semantic merge
+node src/dream.js reflect
 
 # 5. PROJECT: export the curated facts back to the agent's bank (apply the diff)
-node lib/dream.js export-harness
+node src/dream.js export-harness
 
 # 6. VIZ
-node lib/dream.js export-viz          # renders $MEMORY_VIZ
+node src/dream.js export-viz          # renders $MEMORY_VIZ
 ```
 
-Helpers: `node lib/dream.js stats` · `budget` (entry-count pressure + forecast) · `init` (just create
+Helpers: `node src/dream.js stats` · `budget` (entry-count pressure + forecast) · `init` (just create
 the db).
 
 See **`skills/dream/SKILL.md`** for the full algorithm (strength model, schema-accelerated

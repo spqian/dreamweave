@@ -116,6 +116,15 @@ export function createAgentMemoryAdapter(rawCfg) {
   const maxHops = cfg.maxHops || 2;
   const runDream = cfg.runDream !== false; // default TRUE — dream runs once per ingested day
   const toolsDir = cfg.toolsDir || null;   // dir of Pass-3 day-XXXX.yaml memorySave files
+  // DREAM JUDGMENT (LLM): the model the engine itself uses for typed entity extraction,
+  // alias canonicalization (weave --llm), and the reflect pass (salience + semantic
+  // merge). A provider spec like "azure:gpt-5.4-mini". Empty => mechanical-only engine
+  // (regex entities, no merge/salience) — the no-LLM fallback path.
+  const dreamModel = cfg.dreamModel || "";
+  // How often to run the expensive reflect pass: "daily" (faithful nightly cadence) or
+  // "finalize" (once at the end — cheaper for long sweeps). Default daily when an LLM
+  // is configured. weave --llm runs every night regardless (entity typing is cheap).
+  const reflectCadence = cfg.reflectCadence || "daily";
   // FAITHFUL to Scout's native harness: a hard cap of 500 entries (degrades past 250).
   // The nightly dream enforces this deterministically (decay + hard-ceiling eviction), so
   // recall is over the SAME bounded surface Scout actually has — not an infinite store.
@@ -137,6 +146,7 @@ export function createAgentMemoryAdapter(rawCfg) {
       dataDir = await mkdtemp(path.join(tmpdir(), "am-bench-"));
       envExtra = { MEMORY_ENTRY_TARGET: entryTarget, MEMORY_ENTRY_MAX: entryMax };
       if (supersede) envExtra.MEMORY_SUPERSEDE = "1";
+      if (dreamModel) envExtra.DREAM_LLM = dreamModel; // engine LLM judgment uses the same .env keys as the judge
     },
 
     async ingestDay(day, content, metadata) {
@@ -158,14 +168,23 @@ export function createAgentMemoryAdapter(rawCfg) {
         const da = ["dream"]; if (asOf) da.push("--as-of", asOf);
         await engine("dream.js", da);
       }
-      const wa = ["weave"]; if (asOf) wa.push("--as-of", asOf);
+      const wa = ["weave"]; if (dreamModel) wa.push("--llm"); if (asOf) wa.push("--as-of", asOf);
       await engine("dream.js", wa);
+      // Nightly LLM judgment (salience + semantic merge) — the faithful dream cadence.
+      if (dreamModel && reflectCadence === "daily") {
+        const ra = ["reflect"]; if (asOf) ra.push("--as-of", asOf);
+        await engine("dream.js", ra);
+      }
     },
 
     async finalizeIngestion() {
       // Days were woven nightly; a final idempotent weave covers any tail state
       // when the harness finalizes between incremental checkpoints.
-      await engine("dream.js", ["weave"]);
+      const wa = ["weave"]; if (dreamModel) wa.push("--llm");
+      await engine("dream.js", wa);
+      if (dreamModel && reflectCadence === "finalize") {
+        await engine("dream.js", ["reflect"]);
+      }
     },
 
     async query(question) {
