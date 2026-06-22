@@ -161,17 +161,30 @@ The tool does 1 + 2 (so islands never persist); the agent does 3.
    db reflects the merge. Bounded: ≤~30 forgets/run, one cluster at a time, remember-before-forget. **Run
    `dream.js budget` first** to see pressure and how many entries to reclaim this run.
 
-5. **WEAVE (connect every fact — the keystone).** `dream.js weave`.
-   Extracts entities from fact text (subject-verb names, email-bound names, and **collaborator/list patterns**
-   like "with X and Y" or parenthetical "(A, B, C)") and creates missing hubs; adds `mentions` (co-mention),
-   corroborated `related_to`, and low-confidence `similar_to` edges; force-links any straggler (as `similar_to`)
-   to its nearest fact. *Invariant: ZERO fact islands.* The **agent then** canonicalizes/merges entities,
-   retypes `similar_to` suggestions into real edges or drops them, writes a few **bridge facts** for relationships
-   whose endpoints share no tokens, and rewrites fact prose to name its neighbors (via `m_remember`/`m_forget`).
+5. **WEAVE (connect every fact — the keystone).** `dream.js weave` (add `--llm` for the typed pass).
+   Extraction is **self-bootstrapping**: it learns the entity vocabulary from the corpus itself — a wide net over
+   capitalized names, made precise by a grammatical stoplist and a **case-evidence filter** (a token also seen
+   lowercase is an ordinary word, not a name) plus a **recurrence gate** (a name must appear in ≥2 facts, or carry an
+   email binding, to become a hub). NO seed/deny lists, so it ports to any domain. It then adds `mentions`
+   (co-mention), corroborated `related_to`, and low-confidence `similar_to` edges; force-links any straggler (as
+   `similar_to`) to its nearest fact. *Invariant: ZERO fact islands.* With **`weave --llm`** (when `DREAM_LLM` is
+   set) the engine also runs a typed entity read (person/org/place/project/system — catches single-name principals)
+   and **canonicalizes aliases** ("Jamie" → `person:jamie-chen`, "SF" → `place:san-francisco`) into one hub. The
+   **agent then** retypes `similar_to` suggestions, writes a few **bridge facts**, and rewrites fact prose to name
+   its neighbors (via `m_remember`/`m_forget`).
    **Salience elevation (agent):** while reviewing facts here, mark any with genuine high-stakes content
    (Sev1/2, security, exec/architectural decision, major customer/business impact) as **salient** — re-`m_remember`
    them with `category: decision` so they re-ingest as salient (365-day half-life, never aggressively faded). This
    is the ONLY route to salient; the tool never auto-promotes by frequency.
+
+5b. **REFLECT (optional automated judgment — `DREAM_LLM` required).** `dream.js reflect` automates the agent's
+   stage-4 merge and stage-5 salience using a small/cheap LLM (e.g. `azure:gpt-5.4-mini`), for **headless/server**
+   runs where no agent is in the loop. It (a) **scores salience 0–2** and tags only the rare critical facts (capped
+   at a fraction of the bank, so protection stays meaningful — importance, not frequency), and (b) **merges**
+   near-duplicate clusters: the LLM writes one consolidated fact, the survivor is flagged `gist`, constituents are
+   tombstoned with their edges copied over, then the engine re-embeds + re-weaves to stay island-free. The model is
+   a **judge, not an author** — it never invents facts, only decides types/aliases/merges/importance over content
+   the engine already holds. With no `DREAM_LLM`, `reflect` is a no-op and the manual agent stages 4–5 apply.
 
 6. **DOCTOR (health gate).** `dream.js doctor` — exits 3 if any fact island or dangling edge remains. Must be
    clean before projecting.
