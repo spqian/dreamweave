@@ -1,42 +1,30 @@
 "use strict";
 
-// Entity layer for the dream weave: builds an entity vocabulary (with aliases),
-// extracts entities from fact text, and computes co-mention links fact -> entity.
-// High precision by design: matches existing entity hubs + email-bound persons + IDs.
-// The vector layer (in dream.js) guarantees connectivity for anything this misses.
+// Entity layer for the dream weave. SELF-BOOTSTRAPPING: it learns the entity
+// vocabulary from the data (recurrence + email bindings) with NO seed lists or
+// domain denylists, so it works in any domain. extractEntitiesCorpus() is the
+// primary path (frequency-gated); the per-fact extractEntities() is the building
+// block. The vector layer (in dream.js) guarantees connectivity for anything missed.
 
 const ENTITY_PREFIXES = [
   "person", "team", "org", "system", "topic", "incident", "release",
-  "pr", "msrc", "heuristic", "artifact", "decision", "thread",
+  "ref", "artifact", "decision", "thread", "project",
 ];
 
-// Capitalized bigrams that are NOT people — common product/org/phrase forms that
-// the "First Last" heuristic would otherwise misread as names. Keep this generic;
-// add domain-specific terms via the MEMORY_NON_PERSON env (comma-separated) if needed.
-const NON_PERSON = new Set([
-  "machine learning", "data science", "open source", "pull request", "code review",
-  "unit test", "design doc", "status update", "action item", "root cause",
-  "north america", "south america", "united states", "new york", "san francisco",
-  "human resources", "customer success", "product management", "engineering team",
-  "board meeting", "quarterly review", "annual report", "fiscal year",
-  ...String(process.env.MEMORY_NON_PERSON || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
-]);
-
-// Single tokens that are never a person's name (so e.g. "Pipeline Actions",
-// "Orchestration Team" are rejected). Generic, role/structure words.
-const NON_NAME_WORDS = new Set([
-  "team", "teams", "project", "projects", "action", "actions", "pipeline", "orchestration",
-  "product", "review", "summer", "winter", "spring", "fall", "company", "group", "division",
-  "release", "service", "services", "security", "operations", "shared", "platform", "system",
-  "engineering", "manager", "managers", "director", "lead", "report", "reports", "meeting",
-  "north", "south", "east", "west", "central", "the", "and", "with", "from", "for",
-  ...String(process.env.MEMORY_NON_NAME_WORDS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+// A candidate "First Last" is promoted to a person hub only if it RECURS across
+// multiple facts (see extractEntitiesCorpus) — real entities recur, one-off
+// capitalized phrases don't. So there is NO domain denylist. The only filter here
+// is a tiny GRAMMATICAL stoplist (function words that can't be a name), which is
+// language-structural, not domain-specific.
+const GRAMMATICAL = new Set([
+  "the", "a", "an", "and", "or", "but", "with", "from", "for", "to", "of", "in",
+  "on", "at", "by", "as", "is", "was", "were", "are", "be", "this", "that", "these",
+  "those", "it", "its", "we", "our", "they", "their", "i", "my", "he", "she", "his", "her",
 ]);
 
 const isLikelyName = (a, b) => {
   const x = a.toLowerCase(); const y = b.toLowerCase();
-  if (NON_NAME_WORDS.has(x) || NON_NAME_WORDS.has(y)) return false;
-  if (NON_PERSON.has(`${x} ${y}`)) return false;
+  if (GRAMMATICAL.has(x) || GRAMMATICAL.has(y)) return false;
   return a.length >= 2 && b.length >= 2;
 };
 
@@ -132,16 +120,14 @@ function extractEntities(fact) {
   const pairRe = /\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\s+and\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)\b/g;
   while ((m = pairRe.exec(text))) { addPerson(m[1], m[2]); addPerson(m[3], m[4]); }
 
-  // IDs.
+  // IDs: only universal/structural patterns (no domain-specific ones). Hash-style ids
+  // and issue refs like "#1234" recur and are safe; domain incident schemes are not baked in.
   const addId = (re, type) => {
     let mm; const r = new RegExp(re, "g");
     while ((mm = r.exec(text))) out.push({ sig: `${type}:${mm[1]}`.toLowerCase(), type, forms: [mm[1].toLowerCase()] });
   };
-  addId("incident\\s+(\\d{6,})", "incident");
-  addId("\\bIcM#?(\\d{6,})", "incident");
-  addId("\\bMSRC\\s*(\\d{4,})", "msrc");
-  addId("\\bPR\\s*(\\d{6,})", "pr");
-  addId("\\b(\\d{9})\\b", "incident"); // bare 9-digit = incident id in this domain
+  addId("(?:issue|ticket|bug|pr)\\s*#?(\\d{2,})", "ref");
+  addId("#(\\d{2,})", "ref");
 
   // dedup by sig
   const seen = new Map();
@@ -150,6 +136,83 @@ function extractEntities(fact) {
     else seen.get(e.sig).forms = [...new Set([...seen.get(e.sig).forms, ...e.forms])];
   }
   return [...seen.values()];
+}
+
+// SELF-BOOTSTRAPPING corpus extraction (no seed lists). Runs over ALL facts and
+// promotes a candidate person to an entity hub only if it RECURS — appears in at
+// least `minFacts` distinct facts — OR carries a strong single-occurrence signal
+// (an email binding). This learns the entity vocabulary from the data itself, so it
+// works in any domain with zero configuration. One-off capitalized phrases (a product
+// name mentioned once, "Board Meeting", etc.) never become hubs; recurring subjects do.
+//   facts: array of fact-text strings
+//   opts.minFacts: recurrence threshold (default 2)
+function extractEntitiesCorpus(facts, opts = {}) {
+  const minFacts = Math.max(1, Number(opts.minFacts || process.env.MEMORY_ENTITY_MIN_FACTS || 2));
+  const cand = new Map();    // sig -> { sig, type, forms:Set, facts:Set<idx> }
+  const strong = new Set();  // sigs with an email binding (promote at count 1)
+
+  // CASE-EVIDENCE (self-bootstrapping, no word lists): a token that the corpus also
+  // writes in lowercase is an ordinary word ("current", "board", "project"), not a
+  // name part — so capitalized-only-at-sentence-start false positives ("Current
+  // Condor", "For Condor") are rejected without any hand-curated denylist. We learn
+  // this purely from the corpus's own casing.
+  const lower = new Map(), upper = new Map();
+  for (const fact of facts) {
+    const text = fact || "";
+    for (const w of text.match(/[A-Za-z][a-z]{2,}/g) || []) {
+      const k = w.toLowerCase();
+      if (w[0] === w[0].toUpperCase()) upper.set(k, (upper.get(k) || 0) + 1);
+      else lower.set(k, (lower.get(k) || 0) + 1);
+    }
+  }
+  // A token is a "common word" (disqualified as a name part) if it appears lowercase
+  // at least as often as it appears capitalized.
+  const isCommonWord = (w) => {
+    const k = w.toLowerCase();
+    const lo = lower.get(k) || 0, up = upper.get(k) || 0;
+    return lo >= Math.max(1, up);
+  };
+  const isNamePart = (a, b) =>
+    isLikelyName(a, b) && !isCommonWord(a) && !isCommonWord(b);
+
+  const note = (e, idx, isStrong) => {
+    if (!cand.has(e.sig)) cand.set(e.sig, { sig: e.sig, type: e.type, forms: new Set(), facts: new Set() });
+    const c = cand.get(e.sig);
+    e.forms.forEach((f) => c.forms.add(f));
+    c.facts.add(idx);
+    if (isStrong) strong.add(e.sig);
+  };
+  facts.forEach((fact, idx) => {
+    const text = fact || "";
+    // strong signal: email-bound person
+    const emailSigs = new Set();
+    let m; const emailRe = /([A-Z][a-z]+)\s+([A-Z][a-z]+)\s*[(<]([a-z0-9._-]+)@/g;
+    while ((m = emailRe.exec(text))) {
+      if (!isLikelyName(m[1], m[2])) continue;
+      const sig = `person:${slug(`${m[1]} ${m[2]}`)}`;
+      emailSigs.add(sig);
+      note({ sig, type: "person", forms: [normalize(`${m[1]} ${m[2]}`), m[1].toLowerCase(), m[2].toLowerCase(), m[3].toLowerCase()] }, idx, true);
+    }
+    // high-precision syntactic-frame extractions (email/verb/list positions)
+    for (const e of extractEntities(text)) {
+      note(e, idx, strong.has(e.sig) || emailSigs.has(e.sig));
+    }
+    // WIDE NET: every capitalized bigram is a weak person candidate. Precision comes
+    // from the case-evidence filter above + the recurrence gate below, not from lists.
+    const bigramRe = /\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b/g;
+    while ((m = bigramRe.exec(text))) {
+      if (!isNamePart(m[1], m[2])) continue;
+      const sig = `person:${slug(`${m[1]} ${m[2]}`)}`;
+      note({ sig, type: "person", forms: [normalize(`${m[1]} ${m[2]}`), m[1].toLowerCase(), m[2].toLowerCase()] }, idx, false);
+    }
+  });
+  const out = [];
+  for (const c of cand.values()) {
+    if (strong.has(c.sig) || c.facts.size >= minFacts || c.type === "ref") {
+      out.push({ sig: c.sig, type: c.type, forms: [...c.forms].filter((f) => f.length >= 3) });
+    }
+  }
+  return out;
 }
 
 // Co-mention: which vocab entities appear in a fact's text (word-boundary, case-insensitive).
@@ -164,5 +227,5 @@ function coMentions(factText, vocab) {
   return [...new Set(hits)];
 }
 
-module.exports = { ENTITY_PREFIXES, buildVocab, extractEntities, coMentions, formsFor, typeOf, labelOf, normalize, slug };
+module.exports = { ENTITY_PREFIXES, buildVocab, extractEntities, extractEntitiesCorpus, coMentions, formsFor, typeOf, labelOf, normalize, slug };
 

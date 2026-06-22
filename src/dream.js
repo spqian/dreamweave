@@ -416,19 +416,20 @@ async function weave(db, opts) {
   let entityRows = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all();
   let vocab = ent.buildVocab(entityRows);
 
-  // 2) extract new entities from facts -> create hubs
+  // 2) extract new entities from facts -> create hubs. SELF-BOOTSTRAPPING: the corpus
+  //    extractor learns the entity vocabulary from recurrence (no seed/deny lists), so a
+  //    candidate becomes a hub only if it recurs across facts (or has a strong email signal).
   const factRows = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact'").all();
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
+  const corpusEnts = ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 });
   const tx1 = db.transaction(() => {
-    for (const f of factRows) {
-      for (const e of ent.extractEntities(f.fact || "")) {
-        if (haveSig.has(e.sig)) continue;
-        const id = nextId(db);
-        db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-          VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", "");
-        haveSig.add(e.sig); newHubs += 1;
-      }
+    for (const e of corpusEnts) {
+      if (haveSig.has(e.sig)) continue;
+      const id = nextId(db);
+      db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
+        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", "");
+      haveSig.add(e.sig); newHubs += 1;
     }
   });
   tx1();
