@@ -90,34 +90,24 @@ function extractFacts(content, day) {
   return facts;
 }
 
-// Render retrieved memories for the synthesizer with the temporal structure intact:
-// a timeless GIST block (schema facts, no date) followed by an EPISODIC TIMELINE in
-// chronological order (oldest -> newest), each episode carrying its coarse relative
-// age. List position is the temporal axis the answering model reads "when/latest" from.
+// Render retrieved memories for the synthesizer. RELEVANCE ORDER IS PRIMARY: the
+// cluster already arrives ranked by hop-proximity then strength, and reordering it by
+// time (an earlier experiment) starved pointed factual/synthesis questions of their
+// best evidence. So we KEEP the relevance order and merely ANNOTATE each line with its
+// coarse relative age (and date) — the temporal key as metadata, not as a reordering.
+// Gist (timeless schema) facts are marked as such; everything else carries its age.
 function buildContext(out) {
   let cluster;
   try { cluster = JSON.parse(out); } catch { return "(retrieval failed)"; }
   const nodes = (cluster && cluster.cluster && cluster.cluster.nodes) || [];
-  const facts = nodes.filter((n) => n.kind === "fact" && n.fact);
+  const facts = nodes.filter((n) => n.kind === "fact" && n.fact).slice(0, 30);
   if (!facts.length) return "(no memories matched)";
-  const gist = facts.filter((n) => n.tier === "gist").slice(0, 14);
-  const episodic = facts.filter((n) => n.tier !== "gist")
-    .sort((a, b) => (b.age_days == null ? -1 : a.age_days == null ? 1 : b.age_days - a.age_days)) // oldest first
-    .slice(-22);
-  const lines = [];
-  if (gist.length) {
-    lines.push("Standing facts (no single date):");
-    for (const n of gist) lines.push(`- ${n.fact}`);
-  }
-  if (episodic.length) {
-    if (gist.length) lines.push("");
-    lines.push("Timeline (oldest first, newest last):");
-    for (const n of episodic) {
-      const date = n.first_seen ? n.first_seen.slice(0, 10) : "";
-      lines.push(`- [${n.age}${date ? ", " + date : ""}] ${n.fact}`);
-    }
-  }
-  return lines.join("\n");
+  return facts.map((n) => {
+    if (n.tier === "gist") return `- [standing fact] ${n.fact}`;
+    const date = n.first_seen ? n.first_seen.slice(0, 10) : "";
+    const tag = n.age ? `${n.age}${date ? ", " + date : ""}` : (date || "undated");
+    return `- [${tag}] ${n.fact}`;
+  }).join("\n");
 }
 
 export function createAgentMemoryAdapter(rawCfg) {
@@ -215,11 +205,11 @@ export function createAgentMemoryAdapter(rawCfg) {
       const out = await engine("recall.js", qa);
       const ctx = buildContext(out);
       const sys = "You answer questions about a person's history using ONLY the retrieved memory snippets below. "
-        + "The snippets are organized as timeless standing facts plus a TIMELINE ordered oldest-first to newest-last; "
-        + "each timeline item is tagged with how long ago it was noted (e.g. 'this week', 'a couple months ago'). "
-        + "Use that ordering to resolve questions about WHEN something happened or which value is the LATEST — the most "
-        + "recent relevant timeline item wins. If the memories do not contain the answer, reply that you have no record "
-        + "of it — do not guess. Be concise and specific; cite concrete details from the memories.";
+        + "Each snippet is prefixed with how long ago it was noted (e.g. '[this week, 2026-06-20]' or '[a couple "
+        + "months ago, ...]'); '[standing fact]' marks a timeless policy with no single date. The snippets are ordered "
+        + "by relevance, not time. When a question asks WHEN something happened or which value is the LATEST, compare "
+        + "the age tags and prefer the most recent relevant snippet. If the memories do not contain the answer, reply "
+        + "that you have no record of it — do not guess. Be concise and specific; cite concrete details.";
         + "Be concise and specific; cite concrete details from the memories.";
       const user = `Retrieved memories:\n${ctx}\n\nQuestion: ${question}\n\nAnswer:`;
       const ans = await model.complete(sys, user, {});
