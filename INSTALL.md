@@ -4,9 +4,9 @@ There is **no skill marketplace / redistribution mechanism for Scout yet**, and 
 normally just markdown. This package is heavier — it ships a Node engine plus a native vector store —
 so installation is a manual unzip + one-time setup. ~5 minutes.
 
-> Heads-up: this is a community/personal package, **not** a first-party Scout feature. It runs a local
+> Heads-up: this is a community/personal package, **not** a first-party agent feature. It runs a local
 > Node process and downloads a small embedding model on first run (see the dependency note in
-> `docs/memora-graph-memory-proposal.md`). Review before using on sensitive machines.
+> the README). Review before using on sensitive machines.
 
 ## Prerequisites
 

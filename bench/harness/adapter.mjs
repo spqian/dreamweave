@@ -128,7 +128,7 @@ export function createAgentMemoryAdapter(rawCfg) {
   // FAITHFUL to Scout's native harness: a hard cap of 500 entries (degrades past 250).
   // The nightly dream enforces this deterministically (decay + hard-ceiling eviction), so
   // recall is over the SAME bounded surface Scout actually has — not an infinite store.
-  // Override to a large number ONLY for the aspirational "Memora-style unbounded" experiment.
+  // Override to a large number ONLY for the aspirational "unbounded store" experiment.
   const entryTarget = String(cfg.entryTarget || 250);
   const entryMax = String(cfg.entryMax || 500);
   const supersede = cfg.supersede === true; // opt-in supersede-aware consolidation
