@@ -1,0 +1,39 @@
+{
+  "name": "dream-memory",
+  "version": "0.1.0",
+  "description": "Graph + vector long-term memory for AI agents with a nightly 'dream' consolidation pass (forgetting curve, merge, entity weave, supersede-aware corrections) over a local SQLite + sqlite-vec store. Includes a 3D semantic-nebula explorer and a Recall Bench harness.",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "dream-memory": "src/dream.js"
+  },
+  "scripts": {
+    "setup": "node setup.js",
+    "dream": "node src/dream.js dream",
+    "recall": "node src/recall.js",
+    "doctor": "node src/dream.js doctor",
+    "stats": "node src/dream.js stats",
+    "budget": "node src/dream.js budget",
+    "viz": "node src/dream.js export-viz",
+    "test": "node test/smoke.mjs"
+  },
+  "keywords": [
+    "agent-memory",
+    "long-term-memory",
+    "knowledge-graph",
+    "vector-search",
+    "sqlite-vec",
+    "memory-consolidation",
+    "forgetting-curve",
+    "embeddings",
+    "llm"
+  ],
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "better-sqlite3": "^12.10.0",
+    "sqlite-vec": "^0.1.9"
+  }
+}

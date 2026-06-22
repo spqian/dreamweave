@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# per-user runtime data (db, model cache, rendered viz) — never commit
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# transformers.js model cache if placed locally
+model-cache/
+.hf-cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
