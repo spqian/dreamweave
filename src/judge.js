@@ -83,25 +83,33 @@ async function canonicalizeLLM(hubs, llm, opts = {}) {
 // model decides which to roll up and WRITES the single consolidated fact that names
 // every neighbor — fewer, richer entries instead of blind eviction. This is what
 // lifts long-horizon cross-reference/synthesis recall under the hard entry cap.
+// Clusters are BATCHED per call (fewer round-trips over a long nightly cadence).
 async function mergeClustersLLM(clusters, llm, opts = {}) {
   if (!llm || !llm.available || !clusters.length) return [];
+  const batch = Math.max(1, opts.batch || 6);
   const sys = "You are consolidating a personal long-term memory under a strict entry budget. "
-    + "Each input cluster is a set of memory facts that look related. For each cluster, decide if they should be MERGED into one. "
-    + "Merge ONLY facts that are about the same subject and are redundant, incremental, or a correction sequence — then write ONE consolidated fact that preserves every distinct, still-true detail and names all the specifics. "
-    + "If a cluster mixes unrelated subjects, do NOT merge it. Prefer keeping the LATEST value when facts conflict, but retain the prior value as historical context if it aids recall. "
-    + 'Respond with JSON only: an array aligned to the input, each {"merge": boolean, "fact": "<consolidated fact if merge>", "keep_strongest": <1-based index of the member whose identity/id to preserve>}.';
-  const out = [];
-  // one call per cluster keeps prompts small and decisions clean for a mini model
-  for (const cl of clusters) {
-    const members = cl.map((m) => m.fact || "");
-    const user = "Cluster members:\n" + members.map((m, k) => `${k + 1}. ${m}`).join("\n")
-      + '\n\nReturn JSON: {"merge":true|false,"fact":"...","keep_strongest":N}';
-    let dec;
-    try { dec = await llm.json(sys, user, { maxTokens: 1200 }); } catch { dec = null; }
-    if (!dec || dec.merge !== true || typeof dec.fact !== "string" || dec.fact.trim().length < 8) { out.push(null); continue; }
-    let keepIdx = Number(dec.keep_strongest);
-    if (!Number.isFinite(keepIdx) || keepIdx < 1 || keepIdx > cl.length) keepIdx = 1;
-    out.push({ fact: dec.fact.trim(), survivorSig: cl[keepIdx - 1].sig, memberSigs: cl.map((m) => m.sig) });
+    + "You are given several CLUSTERS of facts that look related. For EACH cluster, decide if its facts should be MERGED into one. "
+    + "Merge ONLY facts about the same subject that are redundant, incremental, or a correction sequence — then write ONE consolidated fact that preserves every distinct, still-true detail and names all the specifics. "
+    + "If a cluster mixes unrelated subjects, do NOT merge it. Prefer the LATEST value when facts conflict, but retain the prior value as historical context if it aids recall. "
+    + 'Respond with JSON only: an array with one object per cluster, {"cluster": <1-based cluster number>, "merge": boolean, "fact": "<consolidated fact if merge>", "keep_strongest": <1-based member index whose identity to preserve>}.';
+  const out = new Array(clusters.length).fill(null);
+  for (let i = 0; i < clusters.length; i += batch) {
+    const chunk = clusters.slice(i, i + batch);
+    const user = chunk.map((cl, c) =>
+      `Cluster ${c + 1}:\n` + cl.map((m, k) => `  ${k + 1}. ${m.fact || ""}`).join("\n")
+    ).join("\n\n") + '\n\nReturn JSON: [{"cluster":N,"merge":true|false,"fact":"...","keep_strongest":M}]';
+    let arr;
+    try { arr = await llm.json(sys, user, { maxTokens: 2500 }); } catch { arr = null; }
+    if (!Array.isArray(arr)) continue;
+    for (const dec of arr) {
+      const cNum = Number(dec && dec.cluster);
+      if (!Number.isInteger(cNum) || cNum < 1 || cNum > chunk.length) continue;
+      const cl = chunk[cNum - 1];
+      if (!dec || dec.merge !== true || typeof dec.fact !== "string" || dec.fact.trim().length < 8) continue;
+      let keepIdx = Number(dec.keep_strongest);
+      if (!Number.isFinite(keepIdx) || keepIdx < 1 || keepIdx > cl.length) keepIdx = 1;
+      out[i + cNum - 1] = { fact: dec.fact.trim(), survivorSig: cl[keepIdx - 1].sig, memberSigs: cl.map((m) => m.sig) };
+    }
   }
   return out;
 }

@@ -90,14 +90,34 @@ function extractFacts(content, day) {
   return facts;
 }
 
+// Render retrieved memories for the synthesizer with the temporal structure intact:
+// a timeless GIST block (schema facts, no date) followed by an EPISODIC TIMELINE in
+// chronological order (oldest -> newest), each episode carrying its coarse relative
+// age. List position is the temporal axis the answering model reads "when/latest" from.
 function buildContext(out) {
   let cluster;
   try { cluster = JSON.parse(out); } catch { return "(retrieval failed)"; }
   const nodes = (cluster && cluster.cluster && cluster.cluster.nodes) || [];
-  const facts = nodes.filter((n) => n.kind === "fact" && n.fact).slice(0, 30);
+  const facts = nodes.filter((n) => n.kind === "fact" && n.fact);
   if (!facts.length) return "(no memories matched)";
-  // Order by hop proximity then strength; label hop distance for the synthesizer.
-  return facts.map((n) => `- (${n.class}, hop ${n.hops}) ${n.fact}`).join("\n");
+  const gist = facts.filter((n) => n.tier === "gist").slice(0, 14);
+  const episodic = facts.filter((n) => n.tier !== "gist")
+    .sort((a, b) => (b.age_days == null ? -1 : a.age_days == null ? 1 : b.age_days - a.age_days)) // oldest first
+    .slice(-22);
+  const lines = [];
+  if (gist.length) {
+    lines.push("Standing facts (no single date):");
+    for (const n of gist) lines.push(`- ${n.fact}`);
+  }
+  if (episodic.length) {
+    if (gist.length) lines.push("");
+    lines.push("Timeline (oldest first, newest last):");
+    for (const n of episodic) {
+      const date = n.first_seen ? n.first_seen.slice(0, 10) : "";
+      lines.push(`- [${n.age}${date ? ", " + date : ""}] ${n.fact}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 export function createAgentMemoryAdapter(rawCfg) {
@@ -134,6 +154,7 @@ export function createAgentMemoryAdapter(rawCfg) {
   const supersede = cfg.supersede === true; // opt-in supersede-aware consolidation
   let dataDir = null;
   let envExtra = {};
+  let lastAsOf = null; // checkpoint "now" — anchors relative-age tags in recall
 
   function engine(script, args) {
     return runEngine(enginePath, script, args, dataDir, envExtra);
@@ -151,6 +172,7 @@ export function createAgentMemoryAdapter(rawCfg) {
 
     async ingestDay(day, content, metadata) {
       const asOf = (metadata && metadata.date) || undefined;
+      if (asOf) lastAsOf = asOf;
       // Prefer the bench's atomic memorySave items; fall back to splitting markdown.
       let facts = toolsDir ? await factsFromTools(toolsDir, day) : null;
       if (!facts) facts = extractFacts(content, day);
@@ -188,11 +210,16 @@ export function createAgentMemoryAdapter(rawCfg) {
     },
 
     async query(question) {
-      const out = await engine("recall.js",
-        ["--query", question, "--max-hops", String(maxHops), "--k", String(searchK)]);
+      const qa = ["--query", question, "--max-hops", String(maxHops), "--k", String(searchK)];
+      if (lastAsOf) qa.push("--as-of", lastAsOf);
+      const out = await engine("recall.js", qa);
       const ctx = buildContext(out);
       const sys = "You answer questions about a person's history using ONLY the retrieved memory snippets below. "
-        + "If the memories do not contain the answer, reply that you have no record of it — do not guess. "
+        + "The snippets are organized as timeless standing facts plus a TIMELINE ordered oldest-first to newest-last; "
+        + "each timeline item is tagged with how long ago it was noted (e.g. 'this week', 'a couple months ago'). "
+        + "Use that ordering to resolve questions about WHEN something happened or which value is the LATEST — the most "
+        + "recent relevant timeline item wins. If the memories do not contain the answer, reply that you have no record "
+        + "of it — do not guess. Be concise and specific; cite concrete details from the memories.";
         + "Be concise and specific; cite concrete details from the memories.";
       const user = `Retrieved memories:\n${ctx}\n\nQuestion: ${question}\n\nAnswer:`;
       const ans = await model.complete(sys, user, {});

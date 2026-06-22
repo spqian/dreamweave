@@ -9,12 +9,13 @@
 const Database = require("better-sqlite3");
 const sqliteVec = require("sqlite-vec");
 const { embedOne, toVecBlob } = require("./embed");
+const { ageDays, ageTag } = require("./timeline");
 const cfg = require("../config");
 
 const DB_PATH = cfg.DB_PATH;
 
 function parseArgs(argv) {
-  const args = { query: "", maxHops: 2, seedLimit: 4, k: 12, nodeLimit: 80 };
+  const args = { query: "", maxHops: 2, seedLimit: 4, k: 12, nodeLimit: 80, asOf: "" };
   for (let i = 2; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--query") args.query = argv[++i] || "";
@@ -22,6 +23,7 @@ function parseArgs(argv) {
     else if (a === "--seed-limit") args.seedLimit = Number(argv[++i]);
     else if (a === "--k") args.k = Number(argv[++i]);
     else if (a === "--node-limit") args.nodeLimit = Number(argv[++i]);
+    else if (a === "--as-of") args.asOf = argv[++i] || "";
     else if (!a.startsWith("--")) args.query += `${args.query ? " " : ""}${a}`;
   }
   args.maxHops = Math.max(1, Math.min(3, args.maxHops || 2));
@@ -77,7 +79,8 @@ async function main() {
       WHERE walk.hops < ?
     )
     SELECT w.sig AS signature, MIN(w.hops) AS hops,
-           COALESCE(n.strength, 0) AS strength, n.class AS class, n.fact AS fact, n.kind AS kind
+           COALESCE(n.strength, 0) AS strength, n.class AS class, n.fact AS fact, n.kind AS kind,
+           n.first_seen AS first_seen, n.notes AS notes
     FROM walk w LEFT JOIN nodes n ON n.signature = w.sig
     GROUP BY w.sig
     ORDER BY hops ASC, strength DESC, signature ASC
@@ -94,6 +97,14 @@ async function main() {
 
   db.close();
 
+  // "Now" for relative-age tags: explicit --as-of, else the latest memory in the
+  // cluster (the bench simulates time, so we anchor to the most recent fact seen).
+  const latest = clusterRows.reduce((m, r) => {
+    const t = Date.parse(r.first_seen || "");
+    return t && t > m ? t : m;
+  }, 0);
+  const nowRef = args.asOf ? new Date(args.asOf) : (latest ? new Date(latest) : new Date());
+
   const out = {
     query: args.query,
     seeds,
@@ -106,10 +117,20 @@ async function main() {
     cluster: {
       nodeCount: clusterRows.length,
       edgeCount: clusterEdges.length,
-      nodes: clusterRows.map((r) => ({
-        id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
-        kind: r.kind, fact: (r.fact || "").trim(),
-      })),
+      nodes: clusterRows.map((r) => {
+        const d = ageDays(r.first_seen, nowRef);
+        return {
+          id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
+          kind: r.kind, fact: (r.fact || "").trim(),
+          // Temporal signal for the synthesizer: a coarse RELATIVE age (brain-like,
+          // fuzzy) plus the encode date and a sortable age-in-days. A merge survivor
+          // (notes='gist') is a timeless schema fact; the rest are dated episodes.
+          first_seen: r.first_seen || null,
+          age_days: d,
+          age: ageTag(d),
+          tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : "episodic",
+        };
+      }),
       edges: clusterEdges,
     },
   };

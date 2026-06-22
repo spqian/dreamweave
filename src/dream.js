@@ -32,6 +32,7 @@ const ent = require("./entities");
 const { ensureSchema } = require("./schema");
 const { getLLM } = require("./llm");
 const judge = require("./judge");
+const { ageDays, ageTag } = require("./timeline");
 const cfg = require("../config");
 
 const DATA_DIR = cfg.DATA_DIR;
@@ -640,10 +641,12 @@ async function reflect(db, opts) {
       const members = dec.memberSigs.map((s) => db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(s)).filter(Boolean);
       if (members.length < 2) continue;
       // survivor inherits the consolidated text + the strongest signal in the cluster.
+      // It is now a GIST/schema node (notes='gist') — a fusion of several episodes, so
+      // the projection treats it as timeless rather than placing it on the episodic timeline.
       const maxStrength = Math.max(...members.map((m) => m.strength || 0));
       const anySalient = members.some((m) => m.class === "salient");
       const maxReacts = Math.max(...members.map((m) => m.reactivations || 0));
-      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=? WHERE id=?")
+      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=?, notes='gist' WHERE id=?")
         .run(dec.fact, dec.fact, anySalient ? "salient" : (survivor.class === "episodic" ? "semantic" : survivor.class),
           anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survivor.id);
       // re-embed survivor to its new text so retrieval matches the merged content
@@ -743,9 +746,44 @@ function doctor(db) {
 }
 
 // ---- PROJECT helpers --------------------------------------------------------
-function exportHarness(db) {
-  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact' ORDER BY strength DESC, signature ASC").all();
-  return facts.map((n) => ({ memory_id: n.memory_id, signature: n.signature, category: n.salience || CLASS2CAT[n.class] || "fact", strength: Number((n.strength || 0).toFixed(3)), fact: (n.fact || "").trim() }));
+// PROJECTION (CLS-tiered, sequence-first). The host injects this flat list; ordering
+// is the only temporal channel attention has, so we don't squander it on strength.
+// Two tiers, mirroring complementary learning systems:
+//   GIST (timeless)  — merge survivors / schema facts. Salience-ordered, no age tag;
+//                      these answer "what / who / the policy", which has no single time.
+//   EPISODIC (dated) — the rest, in CHRONOLOGICAL order (oldest->newest) so list
+//                      position encodes "when", each carrying a coarse, fuzzy age tag.
+// "Now" for age tags: --as-of, else the latest memory (the bench simulates time).
+function exportHarness(db, asOf) {
+  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact'").all();
+  const latest = facts.reduce((m, n) => { const t = Date.parse(n.first_seen || ""); return t && t > m ? t : m; }, 0);
+  const nowRef = asOf ? new Date(asOf) : (latest ? new Date(latest) : new Date());
+
+  const isGist = (n) => n.notes && /\bgist\b/.test(n.notes);
+  const rank = (n) => ({ salient: 2, semantic: 1, episodic: 0 }[n.class] || 0);
+
+  const gist = facts.filter(isGist)
+    .sort((a, b) => rank(b) - rank(a) || (b.strength || 0) - (a.strength || 0) || a.signature.localeCompare(b.signature));
+  const episodic = facts.filter((n) => !isGist(n))
+    .sort((a, b) => (Date.parse(a.first_seen || "") || 0) - (Date.parse(b.first_seen || "") || 0) || a.signature.localeCompare(b.signature));
+
+  const rec = (n, tier) => {
+    const d = ageDays(n.first_seen, nowRef);
+    const tag = tier === "episodic" ? ageTag(d) : null;
+    return {
+      memory_id: n.memory_id, signature: n.signature,
+      category: n.salience || CLASS2CAT[n.class] || "fact",
+      tier, strength: Number((n.strength || 0).toFixed(3)),
+      first_seen: n.first_seen || null, age: tag,
+      fact: (n.fact || "").trim(),
+      // Ready-to-inject line: episodic facts are prefixed with their fuzzy age so the
+      // temporal key survives into the host's context; gist facts stay timeless.
+      display: tier === "episodic" ? `[${tag}] ${(n.fact || "").trim()}` : (n.fact || "").trim(),
+    };
+  };
+
+  // Gist first (primacy for standing facts), then the episodic timeline in order.
+  return [...gist.map((n) => rec(n, "gist")), ...episodic.map((n) => rec(n, "episodic"))];
 }
 
 function recordProjection(db, file) {
@@ -843,7 +881,7 @@ async function main() {
     else if (cmd === "consolidate") r = await consolidate(db, { sim: Number(flags.sim) || 0 });
     else if (cmd === "budget") r = await budget(db);
     else if (cmd === "doctor") { r = doctor(db); gate = !r.healthy; }
-    else if (cmd === "export-harness") r = exportHarness(db);
+    else if (cmd === "export-harness") r = exportHarness(db, flags["as-of"]);
     else if (cmd === "record-projection") r = recordProjection(db, flags.file);
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
