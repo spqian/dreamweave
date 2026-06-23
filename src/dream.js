@@ -54,6 +54,11 @@ const EDGE_DECAY = { mentions: 1.0, related_to: 0.985, similar_to: 0.97, superse
 // richer entries) over deletion — entry SIZE may grow to keep the COUNT down.
 const ENTRY_TARGET = Number(process.env.MEMORY_ENTRY_TARGET || 250);
 const ENTRY_MAX = Number(process.env.MEMORY_ENTRY_MAX || 500);
+// TIER 2 ("RAG class"): the bounded graph+vector store recall searches. Embedded fact
+// nodes over this cap are DEMOTED (not deleted) to Tier 3 — a raw keyword-only archive
+// (notes='archive', no vector, no edges). 0 disables (single-tier behavior). The brain
+// analog: a bounded associative store + an unindexed "bookshelf" you can still dig through.
+const TIER2_MAX = Number(process.env.MEMORY_TIER2_MAX || 0);
 
 // pressure = facts / target. Gentle below ~0.6; escalates toward/above 1.0.
 function budgetParams(factCount) {
@@ -103,6 +108,22 @@ function parseFlags(argv) {
 const nextId = (db) => db.prepare("SELECT COALESCE(MAX(id),0)+1 m FROM nodes").get().m;
 const getMeta = (db, k) => (db.prepare("SELECT value FROM meta WHERE key=?").get(k) || {}).value;
 const setMeta = (db, k, v) => db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)").run(k, v);
+
+// EMBED-ONCE: a fact's MiniLM vector is computed once at ingest/weave and stored in
+// vec_nodes. The nightly weave/consolidate KNN loops must REUSE that stored vector as
+// the query rather than re-embedding every fact every night (which made cost grow with
+// the bank). Returns the stored embedding blob, or null if the node was never embedded
+// (caller falls back to embedOne only then). MiniLM is deterministic, so the stored
+// vector is identical to a fresh embed of the same text.
+function storedVecBlob(db, id) {
+  try { const r = db.prepare("SELECT embedding FROM vec_nodes WHERE rowid=?").get(BigInt(id)); return r ? r.embedding : null; }
+  catch { return null; }
+}
+async function queryVec(db, node) {
+  const v = storedVecBlob(db, node.id);
+  if (v) return v;
+  return toVecBlob(await embedOne(node.fact || node.signature));
+}
 
 function uniqueSig(db, base) {
   if (!db.prepare("SELECT 1 FROM nodes WHERE signature=?").get(base)) return base;
@@ -276,7 +297,9 @@ function dreamCore(db, flags) {
   const journal = [];
   const J = (op, sig, reason) => journal.push({ dreamed_at: nowIso, run_id: runId, op, memory_id: "", signature: sig || "", category: "", original_fact: "", result_fact: "", reason });
 
-  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact'").all();
+  // Active facts = Tier 1+2 (embedded, in graph). Archived (Tier 3) facts are inert cold
+  // storage: skipped by decay/weave so they cost no nightly work, reachable only by keyword.
+  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const bp = budgetParams(facts.length);
   const schema = computeSchemaFit(db);
 
@@ -389,6 +412,38 @@ function dreamCore(db, flags) {
     }
   }
 
+  // TIER 2 CAP: demote the weakest EMBEDDED facts to Tier 3 (raw keyword archive) when
+  // the graph+vector store exceeds TIER2_MAX. Demotion ≠ deletion: the node + its raw
+  // fact text stay in the db (notes='archive'), but it loses its vector and graph edges,
+  // so it no longer costs nightly weave/embed work and is reachable only by keyword
+  // search. Protect salient + gist + this-run-new/reactivated; demote details/oldest
+  // first. This is what keeps cost bounded while "remembering everything".
+  let demoted = 0;
+  if (TIER2_MAX > 0) {
+    const embeddedCount = () => db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").get().c;
+    if (embeddedCount() > TIER2_MAX) {
+      const over = embeddedCount() - TIER2_MAX;
+      const supTargets = new Set(db.prepare("SELECT dst FROM edges WHERE rel='supersedes'").all().map((r) => r.dst));
+      // demotion order: details first, then weakest/oldest; never salient or gist.
+      const cands = db.prepare(
+        "SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive') ORDER BY (notes='detail') DESC, (class='salient') ASC, strength ASC, last_decayed ASC"
+      ).all();
+      const demote = [];
+      for (const n of cands) {
+        if (demote.length >= over) break;
+        if (protectedSigs.has(n.signature) || n.class === "salient" || n.notes === "gist" || supTargets.has(n.signature)) continue;
+        demote.push(n);
+      }
+      for (const n of demote) {
+        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
+        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
+        db.prepare("UPDATE nodes SET notes='archive', last_decayed=? WHERE id=?").run(nowIso, n.id);
+        J("evaporate", n.signature, `demoted to Tier3 archive (over Tier2 cap ${TIER2_MAX})`);
+        demoted += 1;
+      }
+    }
+  }
+
   // HOUSEKEEPING
   const cut60 = new Date(now.getTime() - 60 * 86400000).toISOString();
   const cut30 = new Date(now.getTime() - 30 * 86400000).toISOString();
@@ -406,7 +461,7 @@ function dreamCore(db, flags) {
   const ins = db.prepare(`INSERT INTO dream_journal(dreamed_at,run_id,op,memory_id,signature,category,original_fact,result_fact,reason)
     VALUES (@dreamed_at,@run_id,@op,@memory_id,@signature,@category,@original_fact,@result_fact,@reason)`);
   db.transaction(() => journal.forEach((j) => ins.run(j)))();
-  const result = { runId, summary, facts: final, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, reactivated: reentered.size, promoted_semantic: promoSem };
+  const result = { runId, summary, facts: final, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, reactivated: reentered.size, promoted_semantic: promoSem };
   if (overBy > 0) result.action_needed = `Still ${overBy} over target. Run 'consolidate' and merge the reported clusters (agent) to reduce entry count.`;
   return result;
 }
@@ -459,7 +514,7 @@ async function weave(db, opts) {
   //    candidate becomes a hub only if it recurs across facts (or has a strong email signal).
   //    When an LLM is enabled it ADDS a typed read (catches single-name principals and
   //    types orgs/places correctly); the two are unioned for best recall.
-  const factRows = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact'").all();
+  const factRows = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
   const corpusEnts = ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 });
@@ -512,8 +567,10 @@ async function weave(db, opts) {
   });
   tx2();
 
-  // 4) embed any node missing a vec row (new entity hubs), so KNN can use them
-  const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes)").all().map((r) => r.id);
+  // 4) embed any ACTIVE node missing a vec row (new entity hubs / facts). Tier-3 archive
+  //    nodes are intentionally un-embedded — never re-embed them (that's what makes them
+  //    cheap), so they are excluded here.
+  const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
   if (missing.length) await reembed(db, missing);
 
   // 5) vector sibling links fact <-> fact, CORROBORATED.
@@ -523,10 +580,10 @@ async function weave(db, opts) {
   const HIGH = (opts && opts.high) || 0.62;
   const mentionsOf = (sig) => new Set(db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(sig).map((r) => r.dst));
   let relatedEdges = 0, similarEdges = 0;
-  const factNodes = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact'").all();
+  const factNodes = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   for (const f of factNodes) {
     const fe = mentionsOf(f.signature);
-    const qv = toVecBlob(await embedOne(f.fact || f.signature));
+    const qv = await queryVec(db, f);
     const nbrs = db.prepare(`SELECT n.signature s, n.kind k, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>?`).all(qv, K + 8, f.id);
     let added = 0;
     for (const nb of nbrs) {
@@ -548,13 +605,13 @@ async function weave(db, opts) {
   if (SUP) {
     const CUE = /\b(correct(?:ion|ed|s)?|chang(?:e|ed|ing)?|updat(?:e|ed)?|revis(?:e|ed)?|no longer|instead of|rather than|supersed(?:e|ed|es)?|overrid(?:e|den|es)?|replac(?:e|ed|es)?|moved? (?:to|up|earlier|from)|push(?:ed)? (?:to|up|earlier)|now \w+ not)\b/i;
     const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
-    const full = db.prepare("SELECT id, signature, fact, first_seen, strength, class FROM nodes WHERE kind='fact'").all();
+    const full = db.prepare("SELECT id, signature, fact, first_seen, strength, class FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
     const bySig = new Map(full.map((r) => [r.signature, r]));
     for (const f of full) {
       if (!f.fact || !CUE.test(f.fact)) continue;
       const fe = mentionsOf(f.signature);   // entity hubs (may be empty — e.g. single-name principals)
       const ft = toks(f.fact);              // content tokens, for entity-free corroboration
-      const qv = toVecBlob(await embedOne(f.fact));
+      const qv = await queryVec(db, f);
       const nbrs = db.prepare(`SELECT n.signature s, n.kind k, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 12) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>?`).all(qv, f.id);
       let target = null;
       for (const nb of nbrs) {
@@ -585,13 +642,13 @@ async function weave(db, opts) {
   const deg = degreeMap(db);
   for (const f of factNodes) {
     if (deg.get(f.signature)) continue;
-    const qv = toVecBlob(await embedOne(f.fact || f.signature));
+    const qv = await queryVec(db, f);
     const nb = db.prepare(`SELECT n.signature s, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 6) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND n.kind='fact'`).all(qv, f.id)[0];
     if (nb) { addEdge(f.signature, "similar_to", nb.s, Number((1 - nb.d).toFixed(3))); rescued += 1; }
   }
 
   repairGraph(db);
-  const islands = [...db.prepare("SELECT signature FROM nodes WHERE kind='fact'").all().map((r) => r.signature)].filter((s) => !degreeMap(db).get(s));
+  const islands = [...db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature)].filter((s) => !degreeMap(db).get(s));
   return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, rescued_islands: rescued, remaining_islands: islands.length };
 }
 
@@ -695,7 +752,8 @@ async function reflect(db, opts) {
   txM();
 
   // re-embed any survivor whose vec row we dropped, then re-weave to heal islands.
-  const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes)").all().map((r) => r.id);
+  // Never re-embed Tier-3 archive nodes (they are intentionally un-embedded).
+  const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
   if (missing.length) await reembed(db, missing);
   await weave(db, { asOf: opts && opts.asOf, llm: false });
   repairGraph(db);
@@ -708,14 +766,17 @@ async function consolidate(db, opts) {
   const bp = budgetParams(factCount);
   // Under entry-budget pressure, lower the similarity bar so more near-dups/rollups surface.
   const SIM = (opts && opts.sim) || bp.mergeSim;
-  const excl = (opts && opts.excludeDetail) ? " AND (notes IS NULL OR notes <> 'detail')" : "";
+  // Always exclude Tier-3 archive (un-embedded); also exclude detail in retain mode.
+  const excl = (opts && opts.excludeDetail)
+    ? " AND (notes IS NULL OR notes NOT IN ('detail','archive'))"
+    : " AND (notes IS NULL OR notes<>'archive')";
   const facts = db.prepare(`SELECT id, signature, fact FROM nodes WHERE kind='fact'${excl}`).all();
   const mentionsOf = (sig) => new Set(db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(sig).map((r) => r.dst));
   const seen = new Set();
   const clusters = [];
   for (const f of facts) {
     if (seen.has(f.signature)) continue;
-    const qv = toVecBlob(await embedOne(f.fact || f.signature));
+    const qv = await queryVec(db, f);
     const nbrs = db.prepare(`SELECT n.id, n.signature s, n.fact, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 10) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND n.kind='fact'${excl}`).all(qv, f.id);
     const fe = mentionsOf(f.signature);
     const group = [{ sig: f.signature, fact: f.fact }];
@@ -760,15 +821,17 @@ async function budget(db) {
 
 // ---- DOCTOR -----------------------------------------------------------------
 function doctor(db) {
-  const facts = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact'").get().c;
+  const facts = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").get().c;
+  const archived = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND notes='archive'").get().c;
   const entities = db.prepare("SELECT count(*) c FROM nodes WHERE kind='entity'").get().c;
   const edges = db.prepare("SELECT count(*) c FROM edges").get().c;
   const sigs = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   const dangling = db.prepare("SELECT src,dst FROM edges").all().filter((e) => !sigs.has(e.src) || !sigs.has(e.dst)).length;
   const deg = degreeMap(db);
-  const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact'").all().map((r) => r.signature).filter((s) => !deg.get(s));
+  // Tier-3 archive nodes are intentionally edgeless (keyword-only) — not islands.
+  const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !deg.get(s));
   const degsum = [...deg.values()].reduce((a, b) => a + b, 0);
-  return { facts, entities, edges, fact_islands: islands.length, islands: islands.slice(0, 20), dangling_edges: dangling, avg_degree: edges ? Number((degsum / (facts + entities)).toFixed(2)) : 0, healthy: islands.length === 0 && dangling === 0 };
+  return { facts, tier3_archived: archived, entities, edges, fact_islands: islands.length, islands: islands.slice(0, 20), dangling_edges: dangling, avg_degree: edges ? Number((degsum / (facts + entities)).toFixed(2)) : 0, healthy: islands.length === 0 && dangling === 0 };
 }
 
 // ---- PROJECT helpers --------------------------------------------------------
@@ -782,9 +845,9 @@ function doctor(db) {
 // "Now" for age tags: --as-of, else the latest memory (the bench simulates time).
 function exportHarness(db, asOf) {
   // Detail nodes (notes='detail') are lookup-only — kept in the side DB for recall but
-  // NOT injected; the projection carries the gist. This is the cap-on-inject, not-on-
-  // remember split. Everything else projects.
-  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes <> 'detail')").all();
+  // NOT injected; the projection carries the gist. Archive nodes (Tier 3) are never
+  // projected either. This is the cap-on-inject, not-on-remember split. Everything else projects.
+  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes NOT IN ('detail','archive'))").all();
   const latest = facts.reduce((m, n) => { const t = Date.parse(n.first_seen || ""); return t && t > m ? t : m; }, 0);
   const nowRef = asOf ? new Date(asOf) : (latest ? new Date(latest) : new Date());
 

@@ -26,6 +26,11 @@ package fixes both:
 
 The result is a small (~250-entry target), atomic, mostly-semantic, **fully connected** memory.
 
+> **Design guideline:** the engine follows a **three-tier memory model** (instincts /
+> RAG / bookshelf) with a few non-negotiable principles (embed-once, bounded nightly
+> cost, demote-don't-delete, gist-for-attention/detail-for-recall). See
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before making engine changes.
+
 ### Optional: LLM judgment layer
 
 The engine runs fully on **local embeddings with zero API keys** — entity extraction is

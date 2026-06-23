@@ -89,6 +89,30 @@ async function main() {
 
   const clusterSet = new Set(clusterRows.map((r) => r.signature));
 
+  // 2b) TIER 3 (bookshelf): keyword scan over the un-embedded archive. These cold facts
+  // have no vector and no edges, so vector+graph recall can't reach them — but the detail
+  // may be exactly what a specific question needs. Brute-force LIKE over significant query
+  // terms (the "I know I read this somewhere, let me dig" tier). Cheap relative to the
+  // bench's LLM calls; only scans rows the graph layer already excluded.
+  const STOP = new Set("the a an is are was were of for to in on and or that with as at by from this its not be no into what which who whom whose when where why how did do does has have had will would should could about over under more most than then them they their our your you i me my we us".split(" "));
+  const terms = [...new Set((args.query.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) || []).filter((t) => !STOP.has(t)))].slice(0, 8);
+  let archiveRows = [];
+  if (terms.length) {
+    const like = terms.map(() => "lower(fact) LIKE ?").join(" OR ");
+    const params = terms.map((t) => `%${t}%`);
+    const rows = db.prepare(
+      `SELECT signature, fact, first_seen, strength, class FROM nodes WHERE kind='fact' AND notes='archive' AND (${like})`
+    ).all(...params);
+    // rank by how many distinct query terms a row contains, then recency
+    archiveRows = rows.map((r) => {
+      const f = (r.fact || "").toLowerCase();
+      const hits = terms.reduce((a, t) => a + (f.includes(t) ? 1 : 0), 0);
+      return { ...r, hits };
+    }).filter((r) => r.hits > 0 && !clusterSet.has(r.signature))
+      .sort((a, b) => b.hits - a.hits || (Date.parse(b.first_seen || "") || 0) - (Date.parse(a.first_seen || "") || 0))
+      .slice(0, Math.max(4, Math.floor(args.k / 2)));
+  }
+
   // 3) Edges fully inside the cluster.
   const allEdges = db.prepare(`SELECT src, rel, dst, weight FROM edges`).all();
   const clusterEdges = allEdges
@@ -115,7 +139,7 @@ async function main() {
       class: r.class,
     })),
     cluster: {
-      nodeCount: clusterRows.length,
+      nodeCount: clusterRows.length + archiveRows.length,
       edgeCount: clusterEdges.length,
       nodes: clusterRows.map((r) => {
         const d = ageDays(r.first_seen, nowRef);
@@ -128,9 +152,16 @@ async function main() {
           first_seen: r.first_seen || null,
           age_days: d,
           age: ageTag(d),
-          tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : "episodic",
+          tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
         };
-      }),
+      }).concat(archiveRows.map((r) => {
+        const d = ageDays(r.first_seen, nowRef);
+        return {
+          id: r.signature, hops: 99, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
+          kind: "fact", fact: (r.fact || "").trim(),
+          first_seen: r.first_seen || null, age_days: d, age: ageTag(d), tier: "archive",
+        };
+      })),
       edges: clusterEdges,
     },
   };
