@@ -59,6 +59,15 @@ const ENTRY_MAX = Number(process.env.MEMORY_ENTRY_MAX || 500);
 // (notes='archive', no vector, no edges). 0 disables (single-tier behavior). The brain
 // analog: a bounded associative store + an unindexed "bookshelf" you can still dig through.
 const TIER2_MAX = Number(process.env.MEMORY_TIER2_MAX || 0);
+// SQL fragment for "active" facts = Tier 1+2 (embedded, in graph). Tier-3 archive nodes
+// must be excluded from EVERY nightly query that costs compute, re-embeds, or could
+// delete them — they are inert keyword-only cold storage. Use this everywhere except the
+// explicit Tier-3 keyword recall. (Audit-hardened: archive must never reach decay,
+// evaporate, hard-cap, reactivation, salience, schema, or budget.)
+const ACTIVE_FACT = "kind='fact' AND (notes IS NULL OR notes<>'archive')";
+// Retain/tiered mode: when on, destructive eviction (ENTRY_MAX hard cap, weak-semantic
+// fade) is replaced by DEMOTION — we never physically delete a fact, we move it to Tier 3.
+const TIERED = () => process.env.MEMORY_MERGE_KEEP === "1" || TIER2_MAX > 0;
 
 // pressure = facts / target. Gentle below ~0.6; escalates toward/above 1.0.
 function budgetParams(factCount) {
@@ -270,7 +279,7 @@ const SCHEMA_HALFLIFE_BONUS = 0.6; // up to +60% half-life for a fully schema-em
 // reactivation frequency. Repetition makes facts durable (semantic), not important.
 
 function computeSchemaFit(db) {
-  const factCount = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact'").get().c || 1;
+  const factCount = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c || 1;
   const ubiqCut = Math.max(8, Math.ceil(SCHEMA_UBIQUITOUS * factCount));
   const entDeg = new Map();
   for (const r of db.prepare("SELECT dst FROM edges WHERE rel='mentions'").all()) entDeg.set(r.dst, (entDeg.get(r.dst) || 0) + 1);
@@ -322,7 +331,7 @@ function dreamCore(db, flags) {
   // entities. Each fact reactivates AT MOST ONCE per run (reactivations counts NIGHTS re-seen,
   // not co-mentions) — so a tier promotion needs persistence across runs, not one busy night.
   // Schema-supported reactivation boosts more (and promotes at a lower threshold).
-  const newFacts = db.prepare("SELECT * FROM nodes WHERE kind='fact' AND first_seen > ?").all(lastDream);
+  const newFacts = db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND first_seen > ?`).all(lastDream);
   const newIdSet = new Set(newFacts.map((n) => n.id));
   const triggers = new Map(); // sibling fact id -> count of distinct new facts that re-cued it
   for (const nf of newFacts) {
@@ -360,26 +369,31 @@ function dreamCore(db, flags) {
 
   // EVAPORATE faded facts (decay-gated; not new AND not reactivated this run).
   // Episodic below the (pressure-adaptive) threshold always; weak re-derivable semantic only under pressure.
+  // In TIERED mode we never physically delete a fact here — demotion (below) moves
+  // overflow to Tier 3 instead, so faded facts stay recoverable by keyword. Archive nodes
+  // are always excluded (they are inert and must never be deleted by decay).
   const protectedSigs = new Set([...newFacts.map((n) => n.signature), ...reentered]);
   let evap = 0, evapSem = 0;
-  for (const n of db.prepare("SELECT * FROM nodes WHERE kind='fact' AND class='episodic' AND strength < ?").all(bp.forgetThreshold)) {
-    if (protectedSigs.has(n.signature)) continue;
-    db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id || "", nowIso, `S=${n.strength.toFixed(3)}<${bp.forgetThreshold} episodic`);
-    db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
-    db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
-    db.prepare("DELETE FROM nodes WHERE id=?").run(n.id);
-    J("evaporate", n.signature, `S=${n.strength.toFixed(3)} episodic (threshold ${bp.forgetThreshold})`);
-    evap += 1;
-  }
-  if (bp.semanticFade > 0) {
-    for (const n of db.prepare("SELECT * FROM nodes WHERE kind='fact' AND class='semantic' AND strength < ?").all(bp.semanticFade)) {
+  if (!TIERED()) {
+    for (const n of db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND class='episodic' AND strength < ?`).all(bp.forgetThreshold)) {
       if (protectedSigs.has(n.signature)) continue;
-      db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id || "", nowIso, `S=${n.strength.toFixed(3)}<${bp.semanticFade} weak-semantic (over budget)`);
+      db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id || "", nowIso, `S=${n.strength.toFixed(3)}<${bp.forgetThreshold} episodic`);
       db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
       db.prepare("DELETE FROM nodes WHERE id=?").run(n.id);
-      J("evaporate", n.signature, `S=${n.strength.toFixed(3)} weak-semantic over-budget`);
-      evapSem += 1;
+      J("evaporate", n.signature, `S=${n.strength.toFixed(3)} episodic (threshold ${bp.forgetThreshold})`);
+      evap += 1;
+    }
+    if (bp.semanticFade > 0) {
+      for (const n of db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND class='semantic' AND strength < ?`).all(bp.semanticFade)) {
+        if (protectedSigs.has(n.signature)) continue;
+        db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id || "", nowIso, `S=${n.strength.toFixed(3)}<${bp.semanticFade} weak-semantic (over budget)`);
+        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
+        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
+        db.prepare("DELETE FROM nodes WHERE id=?").run(n.id);
+        J("evaporate", n.signature, `S=${n.strength.toFixed(3)} weak-semantic over-budget`);
+        evapSem += 1;
+      }
     }
   }
 
@@ -387,15 +401,17 @@ function dreamCore(db, flags) {
   // Decay/evaporate above are the graceful path; in batch/headless runs there is no agent to
   // perform merges, so we deterministically evict the weakest facts down to the cap. Salient
   // is protected first, then this-run-new/reactivated, then lowest strength is dropped.
+  // SKIPPED in TIERED mode: there the Tier-2 demotion (below) bounds the embedded set by
+  // MOVING overflow to Tier 3, never deleting — so the physical ENTRY_MAX delete must not run.
   let evapCap = 0;
-  const factCountNow = () => db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact'").get().c;
-  if (factCountNow() > ENTRY_MAX) {
+  const factCountNow = () => db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
+  if (!TIERED() && factCountNow() > ENTRY_MAX) {
     const over = factCountNow() - ENTRY_MAX;
     // Facts that some other fact SUPERSEDES are the preserved "from" value of a correction —
     // protect them so the transition stays answerable (empty set when supersede is unused).
     const supTargets = new Set(db.prepare("SELECT dst FROM edges WHERE rel='supersedes'").all().map((r) => r.dst));
     const cands = db.prepare(
-      "SELECT * FROM nodes WHERE kind='fact' ORDER BY (class='salient') ASC, strength ASC, last_decayed ASC"
+      `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (class='salient') ASC, strength ASC, last_decayed ASC`
     ).all();
     const evict = [];
     // pass 1: evict weakest non-protected, non-salient, non-supersede-target
@@ -420,28 +436,70 @@ function dreamCore(db, flags) {
   // first. This is what keeps cost bounded while "remembering everything".
   let demoted = 0;
   if (TIER2_MAX > 0) {
-    const embeddedCount = () => db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").get().c;
+    const embeddedCount = () => db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
     if (embeddedCount() > TIER2_MAX) {
       const over = embeddedCount() - TIER2_MAX;
       const supTargets = new Set(db.prepare("SELECT dst FROM edges WHERE rel='supersedes'").all().map((r) => r.dst));
-      // demotion order: details first, then weakest/oldest; never salient or gist.
+      // Demotion priority (keep the active set bounded NO MATTER WHAT, like a real
+      // associative store): detail first, then weak/old episodic, then weak/old semantic,
+      // and finally — only if still over — the weakest/oldest GIST and SALIENT too. Even
+      // important old memories can fade from active recall to the keyword "bookshelf"
+      // (still findable, just not in the hot RAG set). Hard-protect ONLY this-run-new and
+      // supersede targets (needed for the current operation). This guarantees the cap holds
+      // so nightly cost stays bounded — the C4 accumulation fix.
       const cands = db.prepare(
-        "SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive') ORDER BY (notes='detail') DESC, (class='salient') ASC, strength ASC, last_decayed ASC"
+        `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (notes='detail') DESC, (class='salient') ASC, (notes='gist') ASC, strength ASC, last_decayed ASC`
       ).all();
+      const isHardProtected = (n) => protectedSigs.has(n.signature) || supTargets.has(n.signature);
       const demote = [];
+      // pass 1: prefer to keep salient/gist — demote everything else first
       for (const n of cands) {
         if (demote.length >= over) break;
-        if (protectedSigs.has(n.signature) || n.class === "salient" || n.notes === "gist" || supTargets.has(n.signature)) continue;
+        if (isHardProtected(n) || n.class === "salient" || n.notes === "gist") continue;
         demote.push(n);
       }
-      for (const n of demote) {
-        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
-        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
-        db.prepare("UPDATE nodes SET notes='archive', last_decayed=? WHERE id=?").run(nowIso, n.id);
-        J("evaporate", n.signature, `demoted to Tier3 archive (over Tier2 cap ${TIER2_MAX})`);
-        demoted += 1;
+      // pass 2: still over cap (salient/gist alone exceed it) — demote the weakest/oldest
+      // of those too, so the embedded set is ALWAYS bounded. Only new/supersede stay.
+      if (demote.length < over) {
+        const picked = new Set(demote.map((n) => n.id));
+        for (const n of cands) {
+          if (demote.length >= over) break;
+          if (picked.has(n.id) || isHardProtected(n)) continue;
+          demote.push(n); picked.add(n.id);
+        }
       }
+      // Atomic: a crash mid-demotion must not leave an active node without its vector/edges.
+      const txD = db.transaction(() => {
+        for (const n of demote) {
+          db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
+          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
+          db.prepare("UPDATE nodes SET notes='archive', last_decayed=? WHERE id=?").run(nowIso, n.id);
+          J("evaporate", n.signature, `demoted to Tier3 archive (over Tier2 cap ${TIER2_MAX})`);
+          demoted += 1;
+        }
+      });
+      txD();
     }
+  }
+
+  // ENTITY HUB PRUNE (bounds vector-index growth — audit C3). Entity hubs are embedded
+  // and never decay, so over a long run distinct entities could grow the KNN cost without
+  // bound. Drop hubs that no active fact mentions anymore (degree 0 into them): they are
+  // dead scaffolding. Cheap, and keeps the embedded set ~= active facts + live entities.
+  let prunedHubs = 0;
+  {
+    const liveDst = new Set(db.prepare("SELECT DISTINCT dst FROM edges WHERE rel='mentions'").all().map((r) => r.dst));
+    const hubs = db.prepare("SELECT id, signature FROM nodes WHERE kind='entity'").all();
+    const txP = db.transaction(() => {
+      for (const h of hubs) {
+        if (liveDst.has(h.signature)) continue;
+        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(h.signature, h.signature);
+        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(h.id));
+        db.prepare("DELETE FROM nodes WHERE id=?").run(h.id);
+        prunedHubs += 1;
+      }
+    });
+    txP();
   }
 
   // HOUSEKEEPING
@@ -453,15 +511,16 @@ function dreamCore(db, flags) {
 
   repairGraph(db);
   setMeta(db, "last_dream", nowIso);
-  const final = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact'").get().c;
+  const final = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
+  const archivedNow = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND notes='archive'").get().c;
   const after = budgetParams(final);
   const overBy = Math.max(0, final - ENTRY_TARGET);
-  const summary = `RUN ${runId}: facts ${facts.length}->${final} (target ${ENTRY_TARGET}, status ${after.status}); reactivated ${reentered.size} (promoted ${promoSem}->sem), evaporated ${evap}+${evapSem}sem; pruned ${tRem} tombstones/${eRem} edges/${jRem} journal.`;
+  const summary = `RUN ${runId}: active facts ${facts.length}->${final} (target ${ENTRY_TARGET}, status ${after.status}); reactivated ${reentered.size} (promoted ${promoSem}->sem), evaporated ${evap}+${evapSem}sem, demoted ${demoted}, pruned ${prunedHubs} hubs; archive=${archivedNow}.`;
   J("keep", "", summary);
   const ins = db.prepare(`INSERT INTO dream_journal(dreamed_at,run_id,op,memory_id,signature,category,original_fact,result_fact,reason)
     VALUES (@dreamed_at,@run_id,@op,@memory_id,@signature,@category,@original_fact,@result_fact,@reason)`);
   db.transaction(() => journal.forEach((j) => ins.run(j)))();
-  const result = { runId, summary, facts: final, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, reactivated: reentered.size, promoted_semantic: promoSem };
+  const result = { runId, summary, facts: final, archived: archivedNow, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, pruned_hubs: prunedHubs, reactivated: reentered.size, promoted_semantic: promoSem };
   if (overBy > 0) result.action_needed = `Still ${overBy} over target. Run 'consolidate' and merge the reported clusters (agent) to reduce entry count.`;
   return result;
 }
@@ -667,14 +726,17 @@ async function reflect(db, opts) {
   if (!llm.available) return { llm: "none", note: "reflect requires DREAM_LLM; skipped", salient_tagged: 0, clusters_merged: 0, entries_reclaimed: 0 };
 
   const keepDetail0 = process.env.MEMORY_MERGE_KEEP === "1" || (opts && opts.keepDetail);
-  // In retain-detail mode, archived 'detail' nodes are lookup-only — exclude them from
-  // the nightly salience/merge passes so each night only processes NEW + gist material
-  // (bounds LLM cost and avoids re-churning the archive).
-  const notDetail = keepDetail0 ? " AND (notes IS NULL OR notes <> 'detail')" : "";
+  // Nightly LLM cost must scale with NEW material, not total store size. Exclude Tier-3
+  // archive ALWAYS (it is inert), and 'detail' in retain mode (already archived for
+  // recall). This is the filter the audit flagged: archive was previously sent to the
+  // salience LLM every night, so cost grew with the archive — the exact thing we forbid.
+  const notColdSql = keepDetail0
+    ? " AND (notes IS NULL OR notes NOT IN ('detail','archive'))"
+    : " AND (notes IS NULL OR notes<>'archive')";
 
-  // SALIENCE: judge importance over facts not already salient.
+  // SALIENCE: judge importance over ACTIVE, not-yet-salient facts only.
   let salientTagged = 0;
-  const candidates = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notDetail}`).all();
+  const candidates = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notColdSql}`).all();
   let flagged = new Set();
   try { flagged = await judge.salienceLLM(candidates, llm); }
   catch (e) { process.stderr.write(`[reflect] salience failed: ${e.message}\n`); }
@@ -801,11 +863,11 @@ async function consolidate(db, opts) {
 
 // ---- BUDGET (report entry budget + prioritized worklist) --------------------
 async function budget(db) {
-  const factCount = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact'").get().c;
+  const factCount = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
   const bp = budgetParams(factCount);
-  // forecast what a dream run would evaporate at current strengths
-  const epEvap = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND class='episodic' AND strength < ?").get(bp.forgetThreshold).c;
-  const semEvap = bp.semanticFade > 0 ? db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND class='semantic' AND strength < ?").get(bp.semanticFade).c : 0;
+  // forecast what a dream run would evaporate at current strengths (active facts only)
+  const epEvap = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT} AND class='episodic' AND strength < ?`).get(bp.forgetThreshold).c;
+  const semEvap = bp.semanticFade > 0 ? db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT} AND class='semantic' AND strength < ?`).get(bp.semanticFade).c : 0;
   const merge = await consolidate(db, {});
   const projected = factCount - epEvap - semEvap - merge.entries_reclaimable;
   return {

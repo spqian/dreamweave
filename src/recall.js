@@ -56,36 +56,36 @@ async function main() {
   const seedRows = knn.slice(0, args.seedLimit);
   const seeds = seedRows.map((r) => r.signature);
 
-  if (seeds.length === 0) {
-    console.log(JSON.stringify({ query: args.query, seeds: [], cluster: { nodes: [], edges: [] }, summary: "No matching memory nodes found." }, null, 2));
-    db.close();
-    return;
+  // Graph expansion runs only when we have vector seeds; but the Tier-3 keyword search
+  // below MUST run regardless (an archive-only DB, or a query whose answer was demoted,
+  // has zero embedded seeds yet may be answerable from the bookshelf). So we no longer
+  // early-return on empty seeds — we fall through to the keyword tier.
+  let clusterRows = [];
+  if (seeds.length > 0) {
+    const seedsJson = JSON.stringify(seeds);
+    clusterRows = db.prepare(`
+      WITH RECURSIVE
+      bidir(a, b, rel, weight) AS (
+        SELECT src, dst, rel, weight FROM edges
+        UNION ALL
+        SELECT dst, src, rel, weight FROM edges
+      ),
+      walk(sig, hops) AS (
+        SELECT value, 0 FROM json_each(?)
+        UNION
+        SELECT b.b, walk.hops + 1
+        FROM walk JOIN bidir b ON b.a = walk.sig
+        WHERE walk.hops < ?
+      )
+      SELECT w.sig AS signature, MIN(w.hops) AS hops,
+             COALESCE(n.strength, 0) AS strength, n.class AS class, n.fact AS fact, n.kind AS kind,
+             n.first_seen AS first_seen, n.notes AS notes
+      FROM walk w LEFT JOIN nodes n ON n.signature = w.sig
+      GROUP BY w.sig
+      ORDER BY hops ASC, strength DESC, signature ASC
+      LIMIT ?
+    `).all(seedsJson, args.maxHops, args.nodeLimit);
   }
-
-  // 2) Graph expansion: bidirectional recursive walk from seeds up to maxHops.
-  const seedsJson = JSON.stringify(seeds);
-  const clusterRows = db.prepare(`
-    WITH RECURSIVE
-    bidir(a, b, rel, weight) AS (
-      SELECT src, dst, rel, weight FROM edges
-      UNION ALL
-      SELECT dst, src, rel, weight FROM edges
-    ),
-    walk(sig, hops) AS (
-      SELECT value, 0 FROM json_each(?)
-      UNION
-      SELECT b.b, walk.hops + 1
-      FROM walk JOIN bidir b ON b.a = walk.sig
-      WHERE walk.hops < ?
-    )
-    SELECT w.sig AS signature, MIN(w.hops) AS hops,
-           COALESCE(n.strength, 0) AS strength, n.class AS class, n.fact AS fact, n.kind AS kind,
-           n.first_seen AS first_seen, n.notes AS notes
-    FROM walk w LEFT JOIN nodes n ON n.signature = w.sig
-    GROUP BY w.sig
-    ORDER BY hops ASC, strength DESC, signature ASC
-    LIMIT ?
-  `).all(seedsJson, args.maxHops, args.nodeLimit);
 
   const clusterSet = new Set(clusterRows.map((r) => r.signature));
 
@@ -100,8 +100,10 @@ async function main() {
   if (terms.length) {
     const like = terms.map(() => "lower(fact) LIKE ?").join(" OR ");
     const params = terms.map((t) => `%${t}%`);
+    // Bounded scan: cap rows materialized (recent-first) so a huge archive can't blow up
+    // memory; we then re-rank the capped set by term-hit count + recency.
     const rows = db.prepare(
-      `SELECT signature, fact, first_seen, strength, class FROM nodes WHERE kind='fact' AND notes='archive' AND (${like})`
+      `SELECT signature, fact, first_seen, strength, class FROM nodes WHERE kind='fact' AND notes='archive' AND (${like}) ORDER BY first_seen DESC LIMIT 200`
     ).all(...params);
     // rank by how many distinct query terms a row contains, then recency
     archiveRows = rows.map((r) => {
