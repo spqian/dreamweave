@@ -45,13 +45,17 @@ async function main() {
 
   const qvec = toVecBlob(await embedOne(args.query));
 
-  // 1) Vector KNN -> candidate seeds (cosine distance; lower = closer).
+  // 1) Vector KNN -> candidate seeds (cosine distance; lower = closer). Seeds are FACTS
+  //    only: entity hubs are also embedded, but a hub seed consumes a limited seed slot
+  //    and (being generic) starts the graph walk from a broad connector, diluting the
+  //    cluster. Hubs still enter the cluster as walk frontier via fact co-mention edges.
   const knn = db.prepare(`
     SELECT n.signature AS signature, n.strength AS strength, n.class AS class, v.distance AS distance
     FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
     JOIN nodes n ON n.id = v.rowid
+    WHERE n.kind = 'fact'
     ORDER BY v.distance
-  `).all(qvec, args.k);
+  `).all(qvec, args.k * 2);
 
   const seedRows = knn.slice(0, args.seedLimit);
   const seeds = seedRows.map((r) => r.signature);

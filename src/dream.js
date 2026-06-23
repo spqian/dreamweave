@@ -228,7 +228,24 @@ async function ingestHarness(db, file, prune, asOf) {
       const fact = String(m.fact || "").replace(UNTRUSTED, "").trim();
       const category = m.category || "fact";
       const ex = byMem.get(mid);
-      if (ex) { db.prepare("UPDATE nodes SET fact=?, salience=? WHERE id=?").run(fact || ex.fact, category, ex.id); res.refreshed += 1; continue; }
+      if (ex) {
+        const newFact = fact || ex.fact;
+        if (newFact !== ex.fact) {
+          // BUG-FIX: text changed for an existing memory — its stored vector is now stale.
+          // Drop the vec row + text so the nightly embed-missing re-embeds it (keeps
+          // vector ↔ text in sync). Also REVIVE a re-confirmed Tier-3 archive node back to
+          // the active tier: re-ingestion by the source of truth is a strong reactivation
+          // signal, so it earns its way out of the keyword-only bookshelf.
+          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(ex.id));
+          db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END WHERE id=?").run(newFact, category, ex.id);
+        } else if (ex.notes === "archive") {
+          // re-confirmed but text unchanged: still revive from archive (re-embed via missing).
+          db.prepare("UPDATE nodes SET salience=?, notes=NULL WHERE id=?").run(category, ex.id);
+        } else {
+          db.prepare("UPDATE nodes SET salience=? WHERE id=?").run(category, ex.id);
+        }
+        res.refreshed += 1; continue;
+      }
       const cls = CAT2CLASS[category] || "semantic";
       const sig = uniqueSig(db, `fact:${deriveSlug(fact)}`);
       const id = nextId(db);
@@ -565,6 +582,20 @@ async function weave(db, opts) {
   const SIM = (opts && opts.sim) || 0.45;
   const llm = (opts && opts.llm) ? getLLM() : { available: false };
 
+  // INCREMENTAL WEAVE (env MEMORY_INCREMENTAL_WEAVE=1): brain-faithful — only process
+  // NEW facts (first_seen > last_weave) and DIRTY ones (merge survivors whose text
+  // changed: gist updated since last_weave). Existing facts already have their entity
+  // and sibling edges; a new fact AMENDS its old neighbors by linking to them
+  // (recall walks edges bidirectionally, so new->old suffices), and a newly-created
+  // entity hub re-links only the old facts that textually mention it (scoped, not O(N)).
+  // This makes nightly cost scale with NEW material, not total store size. Default off
+  // (full re-derivation) preserves exact legacy behavior.
+  const incremental = process.env.MEMORY_INCREMENTAL_WEAVE === "1" || (opts && opts.incremental);
+  const lastWeave = incremental ? (getMeta(db, "last_weave") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
+  const isToWeave = (n) => !incremental
+    || (n.first_seen && n.first_seen > lastWeave)
+    || (n.notes === "gist" && n.last_reactivated && n.last_reactivated > lastWeave);
+
   // 1) entity vocab from existing entity hubs
   let vocab = vocabWithForms(db);
 
@@ -573,12 +604,13 @@ async function weave(db, opts) {
   //    candidate becomes a hub only if it recurs across facts (or has a strong email signal).
   //    When an LLM is enabled it ADDS a typed read (catches single-name principals and
   //    types orgs/places correctly); the two are unioned for best recall.
-  const factRows = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  const allActive = db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  const factRows = incremental ? allActive.filter(isToWeave) : allActive;
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
   const corpusEnts = ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 });
   let llmEnts = [];
-  if (llm.available) {
+  if (llm.available && factRows.length) {
     try { llmEnts = await judge.extractEntitiesLLM(factRows.map((f) => f.fact || ""), llm); }
     catch (e) { process.stderr.write(`[weave] llm extract failed: ${e.message}\n`); }
   }
@@ -587,6 +619,7 @@ async function weave(db, opts) {
     if (!allEnts.has(e.sig)) allEnts.set(e.sig, { sig: e.sig, type: e.type, forms: new Set(e.forms) });
     else e.forms.forEach((f) => allEnts.get(e.sig).forms.add(f));
   }
+  const newHubSigs = [];
   const tx1 = db.transaction(() => {
     for (const e of allEnts.values()) {
       if (haveSig.has(e.sig)) continue;
@@ -594,15 +627,17 @@ async function weave(db, opts) {
       const formsStr = [...e.forms].filter((f) => f.length >= 3).join("|");
       db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
         VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", formsStr);
-      haveSig.add(e.sig); newHubs += 1;
+      haveSig.add(e.sig); newHubs += 1; newHubSigs.push(e.sig);
     }
   });
   tx1();
 
   // 2.5) CANONICALIZATION (LLM): fold alias hubs ("Jamie" -> "person:jamie-chen",
   //      "SF" -> "place:san-francisco") into one canonical hub before linking.
+  //      In incremental mode, only run when NEW hubs appeared (no new entities => no new
+  //      aliases to reconcile) — bounds the nightly LLM cost.
   let aliasesMerged = 0;
-  if (llm.available) {
+  if (llm.available && (!incremental || newHubs > 0)) {
     const hubs = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all()
       .map((r) => ({ sig: r.signature, label: ent.labelOf(r.signature) }));
     let groups = [];
@@ -615,13 +650,24 @@ async function weave(db, opts) {
   }
   vocab = vocabWithForms(db);
 
-  // 3) co-mention edges fact -> entity
+  // 3) co-mention edges fact -> entity. For toWeave (new/dirty) facts: link all entities
+  //    they mention. AMENDMENT: when new hubs were created, also link the EXISTING facts
+  //    that textually mention them (scoped to those hubs' forms — an index-free LIKE over
+  //    active facts, bounded by #new-hubs, not a full O(N) re-scan).
   const hasEdge = db.prepare("SELECT 1 FROM edges WHERE src=? AND dst=? AND rel=?");
   const addEdge = (src, rel, dst, w) => { if (src === dst) return; if (!hasEdge.get(src, dst, rel)) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(src, rel, dst, w, now, now); };
   let mentionEdges = 0;
   const tx2 = db.transaction(() => {
     for (const f of factRows) {
       for (const sig of ent.coMentions(f.fact || "", vocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
+    }
+    if (incremental && newHubSigs.length) {
+      const newVocab = vocabWithForms(db).filter((v) => newHubSigs.includes(v.sig));
+      const toWeaveSigs = new Set(factRows.map((f) => f.signature));
+      for (const f of allActive) {
+        if (toWeaveSigs.has(f.signature)) continue; // already linked above
+        for (const sig of ent.coMentions(f.fact || "", newVocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
+      }
     }
   });
   tx2();
@@ -639,7 +685,13 @@ async function weave(db, opts) {
   const HIGH = (opts && opts.high) || 0.62;
   const mentionsOf = (sig) => new Set(db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(sig).map((r) => r.dst));
   let relatedEdges = 0, similarEdges = 0;
-  const factNodes = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  // Sibling linking runs only for toWeave (new/dirty) facts: each links to its k nearest
+  // among ALL active facts, AMENDING those old neighbors (recall traverses edges
+  // bidirectionally, so a single new->old edge connects both ways). Old facts already
+  // hold their sibling edges from the night they were woven.
+  const factNodes = incremental
+    ? db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().filter(isToWeave)
+    : db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   for (const f of factNodes) {
     const fe = mentionsOf(f.signature);
     const qv = await queryVec(db, f);
@@ -664,9 +716,12 @@ async function weave(db, opts) {
   if (SUP) {
     const CUE = /\b(correct(?:ion|ed|s)?|chang(?:e|ed|ing)?|updat(?:e|ed)?|revis(?:e|ed)?|no longer|instead of|rather than|supersed(?:e|ed|es)?|overrid(?:e|den|es)?|replac(?:e|ed|es)?|moved? (?:to|up|earlier|from)|push(?:ed)? (?:to|up|earlier)|now \w+ not)\b/i;
     const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
-    const full = db.prepare("SELECT id, signature, fact, first_seen, strength, class FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+    const full = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
     const bySig = new Map(full.map((r) => [r.signature, r]));
-    for (const f of full) {
+    // A correction is always a NEW fact, so in incremental mode only scan toWeave facts
+    // for supersede cues (the prior value is found among ALL active via bySig/KNN).
+    const supSource = incremental ? full.filter(isToWeave) : full;
+    for (const f of supSource) {
       if (!f.fact || !CUE.test(f.fact)) continue;
       const fe = mentionsOf(f.signature);   // entity hubs (may be empty — e.g. single-name principals)
       const ft = toks(f.fact);              // content tokens, for entity-free corroboration
@@ -696,19 +751,24 @@ async function weave(db, opts) {
     }
   }
 
-  // 6) zero-island guarantee: any fact still degree 0 -> link nearest as similar_to (weak, agent retypes later).
+  // 6) zero-island guarantee: any active fact still degree 0 -> link nearest as similar_to.
+  //    Scans ALL active facts (not just toWeave): demotion of a neighbor can orphan an
+  //    OLD fact, so the guarantee must cover the whole active set. Cheap — the KNN runs
+  //    only for the (rare) actual islands.
   let rescued = 0;
   const deg = degreeMap(db);
-  for (const f of factNodes) {
+  const islandScan = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  for (const f of islandScan) {
     if (deg.get(f.signature)) continue;
     const qv = await queryVec(db, f);
     const nb = db.prepare(`SELECT n.signature s, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 6) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND n.kind='fact'`).all(qv, f.id)[0];
     if (nb) { addEdge(f.signature, "similar_to", nb.s, Number((1 - nb.d).toFixed(3))); rescued += 1; }
   }
 
+  if (incremental) setMeta(db, "last_weave", now);
   repairGraph(db);
   const islands = [...db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature)].filter((s) => !degreeMap(db).get(s));
-  return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, rescued_islands: rescued, remaining_islands: islands.length };
+  return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
 }
 
 // ---- REFLECT: the LLM JUDGMENT pass (salience + semantic merge) -------------
@@ -734,9 +794,14 @@ async function reflect(db, opts) {
     ? " AND (notes IS NULL OR notes NOT IN ('detail','archive'))"
     : " AND (notes IS NULL OR notes<>'archive')";
 
-  // SALIENCE: judge importance over ACTIVE, not-yet-salient facts only.
+  // SALIENCE: judge importance over not-yet-salient facts. In incremental mode, only
+  // judge facts NEW since the last reflect (importance is decided once, not re-judged
+  // nightly) — bounds LLM cost to new material.
+  const incrementalR = process.env.MEMORY_INCREMENTAL_WEAVE === "1" || (opts && opts.incremental);
+  const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
+  const newOnlySql = incrementalR ? ` AND first_seen > '${lastReflect.replace(/'/g, "")}'` : "";
   let salientTagged = 0;
-  const candidates = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notColdSql}`).all();
+  const candidates = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notColdSql}${newOnlySql}`).all();
   let flagged = new Set();
   try { flagged = await judge.salienceLLM(candidates, llm); }
   catch (e) { process.stderr.write(`[reflect] salience failed: ${e.message}\n`); }
@@ -750,7 +815,8 @@ async function reflect(db, opts) {
   txS();
 
   // MERGE: get near-duplicate clusters, let the LLM decide + write the rollup, apply.
-  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: keepDetail0 });
+  // Incremental: only seed merge clusters from facts new since last reflect.
+  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: keepDetail0, seedAfter: incrementalR ? lastReflect : null });
   const clusters = cons.clusters || [];
   let decisions = [];
   if (clusters.length) {
@@ -818,6 +884,7 @@ async function reflect(db, opts) {
   const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
   if (missing.length) await reembed(db, missing);
   await weave(db, { asOf: opts && opts.asOf, llm: false });
+  if (incrementalR) setMeta(db, "last_reflect", now);
   repairGraph(db);
   return { llm: llm.label, salient_tagged: salientTagged, clusters_seen: clusters.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed, details_retained: retained };
 }
@@ -832,11 +899,16 @@ async function consolidate(db, opts) {
   const excl = (opts && opts.excludeDetail)
     ? " AND (notes IS NULL OR notes NOT IN ('detail','archive'))"
     : " AND (notes IS NULL OR notes<>'archive')";
-  const facts = db.prepare(`SELECT id, signature, fact FROM nodes WHERE kind='fact'${excl}`).all();
+  const facts = db.prepare(`SELECT id, signature, fact, first_seen FROM nodes WHERE kind='fact'${excl}`).all();
   const mentionsOf = (sig) => new Set(db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(sig).map((r) => r.dst));
+  // Incremental: only SEED clusters from new facts (a new fact may merge into an existing
+  // cluster; its KNN still finds the old members). Existing-existing dup pairs were
+  // already evaluated the night they arrived. seedAfter = last_reflect timestamp.
+  const seedAfter = opts && opts.seedAfter ? opts.seedAfter : null;
+  const seeds = seedAfter ? facts.filter((f) => (f.first_seen || "") > seedAfter) : facts;
   const seen = new Set();
   const clusters = [];
-  for (const f of facts) {
+  for (const f of seeds) {
     if (seen.has(f.signature)) continue;
     const qv = await queryVec(db, f);
     const nbrs = db.prepare(`SELECT n.id, n.signature s, n.fact, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 10) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND n.kind='fact'${excl}`).all(qv, f.id);
