@@ -72,19 +72,44 @@ forgotten. When a specific question names a cold fact, the keyword tier surfaces
    `MEMORY_MERGE_KEEP`). Synthesis/"what's the policy" hits the gist; "what exactly did
    X commit to" retrieves the detail. Never let the gist *overwrite* the episode.
 
-5. **Recall returns NEIGHBORS.** The graph layer exists so retrieval traverses: a hit
-   pulls in its graph neighbors, not just itself. Don't reduce recall to flat vector
-   top-k.
+5. **Recall returns NEIGHBORS — this is how we aid SYNTHESIS.** The graph layer exists
+   so retrieval traverses: a hit pulls in its graph neighbors (shared-entity facts,
+   related/supersede chains, the gist↔detail link), not just itself. `recall` /
+   `m_recall` must surface this connected cluster, because synthesis questions ("how did
+   X evolve", "what stayed constant across Y") are answered by *assembling related
+   memories*, not by one top-k vector hit. A flat vector top-k that drops neighbors will
+   fail synthesis. (Empirically, the synthesis category is won by the breadth of the
+   recalled neighborhood, not by any single fact's rank.)
 
-6. **Relevance order is primary in the injected context.** When rendering retrieved
-   memories, rank by relevance (hops/strength). Do NOT globally reorder by time — an
-   earlier experiment proved that starves pointed factual/synthesis questions. Temporal
-   info is metadata (coarse, relative age tags), and sequence is carried by ordering the
-   *episodic* facts within their tier, never by displacing relevance.
+6. **Relevance order is primary in the injected RETRIEVAL context.** When rendering
+   retrieved memories for an answer, rank by relevance (hops/strength). Do NOT globally
+   reorder that context by time — an experiment proved a global gist-then-timeline
+   reorder *starves* pointed factual/synthesis questions of their best evidence
+   (factual −0.6 n=73, synthesis −0.8 n=19). Temporal info rides as metadata, not as a
+   reordering of the retrieval result.
 
 7. **No fabrication.** Consolidation/canonicalization may only assert what existing
    memories entail. The LLM judge decides types/aliases/merges/importance — it is a
    judge, not an author.
+
+8. **Merge with TEMPORAL SEQUENCING — the Tier-1 "instincts" are sequence-aware.** Two
+   parts:
+   - **Within the projection:** the injected gist list is laid out so the *episodic*
+     (dated) facts carry their order — Tier 1 is not a bag of timeless statements, it is
+     sequence-aware, so "what's current / what came before what" is legible from the
+     instincts alone (without a lookup). Order the episodic tier chronologically; gist
+     schema facts are timeless. Carry coarse, *relative* age (the brain reconstructs
+     "when" from order + fuzzy distance, not a stored clock) — never a precise timestamp
+     as the load-bearing signal.
+   - **Within merge:** consolidation must PRESERVE the temporal sequence it summarizes.
+     A merge that collapses a multi-day evolution ("$510M → $480M → $465M") into one
+     timeless blob destroys the answer to "how did it change" and "what's the latest".
+     The gist may summarize, but the dated constituents survive as `detail` (principle
+     4) so the sequence is recoverable. Never let a merge erase *when*.
+
+   Guardrail (learned the hard way): sequence-awareness lives in the **projection layout
+   and the retained detail**, NOT in reordering the retrieval context (see principle 6).
+   The two are different surfaces; don't conflate them.
 
 ## Neuroscience grounding (why these tiers)
 
@@ -112,3 +137,30 @@ forgotten. When a specific question names a cold fact, the keyword tier surfaces
 | `MEMORY_SUPERSEDE=1`  | Supersede-aware consolidation (corrections).           |
 
 When adding features, state which tier they touch and which principle(s) they uphold.
+
+## Experiment log (Recall Bench, EA persona, Azure gpt-5.4-mini judge, sample=6)
+
+Evidence behind the principles. Scores are /6 overall at the 30/90/180-day checkpoints.
+
+| Variant                                   | 30d  | 90d  | 180d | Verdict |
+|-------------------------------------------|------|------|------|---------|
+| baseline (mechanical dream, 500-cap)      | 5.13 | 5.15 | 4.90 | —       |
+| **+ reflect (LLM salience + merge)**      | 5.36 | 5.21 | 5.01 | **champion** |
+| + CLS context reorder (gist+timeline)     | 5.29 | 4.80 | 4.66 | REGRESSION — reordered away from relevance; starved factual(−0.6,n73)/synthesis(−0.8,n19). → principle 6 |
+| + temporal age tags (relevance kept)      | 5.24 | 5.03 | 4.95 | wash — tags as metadata are ~neutral; recency is only ~3.5% of Qs |
+| + retain-detail / 3-tier                  | —    | —    | run  | (current) targets decision-tracking & synthesis at the SOURCE |
+
+Key diagnoses from the question logs:
+- **Decision-tracking & synthesis failures were DELETIONS, not retrieval misses.** The
+  exact answers existed in the corpus (e.g. day-30 "same-week resolution plan plus
+  weekly executive sponsor reviews") but aggressive merge + the hard 500-cap had
+  *removed* them before the day-180 query — so even a full-DB recall returned "no
+  record". → principles 3 (demote-don't-delete) & 4 (keep detail).
+- **Reflect's merge lifted synthesis over baseline** (gist kills redundancy) **but the
+  same merge hurt decision/recency** by collapsing distinct dated states. → principle 8
+  (merge must preserve temporal sequence; keep the dated detail).
+- **The 500-cap is faithful to what Scout INJECTS, not what our side DB must REMEMBER.**
+  Conflating the two caused the deletions. → the whole three-tier split.
+
+Open question under audit: does the embedded (Tier-2) set stay bounded over a long run,
+or can entity hubs / detail accumulation make nightly cost grow? (principle 2).
