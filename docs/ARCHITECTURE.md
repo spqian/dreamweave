@@ -148,7 +148,17 @@ Evidence behind the principles. Scores are /6 overall at the 30/90/180-day check
 | **+ reflect (LLM salience + merge)**      | 5.36 | 5.21 | 5.01 | **champion** |
 | + CLS context reorder (gist+timeline)     | 5.29 | 4.80 | 4.66 | REGRESSION — reordered away from relevance; starved factual(−0.6,n73)/synthesis(−0.8,n19). → principle 6 |
 | + temporal age tags (relevance kept)      | 5.24 | 5.03 | 4.95 | wash — tags as metadata are ~neutral; recency is only ~3.5% of Qs |
-| + retain-detail / 3-tier                  | —    | —    | run  | (current) targets decision-tracking & synthesis at the SOURCE |
+| + retain-detail / 3-tier (full weave)     | 5.38 | —    | —    | ties champion at 30d; full O(N) weave stalled (~21 h/180d) → moved to incremental |
+| **+ 3-tier, INCREMENTAL weave**           | **5.64** | **5.58** | **5.46** | **NEW CHAMPION** — beats reflect at every horizon (+0.28 / +0.37 / +0.45), and the margin *grows* with distance |
+
+The incremental three-tier run is the new champion. The win is concentrated exactly where
+the diagnosis predicted: **decision-tracking 5.71 at 180d (n=21)** — the category that had
+been collapsing to "no record" — and synthesis holds at 4.89 (n=19) aided by recall
+returning graph neighbors. Hallucination stays low (4.4 / 4.9 / 8.3%). Cost is bounded:
+incremental weave touches only new/dirty facts (~30/night vs full's ~1389), so the run that
+was infeasible at full-weave O(N) finished end-to-end. The growing margin at 90d/180d is the
+point — retain-detail + demote-don't-delete pays off most at long range, where the old
+500-cap had been deleting the answers.
 
 Key diagnoses from the question logs:
 - **Decision-tracking & synthesis failures were DELETIONS, not retrieval misses.** The
@@ -162,5 +172,9 @@ Key diagnoses from the question logs:
 - **The 500-cap is faithful to what Scout INJECTS, not what our side DB must REMEMBER.**
   Conflating the two caused the deletions. → the whole three-tier split.
 
-Open question under audit: does the embedded (Tier-2) set stay bounded over a long run,
-or can entity hubs / detail accumulation make nightly cost grow? (principle 2).
+Resolved by the incremental run: the embedded (Tier-2) set stays bounded — demotion holds
+the cap (active plateaus ~2500, archive grows free at zero nightly cost), and incremental
+weave keeps per-night work flat instead of O(N). Residual follow-up: the graph-maintenance
+passes (island-scan / degree map / repair) still walk all edges nightly, so pace degrades
+mildly as the bank fills (~0.33→0.17 days/min past the cap). Flattening those to incremental
+is the next cost optimization — not correctness-critical, the cap itself is firmly bounded.
