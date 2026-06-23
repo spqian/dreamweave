@@ -609,9 +609,15 @@ async function reflect(db, opts) {
   const llm = getLLM();
   if (!llm.available) return { llm: "none", note: "reflect requires DREAM_LLM; skipped", salient_tagged: 0, clusters_merged: 0, entries_reclaimed: 0 };
 
+  const keepDetail0 = process.env.MEMORY_MERGE_KEEP === "1" || (opts && opts.keepDetail);
+  // In retain-detail mode, archived 'detail' nodes are lookup-only — exclude them from
+  // the nightly salience/merge passes so each night only processes NEW + gist material
+  // (bounds LLM cost and avoids re-churning the archive).
+  const notDetail = keepDetail0 ? " AND (notes IS NULL OR notes <> 'detail')" : "";
+
   // SALIENCE: judge importance over facts not already salient.
   let salientTagged = 0;
-  const candidates = db.prepare("SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'").all();
+  const candidates = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notDetail}`).all();
   let flagged = new Set();
   try { flagged = await judge.salienceLLM(candidates, llm); }
   catch (e) { process.stderr.write(`[reflect] salience failed: ${e.message}\n`); }
@@ -625,14 +631,22 @@ async function reflect(db, opts) {
   txS();
 
   // MERGE: get near-duplicate clusters, let the LLM decide + write the rollup, apply.
-  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0 });
+  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: keepDetail0 });
   const clusters = cons.clusters || [];
   let decisions = [];
   if (clusters.length) {
     try { decisions = await judge.mergeClustersLLM(clusters, llm); }
     catch (e) { process.stderr.write(`[reflect] merge failed: ${e.message}\n`); }
   }
-  let clustersMerged = 0, reclaimed = 0;
+  let clustersMerged = 0, reclaimed = 0, retained = 0;
+  // RETAIN-DETAIL mode (env MEMORY_MERGE_KEEP=1): the merge writes a GIST survivor for
+  // the projection, but the detailed constituents are KEPT in the db (flagged
+  // notes='detail') instead of deleted — so recall (m_recall / recall.js over the full
+  // side store) can still surface the specific fact when a question needs the detail.
+  // The projection (exportHarness) injects the gist and skips 'detail'; the side DB is
+  // the lookup layer. This is the "vague gist + look-it-up" model: the 500-cap bounds
+  // what we INJECT, not what we REMEMBER. Default (unset) = destructive merge (legacy).
+  const keepDetail = keepDetail0;
   const txM = db.transaction(() => {
     for (const dec of decisions) {
       if (!dec) continue;
@@ -651,18 +665,29 @@ async function reflect(db, opts) {
           anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survivor.id);
       // re-embed survivor to its new text so retrieval matches the merged content
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
-      // forget the other members; copy their mention edges onto the survivor first.
       for (const m of members) {
         if (m.id === survivor.id) continue;
+        // copy the member's mention edges onto the survivor (so the gist stays connected)
         for (const e of db.prepare("SELECT dst, rel, weight FROM edges WHERE src=? AND rel='mentions'").all(m.signature)) {
           const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='mentions' AND dst=?").get(survivor.signature, e.dst);
           if (!dup && survivor.signature !== e.dst) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "mentions", e.dst, e.weight, now, now);
         }
-        db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(m.signature, m.memory_id || "", now, `merged into ${survivor.signature}`);
-        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
-        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(m.id));
-        db.prepare("DELETE FROM nodes WHERE id=?").run(m.id);
-        reclaimed += 1;
+        if (keepDetail) {
+          // RETAIN: keep the detailed fact in the DB as a lookup-only 'detail' node.
+          // Not projected (gist is), but fully retrievable via recall. Link it to the
+          // gist so a graph walk from the gist can reach the specifics.
+          db.prepare("UPDATE nodes SET notes='detail', last_reactivated=? WHERE id=?").run(now, m.id);
+          const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='related_to' AND dst=?").get(survivor.signature, m.signature);
+          if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", m.signature, 0.6, now, now);
+          retained += 1;
+        } else {
+          // DESTRUCTIVE (legacy): tombstone + delete the member.
+          db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(m.signature, m.memory_id || "", now, `merged into ${survivor.signature}`);
+          db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
+          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(m.id));
+          db.prepare("DELETE FROM nodes WHERE id=?").run(m.id);
+          reclaimed += 1;
+        }
       }
       clustersMerged += 1;
     }
@@ -674,7 +699,7 @@ async function reflect(db, opts) {
   if (missing.length) await reembed(db, missing);
   await weave(db, { asOf: opts && opts.asOf, llm: false });
   repairGraph(db);
-  return { llm: llm.label, salient_tagged: salientTagged, clusters_seen: clusters.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed };
+  return { llm: llm.label, salient_tagged: salientTagged, clusters_seen: clusters.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed, details_retained: retained };
 }
 
 // ---- CONSOLIDATE (report merge candidates; pressure-aware threshold) --------
@@ -683,14 +708,15 @@ async function consolidate(db, opts) {
   const bp = budgetParams(factCount);
   // Under entry-budget pressure, lower the similarity bar so more near-dups/rollups surface.
   const SIM = (opts && opts.sim) || bp.mergeSim;
-  const facts = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact'").all();
+  const excl = (opts && opts.excludeDetail) ? " AND (notes IS NULL OR notes <> 'detail')" : "";
+  const facts = db.prepare(`SELECT id, signature, fact FROM nodes WHERE kind='fact'${excl}`).all();
   const mentionsOf = (sig) => new Set(db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(sig).map((r) => r.dst));
   const seen = new Set();
   const clusters = [];
   for (const f of facts) {
     if (seen.has(f.signature)) continue;
     const qv = toVecBlob(await embedOne(f.fact || f.signature));
-    const nbrs = db.prepare(`SELECT n.id, n.signature s, n.fact, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 10) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND n.kind='fact'`).all(qv, f.id);
+    const nbrs = db.prepare(`SELECT n.id, n.signature s, n.fact, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 10) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND n.kind='fact'${excl}`).all(qv, f.id);
     const fe = mentionsOf(f.signature);
     const group = [{ sig: f.signature, fact: f.fact }];
     for (const nb of nbrs) {
@@ -755,7 +781,10 @@ function doctor(db) {
 //                      position encodes "when", each carrying a coarse, fuzzy age tag.
 // "Now" for age tags: --as-of, else the latest memory (the bench simulates time).
 function exportHarness(db, asOf) {
-  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact'").all();
+  // Detail nodes (notes='detail') are lookup-only — kept in the side DB for recall but
+  // NOT injected; the projection carries the gist. This is the cap-on-inject, not-on-
+  // remember split. Everything else projects.
+  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes <> 'detail')").all();
   const latest = facts.reduce((m, n) => { const t = Date.parse(n.first_seen || ""); return t && t > m ? t : m; }, 0);
   const nowRef = asOf ? new Date(asOf) : (latest ? new Date(latest) : new Date());
 

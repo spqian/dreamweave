@@ -142,6 +142,7 @@ export function createAgentMemoryAdapter(rawCfg) {
   const entryTarget = String(cfg.entryTarget || 250);
   const entryMax = String(cfg.entryMax || 500);
   const supersede = cfg.supersede === true; // opt-in supersede-aware consolidation
+  const retainDetail = cfg.retainDetail === true; // non-destructive merge: keep detail facts for recall
   let dataDir = null;
   let envExtra = {};
   let lastAsOf = null; // checkpoint "now" — anchors relative-age tags in recall
@@ -158,6 +159,7 @@ export function createAgentMemoryAdapter(rawCfg) {
       envExtra = { MEMORY_ENTRY_TARGET: entryTarget, MEMORY_ENTRY_MAX: entryMax };
       if (supersede) envExtra.MEMORY_SUPERSEDE = "1";
       if (dreamModel) envExtra.DREAM_LLM = dreamModel; // engine LLM judgment uses the same .env keys as the judge
+      if (retainDetail) envExtra.MEMORY_MERGE_KEEP = "1"; // keep merged detail facts in the side DB for recall
     },
 
     async ingestDay(day, content, metadata) {
