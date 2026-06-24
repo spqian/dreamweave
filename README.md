@@ -1,14 +1,24 @@
-# agent-memory
+# dreamweave
 
-Graph + vector long-term memory for AI agents — a drop-in replacement for the typical
-"flat text + RAG" memory bank. It gives an agent a **durable, self-maintaining knowledge graph**
-that a nightly **dream** pass consolidates (forget / merge / weave) and a **recall** path queries
-with semantic vector search + graph expansion. Ships with a 3D **semantic nebula explorer** to
-inspect the store.
+**A nightly memory engine for [OpenClaw](https://github.com/openclaw/openclaw)-based agents (including Microsoft Scout / Clawpilot).**
+
+Most agent memory is a flat text file that grows unbounded and gets RAG'd. **dreamweave** is different: your agent *dreams*. A nightly pass **weaves a brain-faithful graph+vector memory** and consolidates it like sleep — a forgetting curve drops noise, duplicates **merge**, and survivors **weave** into one connected graph — across three tiers (instinct / recall / archive). The **recall** path then answers with semantic vector search **plus graph-neighbor expansion**.
+
+What makes it different from other "dream"/memory skills:
+
+- **Graph + vector, not flat RAG** — entities and facts with edges; recall returns *neighbors*, which is what actually helps synthesis. The **weave** is the signature operation.
+- **Three tiers** — instinct (~500 injected gist) / recall (~2,500 graph+vector) / archive (uncapped bookshelf). It bounds what's **injected**, not what's **remembered**.
+- **Brain-faithful consolidation** — forgetting curve, REM-style merge, temporal sequencing, demote-don't-delete.
+- **Bounded nightly cost** — incremental weave + embed-once, so it's genuinely runnable *every* night, forever.
+- **Benchmarked** — measured on the [Recall Bench](https://github.com/Stevenic/recall), not vibes.
 
 Everything runs **locally and free**: SQLite (`better-sqlite3`) + `sqlite-vec` for the vector index,
 and `@huggingface/transformers` for on-device embeddings (`all-MiniLM-L6-v2`, 384-dim). No API keys,
-no network after the one-time model download.
+no network after the one-time model download. Ships with a 3D **semantic nebula explorer** to inspect the store.
+
+> **Not affiliated with, authorized, or endorsed by Microsoft.** This is an independent, community
+> project. "Microsoft Scout" and related names are trademarks of their respective owners and are
+> referenced only to describe compatibility.
 
 ---
 

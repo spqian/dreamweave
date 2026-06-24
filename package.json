@@ -1,5 +1,5 @@
 {
-  "name": "dream-memory",
+  "name": "dreamweave",
   "version": "0.1.0",
   "description": "Graph + vector long-term memory for AI agents with a nightly 'dream' consolidation pass (forgetting curve, merge, entity weave, supersede-aware corrections) over a local SQLite + sqlite-vec store. Includes a 3D semantic-nebula explorer and a Recall Bench harness.",
   "license": "MIT",
@@ -35,5 +35,13 @@
     "@huggingface/transformers": "^4.2.0",
     "better-sqlite3": "^12.10.0",
     "sqlite-vec": "^0.1.9"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spqian/dreamweave.git"
+  },
+  "homepage": "https://github.com/spqian/dreamweave#readme",
+  "bugs": {
+    "url": "https://github.com/spqian/dreamweave/issues"
   }
 }
