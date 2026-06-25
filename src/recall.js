@@ -43,6 +43,19 @@ async function main() {
   const db = new Database(DB_PATH, { readonly: true });
   sqliteVec.load(db);
 
+  // Supersede awareness. A correction is stored as an edge (newer)--supersedes-->(older),
+  // so the edge's `dst` is the STALE "from" value. The dream design deliberately PRESERVES
+  // that stale node (so the transition stays answerable for contradiction-resolution), which
+  // means recall must DEMOTE — never drop — it. supersededBy maps stale -> surviving signature.
+  const supersededBy = new Map();
+  for (const e of db.prepare("SELECT src, dst, first_seen FROM edges WHERE rel='supersedes'").all()) {
+    const prev = supersededBy.get(e.dst);
+    // If a node was corrected more than once, keep the NEWEST surviving correction.
+    if (!prev || (Date.parse(e.first_seen || "") || 0) >= (prev.t || 0)) {
+      supersededBy.set(e.dst, { survivor: e.src, t: Date.parse(e.first_seen || "") || 0 });
+    }
+  }
+
   const qvec = toVecBlob(await embedOne(args.query));
 
   // 1) Vector KNN -> candidate seeds (cosine distance; lower = closer). Seeds are FACTS
@@ -57,7 +70,28 @@ async function main() {
     ORDER BY v.distance
   `).all(qvec, args.k * 2);
 
-  const seedRows = knn.slice(0, args.seedLimit);
+  // Seed selection with supersede demotion: when BOTH a stale version and its surviving
+  // correction are vector-retrieved, we are choosing between two versions of the SAME fact —
+  // sink the stale one below its survivor so the current value seeds the cluster (and lands
+  // at the top of what the agent reads). When the survivor was not retrieved, the stale node
+  // keeps its vector position (it may be the only answer we have). Pure distance order is
+  // otherwise preserved.
+  const knnSigs = new Set(knn.map((r) => r.signature));
+  const supersededWithSurvivor = (sig) => {
+    const s = supersededBy.get(sig);
+    return !!(s && knnSigs.has(s.survivor));
+  };
+  const rankedKnn = knn
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => {
+      const da = supersededWithSurvivor(a.r.signature) ? 1 : 0;
+      const dbb = supersededWithSurvivor(b.r.signature) ? 1 : 0;
+      if (da !== dbb) return da - dbb;
+      return a.i - b.i;
+    })
+    .map((x) => x.r);
+
+  const seedRows = rankedKnn.slice(0, args.seedLimit);
   const seeds = seedRows.map((r) => r.signature);
 
   // Graph expansion runs only when we have vector seeds; but the Tier-3 keyword search
@@ -149,6 +183,7 @@ async function main() {
       edgeCount: clusterEdges.length,
       nodes: clusterRows.map((r) => {
         const d = ageDays(r.first_seen, nowRef);
+        const sup = supersededBy.get(r.signature);
         return {
           id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
           kind: r.kind, fact: (r.fact || "").trim(),
@@ -158,14 +193,20 @@ async function main() {
           first_seen: r.first_seen || null,
           age_days: d,
           age: ageTag(d),
+          // Sequencing signal: this node is the superseded ("from") side of a correction,
+          // so a more recent fact overrides it. Consumers should rank it BELOW its survivor.
+          superseded: !!sup,
+          superseded_by: sup ? sup.survivor : null,
           tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
         };
       }).concat(archiveRows.map((r) => {
         const d = ageDays(r.first_seen, nowRef);
+        const sup = supersededBy.get(r.signature);
         return {
           id: r.signature, hops: 99, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
           kind: "fact", fact: (r.fact || "").trim(),
-          first_seen: r.first_seen || null, age_days: d, age: ageTag(d), tier: "archive",
+          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          superseded: !!sup, superseded_by: sup ? sup.survivor : null, tier: "archive",
         };
       })),
       edges: clusterEdges,
