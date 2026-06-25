@@ -34,6 +34,14 @@ const { getLLM } = require("./llm");
 const judge = require("./judge");
 const { ageDays, ageTag } = require("./timeline");
 const cfg = require("../config");
+const tuning = require("./tuning");
+
+// Resolved behavioral knobs (defaults <- memory.config.json <- env override).
+// One snapshot per process; the CLI `config` subcommand re-reads fresh.
+const T = tuning.resolve();
+// Effective env for the optional LLM judge: the `judgment` knob supplies DREAM_LLM
+// unless an explicit DREAM_LLM env var is already set (which still wins).
+const llmEnv = () => ({ ...process.env, DREAM_LLM: T.llmSpec || process.env.DREAM_LLM || "" });
 
 const DATA_DIR = cfg.DATA_DIR;
 const DB_PATH = cfg.DB_PATH; // env MEMORY_DB overrides (e.g. dry-run forecasts)
@@ -52,13 +60,13 @@ const EDGE_DECAY = { mentions: 1.0, related_to: 0.985, similar_to: 0.97, superse
 // Hard max 500; performance degrades past 250. Target 250 as the sweet spot. As the bank
 // approaches/exceeds target, dreaming escalates fading + merging. We prefer MERGE (fewer,
 // richer entries) over deletion — entry SIZE may grow to keep the COUNT down.
-const ENTRY_TARGET = Number(process.env.MEMORY_ENTRY_TARGET || 250);
-const ENTRY_MAX = Number(process.env.MEMORY_ENTRY_MAX || 500);
+const ENTRY_TARGET = T.entryTarget; // capacity knob (env MEMORY_ENTRY_TARGET overrides)
+const ENTRY_MAX = T.entryMax;       // capacity knob (env MEMORY_ENTRY_MAX overrides)
 // TIER 2 ("RAG class"): the bounded graph+vector store recall searches. Embedded fact
 // nodes over this cap are DEMOTED (not deleted) to Tier 3 — a raw keyword-only archive
 // (notes='archive', no vector, no edges). 0 disables (single-tier behavior). The brain
 // analog: a bounded associative store + an unindexed "bookshelf" you can still dig through.
-const TIER2_MAX = Number(process.env.MEMORY_TIER2_MAX || 0);
+const TIER2_MAX = T.tier2Max; // capacity+retention knobs (env MEMORY_TIER2_MAX overrides)
 // SQL fragment for "active" facts = Tier 1+2 (embedded, in graph). Tier-3 archive nodes
 // must be excluded from EVERY nightly query that costs compute, re-embeds, or could
 // delete them — they are inert keyword-only cold storage. Use this everywhere except the
@@ -67,7 +75,7 @@ const TIER2_MAX = Number(process.env.MEMORY_TIER2_MAX || 0);
 const ACTIVE_FACT = "kind='fact' AND (notes IS NULL OR notes<>'archive')";
 // Retain/tiered mode: when on, destructive eviction (ENTRY_MAX hard cap, weak-semantic
 // fade) is replaced by DEMOTION — we never physically delete a fact, we move it to Tier 3.
-const TIERED = () => process.env.MEMORY_MERGE_KEEP === "1" || TIER2_MAX > 0;
+const TIERED = () => T.tiered; // retention knob: preserve=tiered(demote), prune=destructive
 
 // pressure = facts / target. Gentle below ~0.6; escalates toward/above 1.0.
 function budgetParams(factCount) {
@@ -333,7 +341,7 @@ function dreamCore(db, flags) {
   // (schema-embedded facts persist; islands fade fastest).
   for (const n of facts) {
     const sf = schema.get(n.signature) || 0;
-    const H = (HALFLIFE[n.class] || HALFLIFE.episodic) * (1 + SCHEMA_HALFLIFE_BONUS * sf) / bp.decayAccel;
+    const H = (HALFLIFE[n.class] || HALFLIFE.episodic) * T.forgetMultiplier * (1 + SCHEMA_HALFLIFE_BONUS * sf) / bp.decayAccel;
     const dDays = Math.max(0, (now.getTime() - Date.parse(n.last_decayed || n.first_seen || nowIso)) / 86400000);
     db.prepare("UPDATE nodes SET strength=?, last_decayed=? WHERE id=?").run(clamp01(n.strength * Math.pow(2, -dDays / H)), nowIso, n.id);
   }
@@ -580,7 +588,7 @@ async function weave(db, opts) {
   const now = (opts && opts.asOf) ? new Date(opts.asOf).toISOString() : new Date().toISOString();
   const K = (opts && opts.k) || 3;
   const SIM = (opts && opts.sim) || 0.45;
-  const llm = (opts && opts.llm) ? getLLM() : { available: false };
+  const llm = (opts && opts.llm) ? getLLM(llmEnv()) : { available: false };
 
   // INCREMENTAL WEAVE (env MEMORY_INCREMENTAL_WEAVE=1): brain-faithful — only process
   // NEW facts (first_seen > last_weave) and DIRTY ones (merge survivors whose text
@@ -590,7 +598,7 @@ async function weave(db, opts) {
   // entity hub re-links only the old facts that textually mention it (scoped, not O(N)).
   // This makes nightly cost scale with NEW material, not total store size. Default off
   // (full re-derivation) preserves exact legacy behavior.
-  const incremental = process.env.MEMORY_INCREMENTAL_WEAVE === "1" || (opts && opts.incremental);
+  const incremental = (opts && opts.incremental) || T.incrementalWeave;
   const lastWeave = incremental ? (getMeta(db, "last_weave") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
   const isToWeave = (n) => !incremental
     || (n.first_seen && n.first_seen > lastWeave)
@@ -712,7 +720,7 @@ async function weave(db, opts) {
   // PRESERVED (pinned against cap-eviction) so the transition stays answerable. Mirrors how a
   // human remembers a correction more vividly than the steady state it replaced.
   let supersedeEdges = 0;
-  const SUP = (opts && opts.supersede) || process.env.MEMORY_SUPERSEDE === "1";
+  const SUP = (opts && opts.supersede) || T.supersede;
   if (SUP) {
     const CUE = /\b(correct(?:ion|ed|s)?|chang(?:e|ed|ing)?|updat(?:e|ed)?|revis(?:e|ed)?|no longer|instead of|rather than|supersed(?:e|ed|es)?|overrid(?:e|den|es)?|replac(?:e|ed|es)?|moved? (?:to|up|earlier|from)|push(?:ed)? (?:to|up|earlier)|now \w+ not)\b/i;
     const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
@@ -782,10 +790,10 @@ async function weave(db, opts) {
 // No-op (returns zeros) when no LLM is configured.
 async function reflect(db, opts) {
   const now = (opts && opts.asOf) ? new Date(opts.asOf).toISOString() : new Date().toISOString();
-  const llm = getLLM();
-  if (!llm.available) return { llm: "none", note: "reflect requires DREAM_LLM; skipped", salient_tagged: 0, clusters_merged: 0, entries_reclaimed: 0 };
+  const llm = getLLM(llmEnv());
+  if (!llm.available) return { llm: "none", note: "reflect requires the judgment knob (or DREAM_LLM); skipped", salient_tagged: 0, clusters_merged: 0, entries_reclaimed: 0 };
 
-  const keepDetail0 = process.env.MEMORY_MERGE_KEEP === "1" || (opts && opts.keepDetail);
+  const keepDetail0 = T.keepDetail || (opts && opts.keepDetail);
   // Nightly LLM cost must scale with NEW material, not total store size. Exclude Tier-3
   // archive ALWAYS (it is inert), and 'detail' in retain mode (already archived for
   // recall). This is the filter the audit flagged: archive was previously sent to the
@@ -797,7 +805,7 @@ async function reflect(db, opts) {
   // SALIENCE: judge importance over not-yet-salient facts. In incremental mode, only
   // judge facts NEW since the last reflect (importance is decided once, not re-judged
   // nightly) — bounds LLM cost to new material.
-  const incrementalR = process.env.MEMORY_INCREMENTAL_WEAVE === "1" || (opts && opts.incremental);
+  const incrementalR = (opts && opts.incremental) || T.incrementalWeave;
   const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
   const newOnlySql = incrementalR ? ` AND first_seen > '${lastReflect.replace(/'/g, "")}'` : "";
   let salientTagged = 0;
@@ -1091,6 +1099,36 @@ function stats(db) {
 }
 
 // ---- CLI --------------------------------------------------------------------
+
+// `config` subcommand: inspect / set the five behavioral knobs (persisted to
+// memory.config.json). Used by the LLM-driven install interview and by humans.
+function configCmd(argv) {
+  const sub = (argv[3] || "show").toLowerCase();
+  if (sub === "show") {
+    const r = tuning.resolve();
+    return {
+      configPath: r.configPath, configExists: r.configExists, knobs: r.knobs,
+      resolved: { entryTarget: r.entryTarget, entryMax: r.entryMax, tier2Max: r.tier2Max, tiered: r.tiered, keepDetail: r.keepDetail, forgetMultiplier: r.forgetMultiplier, incrementalWeave: r.incrementalWeave, supersede: r.supersede, llmSpec: r.llmSpec },
+      summary: tuning.describe(r),
+    };
+  }
+  if (sub === "list" || sub === "knobs") {
+    const out = {};
+    for (const [name, spec] of Object.entries(tuning.KNOBS)) out[name] = { values: spec.values || "off | <provider>:<model>", default: spec.default, help: spec.help };
+    return { knobs: out };
+  }
+  if (sub === "init") { const r = tuning.ensureConfig(); return { ...r, configPath: tuning.CONFIG_PATH }; }
+  if (sub === "get") { const name = argv[4]; return { [name]: tuning.resolve().knobs[name] }; }
+  if (sub === "set") {
+    const name = argv[4], value = argv[5];
+    if (!name || value === undefined) throw new Error("usage: config set <knob> <value>");
+    const res = tuning.setKnob(name, value);
+    if (!res.ok) throw new Error(res.error);
+    return { set: { [name]: res.knobs[name] }, knobs: res.knobs, summary: tuning.describe(tuning.resolve()) };
+  }
+  throw new Error(`unknown config subcommand "${sub}". Use: show | list | set <knob> <value> | get <knob> | init`);
+}
+
 async function main() {
   const cmd = process.argv[2];
   const flags = parseFlags(process.argv);
@@ -1102,7 +1140,7 @@ async function main() {
     else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"]); gate = !r.complete; }
     else if (cmd === "verify-sync") { r = verifySync(db, flags.file); gate = !r.complete; }
     else if (cmd === "dream") r = dreamCore(db, flags);
-    else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], llm: flags.llm === true || flags.llm === "true", supersede: flags.supersede === true || flags.supersede === "true" || process.env.MEMORY_SUPERSEDE === "1" });
+    else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], llm: flags.llm === true || flags.llm === "true", supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
     else if (cmd === "reflect") r = await reflect(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
     else if (cmd === "consolidate") r = await consolidate(db, { sim: Number(flags.sim) || 0 });
     else if (cmd === "budget") r = await budget(db);
@@ -1111,7 +1149,8 @@ async function main() {
     else if (cmd === "record-projection") r = recordProjection(db, flags.file);
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
-    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|dream|weave|reflect|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats> [flags]"); process.exitCode = 2; return; }
+    else if (cmd === "config") r = configCmd(process.argv);
+    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|dream|weave|reflect|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
     console.log(JSON.stringify(r, null, 2));
     if (gate) process.exitCode = 3;
   } finally { db.close(); }

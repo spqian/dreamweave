@@ -57,6 +57,31 @@ Important flags verified against `src/dream.js`:
 - `MEMORY_EMBED_DIM` defaults to `384`.
 - `DREAM_LLM` enables the judgment layer used by `reflect` / typed extraction.
 
+### Behavioral configuration — the five knobs (`src/tuning.js`)
+Behavior is controlled by **five user-facing knobs**, resolved with precedence
+**env override → persisted `memory.config.json` → built-in default**. The defaults ship the
+intended three-tier experience (no flags needed). Inspect/set them with the `config` subcommand:
+
+```bash
+node <AGENT_MEMORY>/src/dream.js config show          # resolved knobs + low-level effect
+node <AGENT_MEMORY>/src/dream.js config list          # knob spec + help
+node <AGENT_MEMORY>/src/dream.js config set <knob> <value>
+```
+
+| Knob | Values (default **bold**) | Effect |
+|---|---|---|
+| `retention` | **preserve** / prune | preserve = tiered demote-to-Tier3 (never delete); prune = legacy destructive |
+| `capacity` | compact / **standard** / expansive | Tier-1 target/max + Tier-2 cap (250/500/2500) |
+| `forgetting` | slow / **natural** / fast | half-life multiplier (×2 / ×1 / ×0.5) |
+| `judgment` | **off** / `<provider>:<model>` | engine-internal `DREAM_LLM` judge for headless runs; **off** ⇒ the host LLM running this skill judges via `consolidate` |
+| `connections` | **incremental** / thorough | incremental vs full nightly weave |
+
+Correction lineage (`supersedes` edges) is **always on** — not a knob (`MEMORY_SUPERSEDE` is a
+bench-only override). Raw `MEMORY_*` / `DREAM_LLM` env vars still override any knob (bench/CI
+escape hatch). The legacy flag names referenced below (`MEMORY_TIER2_MAX`, `MEMORY_MERGE_KEEP`,
+`MEMORY_INCREMENTAL_WEAVE`, `MEMORY_SUPERSEDE`) are those override hooks — out of the box they
+are now driven by the knobs above, with tiered retention **on by default**.
+
 ## The current three-tier memory model
 
 ### Tier 1 — instincts (the projection, ~500)

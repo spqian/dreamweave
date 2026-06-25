@@ -11,6 +11,9 @@ node_modules/
 model-cache/
 .hf-cache/
 
+# local working notes / session handoff — never commit
+HANDOFF.md
+
 # OS / editor
 .DS_Store
 Thumbs.db

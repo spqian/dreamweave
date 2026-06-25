@@ -13,6 +13,7 @@
 const fs = require("fs");
 const path = require("path");
 const cfg = require("./config");
+const tuning = require("./src/tuning");
 
 function ok(m) { console.log("  \u2713 " + m); }
 function info(m) { console.log("    " + m); }
@@ -73,6 +74,13 @@ async function main() {
     info("manual: copy skills/dream and skills/graph-recall into your Scout skills dir,");
     info("then replace <AGENT_MEMORY> in their SKILL.md with: " + cfg.ROOT.replace(/\\/g, "/"));
   }
+
+  // 5) Ensure a behavioral config exists (defaults deliver the target three-tier UX).
+  const { created } = tuning.ensureConfig();
+  ok(`behavior config ${created ? "created (defaults)" : "present"}: ${tuning.CONFIG_PATH}`);
+  console.log("    active behavior:\n      " + tuning.describe().replace(/\n  /g, "\n      "));
+  console.log("    (these are the 5 knobs — an AI importing this package should INTERVIEW");
+  console.log("     the user and persist choices via: node src/dream.js config set <knob> <value>)");
 
   console.log("\nReady. To use it, ask your agent to:");
   info("1. Run the nightly dream loop (see skills/dream/SKILL.md), or");
