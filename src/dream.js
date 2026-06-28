@@ -791,27 +791,50 @@ async function weave(db, opts) {
   if (SUP) await profA("weave.supersede", async () => {
     const CUE = /\b(correct(?:ion|ed|s)?|chang(?:e|ed|ing)?|updat(?:e|ed)?|revis(?:e|ed)?|no longer|instead of|rather than|supersed(?:e|ed|es)?|overrid(?:e|den|es)?|replac(?:e|ed|es)?|moved? (?:to|up|earlier|from)|push(?:ed)? (?:to|up|earlier)|now \w+ not)\b/i;
     const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
+    const jaccard = (a, b) => { if (!a.size || !b.size) return 0; let i = 0; for (const x of a) if (b.has(x)) i++; return i / (a.size + b.size - i); };
+    const scopeOf = (s) => { const m = String(s || "").match(/^\s*\[([^\]]{1,40})\]/); return m ? ent.normalize(m[1]) : ""; };
     const full = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
     const bySig = new Map(full.map((r) => [r.signature, r]));
+    // Entity-hub corpus frequency. A genuine correction restates the SAME subject — best
+    // signalled by a shared SPECIFIC entity (a named person/account/project that tags few
+    // facts), NOT a generic scope/role tag (e.g. [executive-team], [principal]) shared by
+    // hundreds of unrelated standing-intent facts. Sharing a generic hub/scope is the exact
+    // false-corroboration that chained "operations cadence" -> "treasury FY27" (different
+    // topics, same voice) into bogus supersede chains. *_MAX scale with the active corpus.
+    const entFreq = new Map();
+    for (const r of db.prepare("SELECT dst FROM edges WHERE rel='mentions'").all()) entFreq.set(r.dst, (entFreq.get(r.dst) || 0) + 1);
+    const scopeFreq = new Map();
+    for (const r of full) { const s = scopeOf(r.fact); if (s) scopeFreq.set(s, (scopeFreq.get(s) || 0) + 1); }
+    const SPECIFIC_MAX = Math.max(4, Math.round(0.01 * full.length));
+    const SCOPE_MAX = Math.max(4, Math.round(0.02 * full.length));
     // A correction is always a NEW fact, so in incremental mode only scan toWeave facts
     // for supersede cues (the prior value is found among ALL active via bySig/KNN).
     const supSource = incremental ? full.filter(isToWeave) : full;
     for (const f of supSource) {
       if (!f.fact || !CUE.test(f.fact)) continue;
       const fe = mentionsOf(f.signature);   // entity hubs (may be empty — e.g. single-name principals)
-      const ft = toks(f.fact);              // content tokens, for entity-free corroboration
+      const ft = toks(f.fact);              // content tokens
+      const fScope = scopeOf(f.fact);
+      const fScopeSpecific = fScope && (scopeFreq.get(fScope) || 0) <= SCOPE_MAX;
       const qv = await queryVec(db, f);
       const nbrs = db.prepare(`SELECT n.signature s, n.kind k, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 12) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>?`).all(qv, f.id);
-      let target = null;
+      // Pick the BEST (most similar) qualifying predecessor, not the first one scanned, so a
+      // loosely-related older neighbour can't grab the supersede link ahead of the true prior
+      // version. A version is the SAME fact with a changed value -> high content overlap
+      // (token-Jaccard >= .34) OR a shared SPECIFIC named entity OR a shared SPECIFIC scope
+      // with some overlap; a single shared word (the old rule) is too weak and caused drift.
+      let target = null, bestSim = -1;
       for (const nb of nbrs) {
         if (nb.k !== "fact") continue;
         const o = bySig.get(nb.s); if (!o) continue;
         const sim = 1 - nb.d;
+        if (!(sim >= 0.5 && sim <= 0.96) || sim <= bestSim) continue;
         const older = Date.parse(o.first_seen || 0) < Date.parse(f.first_seen || 0);
-        // corroborate by a shared entity hub OR (when none) a shared content token.
-        const sharedEnt = fe.size && [...mentionsOf(nb.s)].some((x) => fe.has(x));
-        const sharedTok = [...toks(o.fact)].some((t) => ft.has(t));
-        if (older && sim >= 0.5 && sim <= 0.96 && (sharedEnt || sharedTok)) { target = o; break; }
+        if (!older) continue;
+        const ojac = jaccard(ft, toks(o.fact));
+        const sharedSpecificEnt = fe.size && [...mentionsOf(nb.s)].some((x) => fe.has(x) && (entFreq.get(x) || 0) <= SPECIFIC_MAX);
+        const sharedSpecificScope = fScopeSpecific && scopeOf(o.fact) === fScope && ojac >= 0.12;
+        if (ojac >= 0.34 || sharedSpecificEnt || sharedSpecificScope) { target = o; bestSim = sim; }
       }
       if (!target || hasEdge.get(f.signature, target.signature, "supersedes")) continue;
       addEdge(f.signature, "supersedes", target.signature, 0.9);
@@ -923,9 +946,21 @@ async function reflect(db, opts) {
       const maxStrength = Math.max(...members.map((m) => m.strength || 0));
       const anySalient = members.some((m) => m.class === "salient");
       const maxReacts = Math.max(...members.map((m) => m.reactivations || 0));
-      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=?, notes='gist' WHERE id=?")
+      // first_seen is the immutable ORIGINAL record date ("when first noted") — it drives the
+      // Source: citation the agent reads. A merge survivor may be a LATER re-emission of the
+      // same fact; keeping the survivor's own (later) first_seen loses the original posting
+      // date and makes "when was it first recorded/posted" unanswerable (e.g. q010: conference
+      // posted day7, but a day10 re-emission survived -> agent cited day10). The gist must carry
+      // the EARLIEST date across its constituents. Recency is unaffected: it keys off
+      // last_reactivated (set to `now` here), not first_seen, and is only a rank tie-break.
+      const minFirstSeen = members.reduce((m, n) => {
+        const t = Date.parse(n.first_seen || "");
+        return (Number.isFinite(t) && (m == null || t < m.t)) ? { t, s: n.first_seen } : m;
+      }, null);
+      const survFirstSeen = (minFirstSeen && minFirstSeen.s) || survivor.first_seen;
+      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist' WHERE id=?")
         .run(dec.fact, dec.fact, anySalient ? "salient" : (survivor.class === "episodic" ? "semantic" : survivor.class),
-          anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survivor.id);
+          anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, survivor.id);
       // re-embed survivor to its new text so retrieval matches the merged content
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
       for (const m of members) {
