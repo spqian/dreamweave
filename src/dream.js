@@ -43,6 +43,27 @@ const T = tuning.resolve();
 // unless an explicit DREAM_LLM env var is already set (which still wins).
 const llmEnv = () => ({ ...process.env, DREAM_LLM: T.llmSpec || process.env.DREAM_LLM || "" });
 
+// ---- PHASE PROFILER (env MEMORY_PROFILE=1) ---------------------------------
+// Lightweight per-phase wall-clock timing to stderr, to find where nightly cost
+// scales with store size. Zero overhead when off.
+const PROF_ON = process.env.MEMORY_PROFILE === "1";
+function prof(label, fn) {
+  if (!PROF_ON) return fn();
+  const t0 = process.hrtime.bigint();
+  const r = fn();
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  process.stderr.write(`[prof] ${label} ${ms.toFixed(1)}ms\n`);
+  return r;
+}
+async function profA(label, fn) {
+  if (!PROF_ON) return fn();
+  const t0 = process.hrtime.bigint();
+  const r = await fn();
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  process.stderr.write(`[prof] ${label} ${ms.toFixed(1)}ms\n`);
+  return r;
+}
+
 const DATA_DIR = cfg.DATA_DIR;
 const DB_PATH = cfg.DB_PATH; // env MEMORY_DB overrides (e.g. dry-run forecasts)
 const VIZ_TEMPLATE = cfg.VIZ_TEMPLATE; // tracked template (empty data line)
@@ -170,6 +191,9 @@ async function reembed(db, onlyIds) {
     rows.forEach((r, i) => {
       db.prepare("UPDATE nodes SET text=? WHERE id=?").run(texts[i], r.id);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(r.id));
+      // Re-embedding means this node is ACTIVE again; ensure it isn't ALSO left in the
+      // cold vec_archive (revive path), or it would surface from both KNN pools.
+      db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(r.id));
       db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(r.id), toVecBlob(vecs[i]));
     });
   });
@@ -224,10 +248,26 @@ function migrateModel(db) {
 
 // ---- INGEST -----------------------------------------------------------------
 async function ingestHarness(db, file, prune, asOf) {
-  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  const raw = prof("ingest.parse", () => JSON.parse(fs.readFileSync(file, "utf8")));
   const mems = Array.isArray(raw) ? raw : (raw.memories || []);
   const now = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
-  const byMem = db.prepare("SELECT * FROM nodes WHERE memory_id=?");
+  // Preload existing memory_id -> {id,fact,salience,notes} ONCE (first-wins by id, matching
+  // the previous unordered byMem.get). Re-confirming the full harness is the common case, so
+  // the old per-memory prepared.get + unconditional salience UPDATE made ingest O(total store)
+  // every checkpoint (measured 11.3s of pure no-op writes at ~17k mems). We now skip writes for
+  // fully-unchanged memories — bit-identical end state, cost falls to O(changed). The in-memory
+  // `ex` row is mutated on each write so a later duplicate memory_id sees prior tx state,
+  // preserving the old transaction-visibility semantics.
+  const exByMem = new Map();
+  for (const r of db.prepare("SELECT id, memory_id, fact, salience, notes FROM nodes WHERE memory_id<>'' AND memory_id<>'live' ORDER BY id").all()) {
+    if (!exByMem.has(r.memory_id)) exByMem.set(r.memory_id, r);
+  }
+  const delVec = db.prepare("DELETE FROM vec_nodes WHERE rowid=?");
+  const updChanged = db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END WHERE id=?");
+  const updRevive = db.prepare("UPDATE nodes SET salience=?, notes=NULL WHERE id=?");
+  const updSal = db.prepare("UPDATE nodes SET salience=? WHERE id=?");
+  const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
+        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`);
   const res = { harness_count: mems.length, created: 0, refreshed: 0, pruned: 0 };
   const harnessIds = new Set(mems.map((m) => m.id || m.memory_id).filter(Boolean));
   const tx = db.transaction(() => {
@@ -235,7 +275,7 @@ async function ingestHarness(db, file, prune, asOf) {
       const mid = m.id || m.memory_id; if (!mid) continue;
       const fact = String(m.fact || "").replace(UNTRUSTED, "").trim();
       const category = m.category || "fact";
-      const ex = byMem.get(mid);
+      const ex = exByMem.get(mid);
       if (ex) {
         const newFact = fact || ex.fact;
         if (newFact !== ex.fact) {
@@ -244,21 +284,25 @@ async function ingestHarness(db, file, prune, asOf) {
           // vector ↔ text in sync). Also REVIVE a re-confirmed Tier-3 archive node back to
           // the active tier: re-ingestion by the source of truth is a strong reactivation
           // signal, so it earns its way out of the keyword-only bookshelf.
-          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(ex.id));
-          db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END WHERE id=?").run(newFact, category, ex.id);
+          delVec.run(BigInt(ex.id));
+          updChanged.run(newFact, category, ex.id);
+          ex.fact = newFact; ex.salience = category; if (ex.notes === "archive") ex.notes = null;
         } else if (ex.notes === "archive") {
           // re-confirmed but text unchanged: still revive from archive (re-embed via missing).
-          db.prepare("UPDATE nodes SET salience=?, notes=NULL WHERE id=?").run(category, ex.id);
-        } else {
-          db.prepare("UPDATE nodes SET salience=? WHERE id=?").run(category, ex.id);
+          updRevive.run(category, ex.id);
+          ex.salience = category; ex.notes = null;
+        } else if (ex.salience !== category) {
+          updSal.run(category, ex.id);
+          ex.salience = category;
         }
+        // else: fully unchanged (fact, salience, not archived) -> SKIP the no-op write.
         res.refreshed += 1; continue;
       }
       const cls = CAT2CLASS[category] || "semantic";
       const sig = uniqueSig(db, `fact:${deriveSlug(fact)}`);
       const id = nextId(db);
-      db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, sig, mid, "fact", cls, category, INIT[cls], now, now, now, "harness-ingest", fact, "");
+      insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], now, now, now, "harness-ingest", fact, "");
+      exByMem.set(mid, { id, memory_id: mid, fact, salience: category, notes: "harness-ingest" });
       res.created += 1;
     }
     if (prune) {
@@ -266,13 +310,14 @@ async function ingestHarness(db, file, prune, asOf) {
       for (const n of stale) {
         db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id, now, "pruned: left harness");
         db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
+        db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(n.id));
         db.prepare("DELETE FROM nodes WHERE id=?").run(n.id);
         res.pruned += 1;
       }
     }
   });
-  tx();
-  repairGraph(db);
+  prof(`ingest.refreshLoop(mems=${mems.length})`, () => tx());
+  prof("ingest.repairGraph", () => repairGraph(db));
   // NOTE: embedding is intentionally NOT done here. New facts are embedded once-per-day
   // by the nightly pass (weave embeds any node missing a vec row, incrementally), so
   // ingest stays O(new) instead of re-embedding the whole store on every memory write.
@@ -335,21 +380,31 @@ function dreamCore(db, flags) {
   // storage: skipped by decay/weave so they cost no nightly work, reachable only by keyword.
   const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const bp = budgetParams(facts.length);
-  const schema = computeSchemaFit(db);
+  const schema = prof("dreamCore.schemaFit", () => computeSchemaFit(db));
 
   // DECAY facts. Half-life accelerated under budget pressure, EXTENDED by schema fit
   // (schema-embedded facts persist; islands fade fastest).
+  prof("dreamCore.decayFacts", () => {
   for (const n of facts) {
     const sf = schema.get(n.signature) || 0;
     const H = (HALFLIFE[n.class] || HALFLIFE.episodic) * T.forgetMultiplier * (1 + SCHEMA_HALFLIFE_BONUS * sf) / bp.decayAccel;
     const dDays = Math.max(0, (now.getTime() - Date.parse(n.last_decayed || n.first_seen || nowIso)) / 86400000);
     db.prepare("UPDATE nodes SET strength=?, last_decayed=? WHERE id=?").run(clamp01(n.strength * Math.pow(2, -dDays / H)), nowIso, n.id);
   }
-  // EDGE decay
+  });
+  // EDGE decay. Write only when the value actually changes: unit-decay relations
+  // (mentions, supersedes -> factor 1.0) multiply to the identical weight, so the old
+  // unconditional UPDATE rewrote all ~49k mention edges every night as a pure no-op
+  // (measured ~1.1s growing with edge count). write-iff-changed is bit-identical
+  // (x*1.0===x for finite x; malformed weights still normalize since the result differs).
+  prof("dreamCore.decayEdges", () => {
+  const updW = db.prepare("UPDATE edges SET weight=? WHERE rowid=?");
   for (const e of db.prepare("SELECT rowid, rel, weight FROM edges").all()) {
     const f = EDGE_DECAY[e.rel] || EDGE_DECAY.default;
-    db.prepare("UPDATE edges SET weight=? WHERE rowid=?").run(clamp01(e.weight * f), e.rowid);
+    const nw = clamp01(e.weight * f);
+    if (nw !== e.weight) updW.run(nw, e.rowid);
   }
+  });
   J("keep", "", `DECAY: ${facts.length} facts (pressure=${bp.pressure}, decayAccel=${bp.decayAccel}, schema-aware); edges`);
 
   // AUTO-REACTIVATE: a fact reappears when a NEW fact (since last dream) shares one of its
@@ -448,6 +503,7 @@ function dreamCore(db, flags) {
       db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
       db.prepare("DELETE FROM nodes WHERE id=?").run(n.id);
+      db.prepare("DELETE FROM detail_of WHERE detail_sig=? OR gist_sig=?").run(n.signature, n.signature);
       J("evaporate", n.signature, `evicted over hard cap ${ENTRY_MAX}`);
       evapCap += 1;
     }
@@ -497,7 +553,17 @@ function dreamCore(db, flags) {
       const txD = db.transaction(() => {
         for (const n of demote) {
           db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
-          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
+          // MOVE the embedding to vec_archive (principle 1 pay-once / principle 3 demote-
+          // don't-delete): the cold fact stays reachable by SIMILARITY (recall.js tier-2c
+          // queries vec_archive secondarily, capped below active seeds), while leaving
+          // vec_nodes — the only table any nightly KNN touches — bounded (principle 2).
+          const rid = BigInt(n.id);
+          const blob = storedVecBlob(db, n.id);
+          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(rid);
+          if (blob) {
+            db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(rid);
+            db.prepare("INSERT INTO vec_archive(rowid, embedding) VALUES (?, ?)").run(rid, blob);
+          }
           db.prepare("UPDATE nodes SET notes='archive', last_decayed=? WHERE id=?").run(nowIso, n.id);
           J("evaporate", n.signature, `demoted to Tier3 archive (over Tier2 cap ${TIER2_MAX})`);
           demoted += 1;
@@ -616,10 +682,10 @@ async function weave(db, opts) {
   const factRows = incremental ? allActive.filter(isToWeave) : allActive;
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
-  const corpusEnts = ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 });
+  const corpusEnts = prof(`weave.extractCorpus(facts=${factRows.length})`, () => ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 }));
   let llmEnts = [];
   if (llm.available && factRows.length) {
-    try { llmEnts = await judge.extractEntitiesLLM(factRows.map((f) => f.fact || ""), llm); }
+    try { llmEnts = await profA(`weave.extractEntitiesLLM(facts=${factRows.length})`, () => judge.extractEntitiesLLM(factRows.map((f) => f.fact || ""), llm)); }
     catch (e) { process.stderr.write(`[weave] llm extract failed: ${e.message}\n`); }
   }
   const allEnts = new Map();
@@ -649,12 +715,12 @@ async function weave(db, opts) {
     const hubs = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all()
       .map((r) => ({ sig: r.signature, label: ent.labelOf(r.signature) }));
     let groups = [];
-    try { groups = await judge.canonicalizeLLM(hubs, llm); }
+    try { groups = await profA(`weave.canonicalizeLLM(hubs=${hubs.length})`, () => judge.canonicalizeLLM(hubs, llm)); }
     catch (e) { process.stderr.write(`[weave] llm canon failed: ${e.message}\n`); }
     const tx = db.transaction(() => {
       for (const g of groups) for (const a of g.aliases) { mergeEntityHub(db, g.canonical, a); aliasesMerged += 1; }
     });
-    tx();
+    prof(`weave.canonApply(groups=${groups.length})`, () => tx());
   }
   vocab = vocabWithForms(db);
 
@@ -678,14 +744,13 @@ async function weave(db, opts) {
       }
     }
   });
-  tx2();
+  prof(`weave.mentionEdges(factRows=${factRows.length},vocab=${vocab.length})`, () => tx2());
 
   // 4) embed any ACTIVE node missing a vec row (new entity hubs / facts). Tier-3 archive
   //    nodes are intentionally un-embedded — never re-embed them (that's what makes them
   //    cheap), so they are excluded here.
   const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
-  if (missing.length) await reembed(db, missing);
-
+  if (missing.length) await profA(`weave.reembed(missing=${missing.length})`, () => reembed(db, missing));
   // 5) vector sibling links fact <-> fact, CORROBORATED.
   //    shared entity (co-mention overlap) -> related_to (trusted).
   //    else high similarity only      -> similar_to  (low-confidence suggestion).
@@ -700,6 +765,7 @@ async function weave(db, opts) {
   const factNodes = incremental
     ? db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().filter(isToWeave)
     : db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  await profA(`weave.siblingLink(n=${factNodes.length})`, async () => {
   for (const f of factNodes) {
     const fe = mentionsOf(f.signature);
     const qv = await queryVec(db, f);
@@ -713,6 +779,7 @@ async function weave(db, opts) {
       else if (sim >= HIGH) { addEdge(f.signature, "similar_to", nb.s, Number(sim.toFixed(3))); similarEdges += 1; added += 1; }
     }
   }
+  });
 
   // 5.5) SUPERSEDE-aware consolidation (opt-in via --supersede). A CORRECTION is a DOUBLE
   // signal: it reactivates the prior fact AND overrides it, so the corrective fact should
@@ -721,7 +788,7 @@ async function weave(db, opts) {
   // human remembers a correction more vividly than the steady state it replaced.
   let supersedeEdges = 0;
   const SUP = (opts && opts.supersede) || T.supersede;
-  if (SUP) {
+  if (SUP) await profA("weave.supersede", async () => {
     const CUE = /\b(correct(?:ion|ed|s)?|chang(?:e|ed|ing)?|updat(?:e|ed)?|revis(?:e|ed)?|no longer|instead of|rather than|supersed(?:e|ed|es)?|overrid(?:e|den|es)?|replac(?:e|ed|es)?|moved? (?:to|up|earlier|from)|push(?:ed)? (?:to|up|earlier)|now \w+ not)\b/i;
     const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
     const full = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
@@ -757,13 +824,14 @@ async function weave(db, opts) {
         .run(clamp01((target.strength || 0) + 0.05), now, target.signature);
       supersedeEdges += 1;
     }
-  }
+  });
 
   // 6) zero-island guarantee: any active fact still degree 0 -> link nearest as similar_to.
   //    Scans ALL active facts (not just toWeave): demotion of a neighbor can orphan an
   //    OLD fact, so the guarantee must cover the whole active set. Cheap — the KNN runs
   //    only for the (rare) actual islands.
   let rescued = 0;
+  await profA(`weave.islandScan(active=${db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").get().c})`, async () => {
   const deg = degreeMap(db);
   const islandScan = db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   for (const f of islandScan) {
@@ -772,10 +840,12 @@ async function weave(db, opts) {
     const nb = db.prepare(`SELECT n.signature s, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT 6) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND n.kind='fact'`).all(qv, f.id)[0];
     if (nb) { addEdge(f.signature, "similar_to", nb.s, Number((1 - nb.d).toFixed(3))); rescued += 1; }
   }
+  });
 
   if (incremental) setMeta(db, "last_weave", now);
-  repairGraph(db);
-  const islands = [...db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature)].filter((s) => !degreeMap(db).get(s));
+  prof("weave.repairGraph", () => repairGraph(db));
+  const degFinal = degreeMap(db);
+  const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !degFinal.get(s));
   return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
 }
 
@@ -811,7 +881,7 @@ async function reflect(db, opts) {
   let salientTagged = 0;
   const candidates = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notColdSql}${newOnlySql}`).all();
   let flagged = new Set();
-  try { flagged = await judge.salienceLLM(candidates, llm); }
+  try { flagged = await profA(`reflect.salienceLLM(cand=${candidates.length})`, () => judge.salienceLLM(candidates, llm)); }
   catch (e) { process.stderr.write(`[reflect] salience failed: ${e.message}\n`); }
   const txS = db.transaction(() => {
     for (const sig of flagged) {
@@ -824,11 +894,11 @@ async function reflect(db, opts) {
 
   // MERGE: get near-duplicate clusters, let the LLM decide + write the rollup, apply.
   // Incremental: only seed merge clusters from facts new since last reflect.
-  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: keepDetail0, seedAfter: incrementalR ? lastReflect : null });
+  const cons = await profA("reflect.consolidate", () => consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: keepDetail0, seedAfter: incrementalR ? lastReflect : null }));
   const clusters = cons.clusters || [];
   let decisions = [];
   if (clusters.length) {
-    try { decisions = await judge.mergeClustersLLM(clusters, llm); }
+    try { decisions = await profA(`reflect.mergeClustersLLM(clusters=${clusters.length})`, () => judge.mergeClustersLLM(clusters, llm)); }
     catch (e) { process.stderr.write(`[reflect] merge failed: ${e.message}\n`); }
   }
   let clustersMerged = 0, reclaimed = 0, retained = 0;
@@ -872,6 +942,16 @@ async function reflect(db, opts) {
           db.prepare("UPDATE nodes SET notes='detail', last_reactivated=? WHERE id=?").run(now, m.id);
           const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='related_to' AND dst=?").get(survivor.signature, m.signature);
           if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", m.signature, 0.6, now, now);
+          // R1: durable gist->detail lineage that survives demotion (edges get GC'd
+          // when the detail is demoted to Tier-3 archive; this cold table does not).
+          db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(m.signature, survivor.signature, now);
+          // Reparent: if this member was itself a gist with its own retained details,
+          // flatten the chain so those details now point at the new (current) survivor.
+          // Collision-safe (copy-if-absent then drop old rows): a plain UPDATE can hit the
+          // (detail_sig,gist_sig) PK when a detail already points at the survivor, and the
+          // detail_sig<>survivor guard prevents a self-referential (survivor,survivor) row.
+          db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) SELECT detail_sig, ?, first_seen FROM detail_of WHERE gist_sig=? AND detail_sig<>?").run(survivor.signature, m.signature, survivor.signature);
+          db.prepare("DELETE FROM detail_of WHERE gist_sig=?").run(m.signature);
           retained += 1;
         } else {
           // DESTRUCTIVE (legacy): tombstone + delete the member.
@@ -879,6 +959,7 @@ async function reflect(db, opts) {
           db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
           db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(m.id));
           db.prepare("DELETE FROM nodes WHERE id=?").run(m.id);
+          db.prepare("DELETE FROM detail_of WHERE detail_sig=? OR gist_sig=?").run(m.signature, m.signature);
           reclaimed += 1;
         }
       }
@@ -890,8 +971,8 @@ async function reflect(db, opts) {
   // re-embed any survivor whose vec row we dropped, then re-weave to heal islands.
   // Never re-embed Tier-3 archive nodes (they are intentionally un-embedded).
   const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
-  if (missing.length) await reembed(db, missing);
-  await weave(db, { asOf: opts && opts.asOf, llm: false });
+  if (missing.length) await profA(`reflect.reembed(missing=${missing.length})`, () => reembed(db, missing));
+  await profA("reflect.reweave", () => weave(db, { asOf: opts && opts.asOf, llm: false }));
   if (incrementalR) setMeta(db, "last_reflect", now);
   repairGraph(db);
   return { llm: llm.label, salient_tagged: salientTagged, clusters_seen: clusters.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed, details_retained: retained };

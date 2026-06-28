@@ -56,10 +56,46 @@ function ensureSchema(db) {
       result_fact TEXT,
       reason TEXT
     );
+
+    -- DURABLE gist -> detail lineage (R1). When retain-detail merge keeps a
+    -- constituent as a 'detail' node, it also records the parent gist HERE, in a
+    -- cold relation table that is NOT subject to graph-edge GC. The 'related_to'
+    -- edge added at merge time is deleted when the detail is later demoted to the
+    -- Tier-3 archive (DELETE FROM edges ...), which used to sever the gist->detail
+    -- link and make the atom reachable only by brittle keyword scan. This table
+    -- survives demotion so recall can always expand a gist back to its specifics.
+    CREATE TABLE IF NOT EXISTS detail_of (
+      detail_sig TEXT NOT NULL,
+      gist_sig   TEXT NOT NULL,
+      first_seen TEXT,
+      PRIMARY KEY (detail_sig, gist_sig)
+    );
+    CREATE INDEX IF NOT EXISTS idx_detail_of_gist   ON detail_of(gist_sig);
+    CREATE INDEX IF NOT EXISTS idx_detail_of_detail ON detail_of(detail_sig);
   `);
+
+  // Backfill detail_of for databases created before this table existed, from the
+  // gist->detail 'related_to' edges that still survive (i.e. details not yet
+  // demoted). Idempotent; cheap (NOT EXISTS guard). After the first demotion the
+  // edge is gone, so this only recovers links for not-yet-archived details.
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen)
+      SELECT e.dst, e.src, e.first_seen
+      FROM edges e
+      JOIN nodes g ON g.signature = e.src AND g.notes = 'gist'
+      JOIN nodes d ON d.signature = e.dst AND d.notes = 'detail'
+      WHERE e.rel = 'related_to'
+    `).run();
+  } catch (e) { /* readonly db or pre-migration schema: skip */ }
 
   // vec0 virtual table (sqlite-vec). Dimensionality is configurable; cosine metric.
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_nodes USING vec0(embedding float[${cfg.EMBED_DIM}] distance_metric=cosine)`);
+  // vec_archive: vectors of DEMOTED (Tier-3) facts. At demotion the embedding is MOVED
+  // here (not deleted — principle 1, pay-once), so the cold bookshelf stays reachable by
+  // SIMILARITY, not just keyword, while staying out of every nightly query (which only
+  // ever touches vec_nodes) — principle 2 (bounded nightly cost) is untouched.
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_archive USING vec0(embedding float[${cfg.EMBED_DIM}] distance_metric=cosine)`);
 
   // Guarded migrations for databases created before fact/kind columns existed.
   for (const col of ["kind TEXT", "fact TEXT"]) {
