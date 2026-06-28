@@ -327,50 +327,6 @@ async function main() {
     .filter((e) => clusterSet.has(e.src) && clusterSet.has(e.dst))
     .sort((a, b) => b.weight - a.weight || a.src.localeCompare(b.src) || a.dst.localeCompare(b.dst));
 
-  // ---- SUPERSEDE-CHAIN NARRATIVE SYNTHESIS (opt-in: DREAM_CHAIN_SYNTH=1) ------
-  // Recall-side, representation-level. When a RETRIEVED fact participates in a
-  // supersede chain (A<-B<-C corrections), gather the WHOLE chain (members that were
-  // not themselves retrieved are looked up here) and emit it as a single, current-first
-  // timeline. This addresses two measured failure classes that ranking alone cannot:
-  //   - recall-miss: the dated transition is now ONE retrievable unit, not scattered atoms;
-  //   - agent answer-selection: the resolved current value + its superseded history are
-  //     stated together, so the synthesizer stops picking a stale distractor.
-  // It is NEVER stored or re-embedded (no vector pollution — the rubber-duck's key risk),
-  // the per-atom demotion logic above is untouched, and dates are RECORD dates (first_seen),
-  // framed as "noted" rather than effective ("until"). Default OFF preserves exact legacy
-  // output for a clean A/B.
-  let chainMembers = [];
-  if (process.env.DREAM_CHAIN_SYNTH === "1" && supersededBy.size) {
-    const prevOf = new Map(); // survivor -> [stale, ...] (one hop down the chain)
-    for (const [stale, s] of supersededBy.entries()) {
-      if (!prevOf.has(s.survivor)) prevOf.set(s.survivor, []);
-      prevOf.get(s.survivor).push(stale);
-    }
-    const headOf = (sig) => { // climb survivors to the current (un-superseded) head
-      let cur = sig, guard = 0;
-      while (supersededBy.has(cur) && guard++ < 16) cur = supersededBy.get(cur).survivor;
-      return cur;
-    };
-    const retrieved = new Set([...clusterSet, ...detailSet, ...archiveSet, ...archiveVecSet]);
-    const heads = new Set();
-    for (const sig of retrieved) if (supersededBy.has(sig) || prevOf.has(sig)) heads.add(headOf(sig));
-    const MAX_NARR = 3, MAX_MEMBERS = Math.max(2, Number(process.env.DREAM_CHAIN_DEPTH ?? 3));
-    const textOf = db.prepare("SELECT fact, first_seen FROM nodes WHERE signature=? AND kind='fact'");
-    for (const head of [...heads].slice(0, MAX_NARR)) {
-      const members = [], seen = new Set(), stack = [head];
-      while (stack.length && members.length < MAX_MEMBERS + 4) {
-        const sig = stack.pop();
-        if (seen.has(sig)) continue; seen.add(sig);
-        const row = textOf.get(sig);
-        if (row && row.fact) members.push({ sig, fact: row.fact.trim(), t: Date.parse(row.first_seen || "") || 0, first_seen: row.first_seen });
-        for (const p of (prevOf.get(sig) || [])) stack.push(p);
-      }
-      if (members.length < 2) continue; // a single node is not a transition
-      members.sort((a, b) => b.t - a.t); // newest first
-      chainMembers.push({ head, members: members.slice(0, MAX_MEMBERS) });
-    }
-  }
-
   db.close();
 
   // "Now" for relative-age tags: explicit --as-of, else the latest memory in the
@@ -451,29 +407,6 @@ async function main() {
       edges: clusterEdges,
     },
   };
-
-  // Prepend the synthesized supersede-chain timeline(s) as the highest-priority fact
-  // node(s) so the synthesizer reads the resolved value + dated history first.
-  if (chainMembers.length) {
-    const narrNodes = chainMembers.map((cn) => {
-      const m = cn.members, cur = m[0];
-      const dateStr = (s) => (s && s.first_seen) ? ` (${s.first_seen.slice(0, 10)})` : "";
-      const curD = ageDays(cur.first_seen, nowRef);
-      const parts = [`As of ${ageTag(curD)}${dateStr(cur)}, the current record is: ${cur.fact}`];
-      for (let i = 1; i < m.length; i++) {
-        const lbl = i === 1 ? "This superseded an earlier record" : "Earlier still";
-        parts.push(`${lbl}${dateStr(m[i])}: ${m[i].fact}`);
-      }
-      return {
-        id: `narrative:${cn.head}`, hops: 0, strength: 1, class: "salient", kind: "fact",
-        fact: parts.join(" "), first_seen: cur.first_seen || null,
-        age_days: curD, age: ageTag(curD),
-        superseded: false, superseded_by: null, tier: "narrative",
-      };
-    });
-    out.cluster.nodes = narrNodes.concat(out.cluster.nodes);
-    out.cluster.nodeCount += narrNodes.length;
-  }
 
   console.log(JSON.stringify(out, null, 2));
 }

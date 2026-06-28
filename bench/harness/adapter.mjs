@@ -103,7 +103,6 @@ function buildContext(out) {
   const facts = nodes.filter((n) => n.kind === "fact" && n.fact).slice(0, 30);
   if (!facts.length) return "(no memories matched)";
   return facts.map((n) => {
-    if (n.tier === "narrative") return `- [timeline] ${n.fact}`;
     if (n.tier === "gist") return `- [standing fact] ${n.fact}`;
     const date = n.first_seen ? n.first_seen.slice(0, 10) : "";
     const tag = n.age ? `${n.age}${date ? ", " + date : ""}` : (date || "undated");
