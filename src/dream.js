@@ -74,7 +74,7 @@ const INIT = { salient: 0.90, semantic: 0.70, episodic: 0.30 };
 const CAT2CLASS = { decision: "salient", fact: "semantic", context: "episodic", preference: "semantic" };
 const CLASS2CAT = { salient: "decision", semantic: "fact", episodic: "context" };
 const FORGET = 0.15;
-const EDGE_DECAY = { mentions: 1.0, related_to: 0.985, similar_to: 0.97, supersedes: 1.0, default: 0.99 }; // multiplicative per run
+const EDGE_DECAY = { mentions: 1.0, related_to: 0.985, similar_to: 0.97, supersedes: 1.0, sequence: 1.0, default: 0.99 }; // multiplicative per run
 
 // ---- ENTRY BUDGET ----------------------------------------------------------
 // The harness caps memory ENTRIES (= fact nodes; entity hubs are free db-side scaffolding).
@@ -786,31 +786,38 @@ async function weave(db, opts) {
   // consolidate MORE strongly than a plain restatement, while the superseded "from" value is
   // PRESERVED (pinned against cap-eviction) so the transition stays answerable. Mirrors how a
   // human remembers a correction more vividly than the steady state it replaced.
+  // ---- Shared same-subject scaffold (SUPERSEDE 5.5 + SEQUENCE 5.6) ----------------
+  // Both steps link a NEW fact to a prior version of the SAME standing statement; they differ
+  // only in the rule (supersede = a correction that demotes the prior value; sequence = a
+  // neutral temporal evolution that preserves both). The corpus-frequency tables are computed
+  // ONCE here — entFreq scans ALL ~1M mention edges at 50k, so it must not run twice — and the
+  // sequence step is ALWAYS-ON, so the scaffold is hoisted out of the SUP-gated block.
+  const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
+  const jaccard = (a, b) => { if (!a.size || !b.size) return 0; let i = 0; for (const x of a) if (b.has(x)) i++; return i / (a.size + b.size - i); };
+  const scopeOf = (s) => { const m = String(s || "").match(/^\s*\[([^\]]{1,40})\]/); return m ? ent.normalize(m[1]) : ""; };
+  const subjFull = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  const subjBySig = new Map(subjFull.map((r) => [r.signature, r]));
+  // Entity-hub corpus frequency. A genuine same-subject restatement shares a SPECIFIC entity
+  // (a named person/account/project that tags few facts), NOT a generic scope/role tag
+  // (e.g. [executive-team], [principal]) shared by hundreds of unrelated standing-intent
+  // facts. Sharing a generic hub/scope is the exact false-corroboration that chained
+  // "operations cadence" -> "treasury FY27" (different topics, same voice) into bogus chains.
+  // *_MAX scale with the active corpus.
+  const entFreq = new Map();
+  for (const r of db.prepare("SELECT dst FROM edges WHERE rel='mentions'").all()) entFreq.set(r.dst, (entFreq.get(r.dst) || 0) + 1);
+  const scopeFreq = new Map();
+  for (const r of subjFull) { const s = scopeOf(r.fact); if (s) scopeFreq.set(s, (scopeFreq.get(s) || 0) + 1); }
+  const SPECIFIC_MAX = Math.max(4, Math.round(0.01 * subjFull.length));
+  const SCOPE_MAX = Math.max(4, Math.round(0.02 * subjFull.length));
+  // A restatement/correction is always a NEW fact, so in incremental mode only SCAN toWeave
+  // facts (the prior value is found among ALL active via subjBySig/KNN).
+  const subjSource = incremental ? subjFull.filter(isToWeave) : subjFull;
+
   let supersedeEdges = 0;
   const SUP = (opts && opts.supersede) || T.supersede;
   if (SUP) await profA("weave.supersede", async () => {
     const CUE = /\b(correct(?:ion|ed|s)?|chang(?:e|ed|ing)?|updat(?:e|ed)?|revis(?:e|ed)?|no longer|instead of|rather than|supersed(?:e|ed|es)?|overrid(?:e|den|es)?|replac(?:e|ed|es)?|moved? (?:to|up|earlier|from)|push(?:ed)? (?:to|up|earlier)|now \w+ not)\b/i;
-    const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
-    const jaccard = (a, b) => { if (!a.size || !b.size) return 0; let i = 0; for (const x of a) if (b.has(x)) i++; return i / (a.size + b.size - i); };
-    const scopeOf = (s) => { const m = String(s || "").match(/^\s*\[([^\]]{1,40})\]/); return m ? ent.normalize(m[1]) : ""; };
-    const full = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
-    const bySig = new Map(full.map((r) => [r.signature, r]));
-    // Entity-hub corpus frequency. A genuine correction restates the SAME subject — best
-    // signalled by a shared SPECIFIC entity (a named person/account/project that tags few
-    // facts), NOT a generic scope/role tag (e.g. [executive-team], [principal]) shared by
-    // hundreds of unrelated standing-intent facts. Sharing a generic hub/scope is the exact
-    // false-corroboration that chained "operations cadence" -> "treasury FY27" (different
-    // topics, same voice) into bogus supersede chains. *_MAX scale with the active corpus.
-    const entFreq = new Map();
-    for (const r of db.prepare("SELECT dst FROM edges WHERE rel='mentions'").all()) entFreq.set(r.dst, (entFreq.get(r.dst) || 0) + 1);
-    const scopeFreq = new Map();
-    for (const r of full) { const s = scopeOf(r.fact); if (s) scopeFreq.set(s, (scopeFreq.get(s) || 0) + 1); }
-    const SPECIFIC_MAX = Math.max(4, Math.round(0.01 * full.length));
-    const SCOPE_MAX = Math.max(4, Math.round(0.02 * full.length));
-    // A correction is always a NEW fact, so in incremental mode only scan toWeave facts
-    // for supersede cues (the prior value is found among ALL active via bySig/KNN).
-    const supSource = incremental ? full.filter(isToWeave) : full;
-    for (const f of supSource) {
+    for (const f of subjSource) {
       if (!f.fact || !CUE.test(f.fact)) continue;
       const fe = mentionsOf(f.signature);   // entity hubs (may be empty — e.g. single-name principals)
       const ft = toks(f.fact);              // content tokens
@@ -826,7 +833,7 @@ async function weave(db, opts) {
       let target = null, bestSim = -1;
       for (const nb of nbrs) {
         if (nb.k !== "fact") continue;
-        const o = bySig.get(nb.s); if (!o) continue;
+        const o = subjBySig.get(nb.s); if (!o) continue;
         const sim = 1 - nb.d;
         if (!(sim >= 0.5 && sim <= 0.96) || sim <= bestSim) continue;
         const older = Date.parse(o.first_seen || 0) < Date.parse(f.first_seen || 0);
@@ -846,6 +853,76 @@ async function weave(db, opts) {
       db.prepare("UPDATE nodes SET strength=?, last_reactivated=? WHERE signature=?")
         .run(clamp01((target.strength || 0) + 0.05), now, target.signature);
       supersedeEdges += 1;
+    }
+  });
+
+  // 5.6) SEQUENCE-aware lineage. A standing statement is RE-STATED across many days, and over
+  // time it EVOLVES — a clause is added ("...treat the relationship reset as confirmed once
+  // service stabilized and the remediation plan was accepted"). Unlike a supersede (a
+  // correction that demotes the prior value), every version here is valid history, so we link
+  // them with a NEUTRAL `sequence` edge (older -> newer) and demote nothing.
+  //
+  // Why this is the temporal-recall fix: the evolved DELTA is the lowest-cosine, lowest-
+  // strength version of itself (its distinctive added clause makes it LESS similar to a generic
+  // "what's the status" query), so it sits ~80 ranks below the bare restatements and KNN never
+  // seeds it. But ANY bare restatement DOES rank high; recall.js then walks the sequence chain
+  // from that hit and pulls the delta into the result — no date heuristic, no lexical anchor,
+  // no privileged ranking. No correction CUE is required (a pure delta has none).
+  //
+  // The same-statement test is CORPUS-INDEPENDENT: an older fact whose content tokens are
+  // strongly CONTAINED in this one, at high cosine, IS this statement at an earlier point in its
+  // evolution. We deliberately do NOT use entity-rarity / scope / Jaccard heuristics here: those
+  // were corpus-relative (a "specific" entity at 50k facts is a "common" one at 3k) and so made
+  // chain-formation path-dependent — the nightly INCREMENTAL weave (small corpus) rejected the
+  // very delta the offline full weave linked. They also reject true deltas by construction (a
+  // delta's added clause drops Jaccard below 0.8, and hot subjects like "caldwell" never count as
+  // "specific"). Containment + cosine alone is the whole signal; cohesion-checked to introduce no
+  // cross-topic chains. CONTAINMENT (overlap coefficient = shared/min(|a|,|b|)) not Jaccard,
+  // because the predecessor stays fully contained in the longer delta (~1.0) while Jaccard drops.
+  //
+  // Two refinements keep a standing statement's restatements in ONE connected chain instead of
+  // fragmenting into disjoint shards (which strands a hit's far end):
+  //  - KNN width SEQ_K is wide (40, not 12): a fact's immediate older predecessor would otherwise
+  //    be crowded OUT of the candidate list by the many near-identical NEWER restatements of the
+  //    same statement, so no link forms and the chain breaks.
+  //  - we link to the CHRONOLOGICALLY-NEAREST qualifying older predecessor (max first_seen below
+  //    f), not the max-cosine one, so the lineage is a clean linear walk; and the same-statement
+  //    gate is shared>=3 AND (containment>=SEQ_CONTAIN OR cosine>=SEQ_SIM_HI) — the cosine-OR
+  //    bridges day-to-day wording drift that momentarily drops containment just below the bar.
+  let sequenceEdges = 0;
+  const SEQ_K = 40;         // KNN candidate width (predecessor must be reachable among newer dups)
+  const SEQ_CONTAIN = 0.8;  // older fact ~fully contained in the newer one (delta added a clause)
+  const SEQ_SIM = 0.6;      // floor cosine to even consider a candidate
+  const SEQ_SIM_HI = 0.85;  // cosine that alone proves same-statement (bridges containment drift)
+  await profA("weave.sequence", async () => {
+    for (const f of subjSource) {
+      if (!f.fact) continue;
+      const ft = toks(f.fact);
+      const fTime = Date.parse(f.first_seen || 0);
+      const qv = await queryVec(db, f);
+      const nbrs = db.prepare(`SELECT n.signature s, n.kind k, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ${SEQ_K}) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>?`).all(qv, f.id);
+      // Link to the chronologically-NEAREST strictly-OLDER version of the SAME statement (the
+      // chain runs forward in time). shared>=3 (content tokens, len>4) prevents a trivially short
+      // fact from false-linking on incidental overlap.
+      let target = null, bestOlderTime = -1;
+      for (const nb of nbrs) {
+        if (nb.k !== "fact") continue;
+        const o = subjBySig.get(nb.s); if (!o) continue;
+        const sim = 1 - nb.d;
+        if (sim < SEQ_SIM) continue;
+        const oTime = Date.parse(o.first_seen || 0);
+        if (!(oTime < fTime) || oTime <= bestOlderTime) continue;
+        const ot = toks(o.fact);
+        let shared = 0; for (const x of ot) if (ft.has(x)) shared++;
+        if (shared < 3) continue;
+        const containment = shared / Math.max(1, Math.min(ft.size, ot.size));
+        if (containment < SEQ_CONTAIN && sim < SEQ_SIM_HI) continue;
+        target = o; bestOlderTime = oTime;
+      }
+      if (!target) continue;
+      if (hasEdge.get(target.signature, f.signature, "sequence") || hasEdge.get(f.signature, target.signature, "sequence")) continue;
+      addEdge(target.signature, "sequence", f.signature, 0.8);
+      sequenceEdges += 1;
     }
   });
 
@@ -869,7 +946,7 @@ async function weave(db, opts) {
   prof("weave.repairGraph", () => repairGraph(db));
   const degFinal = degreeMap(db);
   const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !degFinal.get(s));
-  return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
+  return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, sequence_edges: sequenceEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
 }
 
 // ---- REFLECT: the LLM JUDGMENT pass (salience + semantic merge) -------------

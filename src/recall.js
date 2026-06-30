@@ -172,6 +172,111 @@ async function main() {
     `).all(seedsJson, args.maxHops, args.nodeLimit);
   }
 
+  // 1b) SEQUENCE-CHAIN EXPANSION. A `sequence` edge records the temporally-ordered evolution of
+  // ONE standing statement (built nightly in dream.js). The bounded graph walk above only reaches
+  // +/- maxHops along a chain, so a long lineage hit at one end loses the far end — exactly the
+  // failure where a generic high-ranking restatement is retrieved but the low-cosine *delta*
+  // ("...reset confirmed...") sits dozens of ranks away and never seeds. Here ANY retrieved chain
+  // member pulls in its ENTIRE connected sequence component (one EPISODE), so one hit returns the
+  // whole event chain. Each touched component is expanded INDEPENDENTLY (per-chain budget) so no
+  // single chain starves the others under a shared budget, and every member is tagged with a
+  // component id (`chain_id`) so the consumer can complete the chain of the SPECIFIC hit it
+  // belongs to instead of a global cross-topic pool. 1c then collapses near-identical members.
+  //
+  // TOPIC-COHESION GATE: a connected `sequence` component can span MORE than one standing
+  // statement if two lineages were ever linked, and even a clean single-statement chain is
+  // useless to THIS query when it belongs to an unrelated topic that merely shares a high-ranking
+  // restatement's neighbourhood. Pulling a whole off-topic lineage in floods recall with
+  // cross-topic deltas (measured: 5-8 of 15 delivered slots were unrelated chains like "Yuki's
+  // forecast bridge" on Caldwell/ERP queries). So an EXPANDED member (one not already in the
+  // cluster on its own merits) is admitted only if it shares >=2 significant content tokens with
+  // the query — keeping the queried statement's own evolution while dropping unrelated lineages.
+  const qTokens = new Set((args.query.toLowerCase().match(/[a-z0-9]+/g) || []).filter((w) => w.length > 4 && !STOP.has(w)));
+  const sharesQueryTopic = (txt) => {
+    let n = 0;
+    for (const w of new Set((String(txt || "").toLowerCase().match(/[a-z0-9]+/g) || []))) {
+      if (w.length > 4 && !STOP.has(w) && qTokens.has(w) && ++n >= 2) return true;
+    }
+    return false;
+  };
+  let chainIdBySig = new Map();
+  if (clusterRows.length) {
+    const seqAdj = new Map();
+    for (const e of db.prepare("SELECT src, dst FROM edges WHERE rel='sequence'").all()) {
+      if (!seqAdj.has(e.src)) seqAdj.set(e.src, new Set());
+      if (!seqAdj.has(e.dst)) seqAdj.set(e.dst, new Set());
+      seqAdj.get(e.src).add(e.dst);
+      seqAdj.get(e.dst).add(e.src);
+    }
+    if (seqAdj.size) {
+      const PER_CHAIN_MAX = 40; // bound ONE episode (collapses to a few distinct in 1c)
+      const TOUCHED_MAX = 400;  // global guard across all touched chains
+      const inCluster = new Set(clusterRows.map((r) => r.signature));
+      const seedsOnChain = clusterRows.map((r) => r.signature).filter((s) => seqAdj.has(s));
+      const chainSigs = new Set();
+      let nextChain = 0;
+      for (const seed of seedsOnChain) {
+        if (chainIdBySig.has(seed)) continue; // component already expanded via another seed
+        if (chainSigs.size >= TOUCHED_MAX) break;
+        const id = nextChain++;
+        const lseen = new Set();
+        const stack = [seed];
+        let count = 0;
+        while (stack.length && count < PER_CHAIN_MAX) {
+          const cur = stack.pop();
+          if (lseen.has(cur)) continue;
+          lseen.add(cur);
+          chainIdBySig.set(cur, id);
+          count += 1;
+          if (!inCluster.has(cur)) chainSigs.add(cur);
+          for (const nb of (seqAdj.get(cur) || [])) if (!lseen.has(nb)) stack.push(nb);
+        }
+      }
+      if (chainSigs.size) {
+        const ph = [...chainSigs].map(() => "?").join(",");
+        const rows = db.prepare(
+          `SELECT signature, COALESCE(strength,0) AS strength, class, fact, kind, first_seen, notes
+           FROM nodes WHERE kind='fact' AND signature IN (${ph})`
+        ).all(...chainSigs);
+        for (const r of rows) if (sharesQueryTopic(r.fact)) clusterRows.push({ ...r, hops: 1, via: "sequence" });
+      }
+    }
+  }
+
+  // 1c) IDENTICAL-RESTATEMENT COLLAPSE. A standing statement is re-emitted VERBATIM on many days
+  // (only first_seen differs). Returning 100 identical lines floods the cluster and buries
+  // distinct facts; collapse them to ONE representative carrying the observed span so "still
+  // active on date X?" stays answerable. Distinct (delta) versions differ in text -> never
+  // collapsed; they are surfaced via the sequence chain above. first_seen on the representative
+  // is the LATEST sighting (recency-correct "still asserted as of"); observed_since keeps the
+  // origin. No-op when there are no verbatim duplicates (every node keeps observed_count=1).
+  if (clusterRows.length) {
+    const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const repByText = new Map();
+    const collapsed = [];
+    for (const r of clusterRows) {
+      const key = norm(r.fact);
+      if (!key) { collapsed.push(r); continue; }
+      const rep = repByText.get(key);
+      if (!rep) {
+        const nr = { ...r, observed_count: 1, observed_since: r.first_seen || null };
+        repByText.set(key, nr);
+        collapsed.push(nr);
+        continue;
+      }
+      rep.observed_count += 1;
+      const rt = Date.parse(r.first_seen || "");
+      if (Number.isFinite(rt)) {
+        const ft = Date.parse(rep.first_seen || "");
+        if (!Number.isFinite(ft) || rt > ft) rep.first_seen = r.first_seen;     // latest sighting
+        const st = Date.parse(rep.observed_since || "");
+        if (!Number.isFinite(st) || rt < st) rep.observed_since = r.first_seen;  // origin
+      }
+      if ((r.hops || 0) < (rep.hops || 0)) rep.hops = r.hops;
+    }
+    clusterRows = collapsed;
+  }
+
   const clusterSet = new Set(clusterRows.map((r) => r.signature));
 
   // Significant query terms (shared by the detail-expansion and archive tiers below).
@@ -366,6 +471,10 @@ async function main() {
           superseded: !!sup,
           superseded_by: sup ? sup.survivor : null,
           tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
+          via: r.via || undefined,
+          chain_id: chainIdBySig.has(r.signature) ? chainIdBySig.get(r.signature) : undefined,
+          observed_count: (r.observed_count && r.observed_count > 1) ? r.observed_count : undefined,
+          observed_since: (r.observed_count && r.observed_count > 1) ? (r.observed_since || null) : undefined,
         };
       }).concat(detailRows.map((r) => {
         // R2 detail constituent reached via the durable gist->detail pointer only after
