@@ -149,4 +149,56 @@ async function salienceLLM(facts, llm, opts = {}) {
   return new Set(scored.slice(0, cap).map((x) => x.sig));
 }
 
-module.exports = { extractEntitiesLLM, canonicalizeLLM, mergeClustersLLM, salienceLLM };
+// ---- 5. SYNTHESIS (generalize a dormant recurrence family into a concept) ----
+// Given dormant candidate POOLS of distinct-but-recurring facts (e.g. many "PPVNET Sev4 DNS
+// incident <id>" events), partition each pool into sub-themes and, for each genuine recurrence
+// FAMILY, WRITE ONE higher-level CONCEPT that captures the pattern/count/span/outcome. dream.js
+// then demotes the instances to the cold bookshelf UNDER the concept (retained, not deleted).
+// The model must REFUSE to generalize a coincidental mix (unrelated subjects that only co-occur
+// in time): those members are simply left out of every group (kept active). It never invents
+// members — every memberSig must come from the pool. Validated offline (RQ2) with gpt-5.4-mini,
+// which correctly subdivided a mixed PPVNET pool and held a DNS+SLA-mixed item separate.
+async function synthesizeClustersLLM(pools, llm, opts = {}) {
+  if (!llm || !llm.available || !pools.length) return [];
+  const sys = "You are the SYNTHESIS stage of a human-like memory system's nightly dream. "
+    + "You are given POOLS of dormant, low-importance facts a mechanical pass found mutually similar. "
+    + "Many pools are RECURRENCE FAMILIES: distinct events that are really instances of ONE recurring phenomenon "
+    + "(e.g. many separate 'Sev4 DNS incident <id>' events on the same system). For each genuine family, write ONE "
+    + "general CONCEPT fact capturing the PATTERN, the COUNT/scale, the TIME SPAN, and the typical OUTCOME, naming the "
+    + "recurring subject — but NOT the individual ids/timestamps (those stay archived as detail). "
+    + "Partition a pool into MULTIPLE groups when it mixes sub-themes (e.g. DNS incidents vs SLA drops). "
+    + "Keep a member OUT of every group when it is distinctive or mixes several themes. "
+    + "REFUSE to generalize coincidental members (unrelated subjects that only share timing) — leave them out. "
+    + "A concept requires at least TWO instances. Never invent facts or member ids; every memberSig MUST be a provided sig. "
+    + 'Respond with JSON only: an array with one object per pool: '
+    + '{"poolId":"...","groups":[{"concept":"<general fact>","memberSigs":["...",...],"span":"<e.g. June 24-29 2026>","scale":"<e.g. ~10 incidents>"}]}.';
+  const out = [];
+  for (const p of pools) {
+    const user = `Pool ${p.poolId} (${p.members.length} dormant members):\n`
+      + p.members.map((m) => `  ${m.sig}  [${m.firstSeen ? String(m.firstSeen).slice(0, 10) : "?"}]  ${m.fact}`).join("\n")
+      + (p.hotSiblings && p.hotSiblings.length
+          ? "\n\nReinforced siblings (context only — DO NOT demote these; a concept MAY reference them):\n"
+            + p.hotSiblings.map((h) => `  ${h.sig}  ${h.fact}`).join("\n")
+          : "")
+      + `\n\nReturn JSON for this pool: {"poolId":"${p.poolId}","groups":[{"concept":"...","memberSigs":["..."],"span":"...","scale":"..."}]}`;
+    let obj;
+    try { obj = await llm.json(sys, user, { maxTokens: 1500 }); } catch { obj = null; }
+    if (Array.isArray(obj)) obj = obj.find((x) => x && x.poolId === p.poolId) || obj[0];
+    if (!obj || typeof obj !== "object") continue;
+    const valid = new Set(p.members.map((m) => m.sig));
+    const claimed = new Set();
+    const groups = [];
+    for (const g of (Array.isArray(obj.groups) ? obj.groups : [])) {
+      if (!g || typeof g.concept !== "string" || g.concept.trim().length < 12 || !Array.isArray(g.memberSigs)) continue;
+      // valid pool sig, dedup, and not already claimed by an earlier group (no double-demotion)
+      const memberSigs = [...new Set(g.memberSigs.filter((s) => valid.has(s) && !claimed.has(s)))];
+      if (memberSigs.length < 2) continue;
+      memberSigs.forEach((s) => claimed.add(s));
+      groups.push({ concept: g.concept.trim(), memberSigs, span: typeof g.span === "string" ? g.span.trim() : "", scale: typeof g.scale === "string" ? g.scale.trim() : "" });
+    }
+    if (groups.length) out.push({ poolId: p.poolId, groups });
+  }
+  return out;
+}
+
+module.exports = { extractEntitiesLLM, canonicalizeLLM, mergeClustersLLM, salienceLLM, synthesizeClustersLLM };

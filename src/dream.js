@@ -1165,6 +1165,162 @@ async function consolidate(db, opts) {
   };
 }
 
+// ---- SYNTHESIS: emit recurrence-family candidate pools (deterministic) -------
+// Cosine union-find over ACTIVE facts (NO shared-entity gate — the motivating PPVNET cloud has
+// no entity hub). A pool is emitted only when it is a TIGHT, DORMANT, multi-member cloud whose
+// family has gone QUIET (no recent new member), and excludes facts already generalized (already
+// a `detail_of` member, or a `gist`). This is the mechanical CANDIDATE gate; the LLM
+// (`synthesize`) does the careful sub-theme carve / refuse. Dormancy uses reactivations + age,
+// NOT last_reactivated (the weave bumps it nightly -> always 0d).
+function emitCandidates(db, opts = {}) {
+  const o = {
+    tight: opts.tight != null ? opts.tight : 0.70,                       // cosine to union two facts
+    k: opts.k || 12,                                                     // KNN width
+    minSize: opts.minSize || 3,                                         // demote-eligible pool floor
+    maxStrength: opts.maxStrength != null ? opts.maxStrength : 0.45,    // dormant: weak
+    maxReactivations: opts.maxReactivations != null ? opts.maxReactivations : 1, // dormant: not reinforced
+    minAge: opts.minAge != null ? opts.minAge : 14,                    // member had a chance to be re-asked (days)
+    quietFor: opts.quietFor != null ? opts.quietFor : 14,              // cluster maturity: newest member older than this
+  };
+  const now = Date.now();
+  const ageD = (iso) => (iso ? (now - Date.parse(iso)) / 86400000 : 0);
+  const generalized = new Set(db.prepare("SELECT detail_sig FROM detail_of").all().map((r) => r.detail_sig));
+  const facts = db.prepare(`SELECT id, signature, class, strength, reactivations, first_seen, COALESCE(fact,'') fact, notes FROM nodes WHERE ${ACTIVE_FACT}`).all()
+    .filter((f) => f.notes !== "gist" && !generalized.has(f.signature));
+  const byId = new Map(facts.map((f) => [f.id, f]));
+  const parent = new Map(facts.map((f) => [f.id, f.id]));
+  const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
+  for (const f of facts) {
+    const blob = storedVecBlob(db, f.id); if (!blob) continue;
+    const nbrs = db.prepare(`SELECT n.id id, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND ${ACTIVE_FACT}`).all(blob, o.k + 1, f.id);
+    for (const nb of nbrs) { if (!byId.has(nb.id)) continue; if (1 - nb.d >= o.tight) union(f.id, nb.id); }
+  }
+  const groups = new Map();
+  for (const f of facts) { const r = find(f.id); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(f); }
+  const isDormant = (x) => (x.strength || 0) < o.maxStrength && (x.reactivations || 0) <= o.maxReactivations && ageD(x.first_seen) >= o.minAge;
+  const pools = [];
+  let pid = 0;
+  for (const m of groups.values()) {
+    if (m.length < o.minSize) continue;
+    // Cluster maturity (rubber-duck #7): if ANY member (hot or cold) arrived within quietFor
+    // days, the family is still active -> defer synthesis (don't abstract a still-growing cloud).
+    const newestAgeAll = Math.min(...m.map((x) => ageD(x.first_seen)));
+    if (newestAgeAll < o.quietFor) continue;
+    const dormant = m.filter(isDormant);
+    if (dormant.length < o.minSize) continue;
+    // Mixed-strength (rubber-duck #5): reinforced siblings are EXEMPLARS for the concept but stay
+    // hot (never demoted); only the dormant set is demote-eligible.
+    const hot = m.filter((x) => !isDormant(x));
+    pid += 1;
+    pools.push({
+      poolId: `pool-${pid}`,
+      size: dormant.length,
+      members: dormant.sort((a, b) => Date.parse(a.first_seen) - Date.parse(b.first_seen)).map((x) => ({
+        sig: x.signature, fact: x.fact, strength: Number((x.strength || 0).toFixed(3)),
+        reactivations: x.reactivations || 0, firstSeen: x.first_seen, ageDays: Math.round(ageD(x.first_seen)),
+      })),
+      hotSiblings: hot.map((x) => ({ sig: x.signature, fact: x.fact, strength: Number((x.strength || 0).toFixed(3)), reactivations: x.reactivations || 0 })),
+    });
+  }
+  return { facts: facts.length, pools_found: pools.length, params: o, pools };
+}
+
+// ---- SYNTHESIS: apply ONE concept group (deterministic, transactional) -------
+// Reuses the existing gist/detail machinery: the concept is a HOT gist; the members are demoted
+// to the Tier-3 bookshelf (vector -> vec_archive, notes='archive', edges dropped) and linked to
+// the concept by the durable `detail_of` cold lineage (what recall's 2a drill-down walks). The
+// concept node + every member demotion happen in ONE transaction (rubber-duck #3): a failure
+// rolls back the whole group, so there is NEVER an archived member without its concept anchor.
+async function applyConcept(db, group, opts = {}) {
+  const now = (opts.asOf ? new Date(opts.asOf) : new Date()).toISOString();
+  const jrn = (op, sig, reason) => { try { db.prepare("INSERT INTO dream_journal(dreamed_at,run_id,op,memory_id,signature,category,original_fact,result_fact,reason) VALUES (?,?,?,?,?,?,?,?,?)").run(now, `synth-${now}`, op, "", sig || "", "", "", "", reason); } catch { /* journal best-effort */ } };
+  const members = group.memberSigs
+    .map((sig) => db.prepare(`SELECT id, signature, fact, first_seen, memory_id, strength FROM nodes WHERE signature=? AND ${ACTIVE_FACT}`).get(sig))
+    .filter(Boolean);
+  // idempotency: drop members already generalized under some concept
+  const already = new Set(db.prepare("SELECT detail_sig FROM detail_of").all().map((r) => r.detail_sig));
+  const fresh = members.filter((m) => !already.has(m.signature));
+  if (fresh.length < 2) return { applied: false, reason: "fewer than 2 live un-generalized members" };
+
+  // Durable lexical anchors (rubber-duck #2): bake span/scale into the concept text so a
+  // date/topic query has terms to match and the projected gist is self-describing.
+  let conceptText = group.concept;
+  const extra = [group.span, group.scale].filter((s) => s && !conceptText.includes(s));
+  if (extra.length) conceptText += ` (${extra.join(", ")})`;
+  // the concept carries the family's ONSET date (earliest member) so the span is navigable
+  const minFirst = fresh.reduce((m, n) => { const t = Date.parse(n.first_seen || ""); return (Number.isFinite(t) && (m == null || t < m.t)) ? { t, s: n.first_seen } : m; }, null);
+  const conceptFirstSeen = (minFirst && minFirst.s) || now;
+
+  const vec = await embedOne(conceptText);
+  const blob = toVecBlob(vec);
+  const tx = db.transaction(() => {
+    // id must clear every id-space: a deleted node can leave an orphan vec_nodes/vec_archive
+    // rowid above MAX(nodes.id), which would collide on the vec_nodes PK (rubber-duck: orphan vec).
+    const vmax = (t) => { try { return db.prepare(`SELECT COALESCE(MAX(rowid),0)+1 m FROM ${t}`).get().m; } catch { return 0; } };
+    const cid = Math.max(nextId(db), vmax("vec_nodes"), vmax("vec_archive"));
+    const csig = uniqueSig(db, `fact:${deriveSlug(conceptText)}`);
+    db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
+      VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(cid, csig, "", "fact", "semantic", "fact", 0.62, conceptFirstSeen, now, now, "gist", conceptText, conceptText);
+    db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(cid), blob);
+    for (const m of fresh) {
+      // connect the concept to the entity hubs the member mentioned (keeps it non-island +
+      // reachable by entity co-mention), then DEMOTE the member to the cold bookshelf.
+      for (const e of db.prepare("SELECT dst, weight FROM edges WHERE src=? AND rel='mentions'").all(m.signature)) {
+        const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='mentions' AND dst=?").get(csig, e.dst);
+        if (!dup && csig !== e.dst) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(csig, "mentions", e.dst, e.weight, now, now);
+      }
+      db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(m.signature, csig, now);
+      const rid = BigInt(m.id);
+      const vblob = storedVecBlob(db, m.id);
+      db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
+      db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(rid);
+      if (vblob) { db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(rid); db.prepare("INSERT INTO vec_archive(rowid, embedding) VALUES (?, ?)").run(rid, vblob); }
+      db.prepare("UPDATE nodes SET notes='archive', last_decayed=? WHERE id=?").run(now, m.id);
+      jrn("merge", m.signature, `synthesized under concept ${csig}`);
+    }
+    jrn("bridge", csig, `concept generalizes ${fresh.length} dormant instances`);
+    return { concept_sig: csig, demoted: fresh.length };
+  });
+  const res = tx();
+  return { applied: true, concept: conceptText, ...res };
+}
+
+// ---- SYNTHESIS: bounded multi-turn auto loop (engine-internal DREAM_LLM path) -
+// The headless/bench front-end: emit -> judge(DREAM_LLM) -> validate -> apply -> re-emit until
+// fixpoint or turn-cap. Stateless turns (all state in the db), best-effort & non-blocking (an
+// LLM failure stops the loop, never corrupts the store), transcripted for audit. The live
+// conversational skill drives the same emit-candidates / apply primitives in-context instead.
+async function synthesizeAuto(db, opts = {}) {
+  const llm = getLLM(llmEnv());
+  if (!llm || !llm.available) return { ran: false, reason: "no LLM (judgment off / DREAM_LLM unset)" };
+  const maxTurns = opts.maxTurns || 3;
+  const transcript = [];
+  let totalConcepts = 0, totalDemoted = 0, turn = 0;
+  for (; turn < maxTurns; turn += 1) {
+    const cand = emitCandidates(db, opts.detect || {});
+    if (!cand.pools.length) break;
+    let decisions = [];
+    try { decisions = await judge.synthesizeClustersLLM(cand.pools, llm, {}); }
+    catch (e) { transcript.push({ turn, error: String((e && e.message) || e) }); break; }
+    let appliedThisTurn = 0;
+    const applied = [];
+    for (const dec of decisions) {
+      for (const g of dec.groups) {
+        try {
+          const r = await applyConcept(db, g, { asOf: opts.asOf });
+          if (r.applied) { totalConcepts += 1; totalDemoted += r.demoted; appliedThisTurn += 1; applied.push({ concept: r.concept, demoted: r.demoted }); }
+        } catch (e) { transcript.push({ turn, applyError: String((e && e.message) || e), concept: g.concept }); }
+      }
+    }
+    transcript.push({ turn, pools: cand.pools.length, decided: decisions.length, applied });
+    if (!appliedThisTurn) break;
+  }
+  repairGraph(db);
+  if (opts.transcript) { try { fs.appendFileSync(opts.transcript, transcript.map((t) => JSON.stringify(t)).join("\n") + "\n"); } catch { /* audit best-effort */ } }
+  return { ran: true, turns: turn, concepts_created: totalConcepts, members_demoted: totalDemoted, llm: llm.label, transcript };
+}
+
 // ---- BUDGET (report entry budget + prioritized worklist) --------------------
 async function budget(db) {
   const factCount = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
@@ -1367,6 +1523,13 @@ async function main() {
     else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], llm: flags.llm === true || flags.llm === "true", supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
     else if (cmd === "reflect") r = await reflect(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
     else if (cmd === "consolidate") r = await consolidate(db, { sim: Number(flags.sim) || 0 });
+    else if (cmd === "emit-candidates") r = emitCandidates(db, { tight: flags.tight != null ? Number(flags.tight) : undefined, minSize: flags["min-size"] != null ? Number(flags["min-size"]) : undefined, quietFor: flags["quiet-for"] != null ? Number(flags["quiet-for"]) : undefined, minAge: flags["min-age"] != null ? Number(flags["min-age"]) : undefined, maxStrength: flags["max-strength"] != null ? Number(flags["max-strength"]) : undefined });
+    else if (cmd === "synthesize") {
+      const detect = {};
+      for (const [f, k] of [["tight", "tight"], ["min-size", "minSize"], ["quiet-for", "quietFor"], ["min-age", "minAge"], ["max-strength", "maxStrength"]]) if (flags[f] != null) detect[k] = Number(flags[f]);
+      r = await synthesizeAuto(db, { asOf: flags["as-of"], maxTurns: flags["max-turns"] != null ? Number(flags["max-turns"]) : undefined, transcript: flags.transcript, detect });
+    }
+    else if (cmd === "apply-concept") { const g = JSON.parse(fs.readFileSync(flags.file, "utf8")); r = await applyConcept(db, g, { asOf: flags["as-of"] }); repairGraph(db); }
     else if (cmd === "budget") r = await budget(db);
     else if (cmd === "doctor") { r = doctor(db); gate = !r.healthy; }
     else if (cmd === "export-harness") r = exportHarness(db, flags["as-of"]);
@@ -1379,4 +1542,8 @@ async function main() {
     if (gate) process.exitCode = 3;
   } finally { db.close(); }
 }
-main().catch((e) => { console.error("ERROR:", e); process.exit(1); });
+if (require.main === module) {
+  main().catch((e) => { console.error("ERROR:", e); process.exit(1); });
+}
+
+module.exports = { emitCandidates, applyConcept, synthesizeAuto, repairGraph };
