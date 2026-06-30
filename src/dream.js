@@ -204,11 +204,25 @@ async function reembed(db, onlyIds) {
 function repairGraph(db) {
   const now = new Date().toISOString();
   db.prepare("UPDATE nodes SET memory_id='' WHERE memory_id='live'").run();
+  // Self-heal prior pollution: blank `fact:`-sig 'scaffolding' stubs are illegitimate (a fact
+  // signature was wrongly resurrected as a content-less entity by the old repairGraph). Delete
+  // them here; the dangling-edge scan below then drops any edges that pointed at them.
+  db.prepare("DELETE FROM nodes WHERE notes='scaffolding' AND signature LIKE 'fact:%' AND (fact IS NULL OR fact='')").run();
   const sigs = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   const referenced = new Set();
   for (const e of db.prepare("SELECT src, dst FROM edges").all()) { referenced.add(e.src); referenced.add(e.dst); }
-  let restored = 0;
+  let restored = 0, droppedFactEdges = 0;
   for (const s of [...referenced].filter((x) => x && !sigs.has(x))) {
+    // A dangling FACT endpoint means the fact was consolidated/pruned/demoted away. It must
+    // NOT be resurrected as a blank entity hub: that mints content-less 'scaffolding' stubs
+    // and silently re-homes sequence/supersedes chains onto a fake node (the root cause of
+    // "100% of sequence edges dangle onto blank stubs" in the live store). Drop the dangling
+    // edges instead; any lineage that must survive a demotion already lives in detail_of.
+    if (s.startsWith("fact:")) {
+      droppedFactEdges += db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(s, s).changes;
+      continue;
+    }
+    // A dangling ENTITY endpoint is a legitimate hub the weave referenced; resurrect it.
     const id = nextId(db);
     db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
       VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, s, "", "entity", "semantic", "semantic", 0.5, now, now, now, "scaffolding", "", "");
@@ -309,8 +323,13 @@ async function ingestHarness(db, file, prune, asOf) {
       const stale = db.prepare("SELECT id, signature, memory_id FROM nodes WHERE kind='fact' AND memory_id<>''").all().filter((n) => !harnessIds.has(n.memory_id));
       for (const n of stale) {
         db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id, now, "pruned: left harness");
+        // Delete the node's EDGES too. Without this, a sequence/supersedes/related_to edge
+        // pointing at this pruned fact is left dangling, and the next repairGraph pass used
+        // to resurrect the endpoint as a blank entity stub (the sequence-edge corruption).
+        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
         db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
         db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(n.id));
+        db.prepare("DELETE FROM detail_of WHERE detail_sig=? OR gist_sig=?").run(n.signature, n.signature);
         db.prepare("DELETE FROM nodes WHERE id=?").run(n.id);
         res.pruned += 1;
       }
@@ -1047,6 +1066,18 @@ async function reflect(db, opts) {
           const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='mentions' AND dst=?").get(survivor.signature, e.dst);
           if (!dup && survivor.signature !== e.dst) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "mentions", e.dst, e.weight, now, now);
         }
+        // MOVE the member's chronological/correction lineage (sequence/supersedes) onto the
+        // survivor so the timeline stays navigable from the active gist. Re-point both
+        // directions, dedup, drop self-loops, then remove the originals from the member so
+        // the chain is never duplicated (and never dangles once the member is demoted/deleted).
+        for (const e of db.prepare("SELECT src, rel, dst, weight FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(m.signature, m.signature)) {
+          const nsrc = e.src === m.signature ? survivor.signature : e.src;
+          const ndst = e.dst === m.signature ? survivor.signature : e.dst;
+          if (nsrc === ndst) continue;
+          const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel=? AND dst=?").get(nsrc, e.rel, ndst);
+          if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(nsrc, e.rel, ndst, e.weight, now, now);
+        }
+        db.prepare("DELETE FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").run(m.signature, m.signature);
         if (keepDetail) {
           // RETAIN: keep the detailed fact in the DB as a lookup-only 'detail' node.
           // Not projected (gist is), but fully retrievable via recall. Link it to the
