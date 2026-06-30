@@ -136,6 +136,9 @@ html[data-theme="dark"] #graph { background:
     <div id="graph"></div>
     <div class="labels" id="labels"></div>
     <div class="toolbar">
+      <button class="tbtn on" id="modeSem" title="Semantic axis: meaning links (related_to / similar_to / mentions). Hides year-reference hubs.">◆ Semantic</button>
+      <button class="tbtn" id="modeTmp" title="Temporal axis: only sequence + supersedes — the lineages of how events evolved over time.">◷ Temporal</button>
+      <span style="width:1px;align-self:stretch;background:var(--cp-border);margin:0 3px;"></span>
       <button class="tbtn" id="homeBtn" title="Fit all nodes in view">⌂ Fit</button>
       <button class="tbtn on" id="rotateBtn" title="Toggle idle auto-rotation">↻ Auto</button>
       <button class="tbtn" id="focusBtn" title="Zoom to current selection">⊙ Focus</button>
@@ -185,13 +188,43 @@ const data = {"nodes":[],"links":[]};
   nodes.forEach(n=>{ n._search=(n.id+' '+n.fact+' '+n.notes).toLowerCase(); });
   function escapeHtml(v){ return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-  const comp=new Array(nodes.length).fill(-1); let nComp=0, largest=0;
-  for(let i=0;i<nodes.length;i++){ if(comp[i]!==-1)continue; const q=[i]; comp[i]=nComp; let sz=0;
-    while(q.length){ const v=q.shift(); sz++; for(const u of adj[v]) if(comp[u]===-1){comp[u]=nComp;q.push(u);} } largest=Math.max(largest,sz); nComp++; }
-  document.getElementById('nodeCount').textContent=nodes.length;
-  document.getElementById('edgeCount').textContent=rawLinks.length;
-  document.getElementById('componentCount').textContent=nComp;
-  document.getElementById('largestComponent').textContent=largest;
+  // ---- LINK MODES: semantic axis vs temporal axis ----
+  // The same graph carries two orthogonal kinds of relationship. SEMANTIC links (related_to /
+  // similar_to / mentions) wire facts to meaning and to the entities they name. TEMPORAL links
+  // (sequence / supersedes) wire a standing statement to its own past — the lineage of how a
+  // belief evolved or was overridden. Drawing both at once makes a hairball, and time-reference
+  // hubs (e.g. ref:2026, which every fact naming the year links to) become degenerate mention
+  // hubs that dominate the meaning-nebula. The toggle lets you view one axis at a time.
+  const TEMPORAL_RELS=new Set(['sequence','supersedes']);
+  const isTemporalRel=r=>TEMPORAL_RELS.has(r);
+  const isTimeRefHub=n=>n.kind==='entity'&&/^ref:(?:19|20)\d{2}(?:[-:]\d{1,2}){0,2}$/.test(n.id);
+  let linkMode='semantic';
+  const refHub=new Uint8Array(nodes.length);
+  nodes.forEach(n=>{ if(isTimeRefHub(n)) refHub[n.idx]=1; });
+  const adjSem=nodes.map(()=>[]), adjTmp=nodes.map(()=>[]);
+  const tmpDeg=new Int32Array(nodes.length), semDeg=new Int32Array(nodes.length);
+  rawLinks.forEach(l=>{ const a=byId.get(l.source).idx,b=byId.get(l.target).idx;
+    if(isTemporalRel(l.rel)){ adjTmp[a].push(b); adjTmp[b].push(a); tmpDeg[a]++; tmpDeg[b]++; }
+    else if(!refHub[a]&&!refHub[b]){ adjSem[a].push(b); adjSem[b].push(a); semDeg[a]++; semDeg[b]++; } });
+  const nodeHasTemporal=Array.from(tmpDeg,d=>d>0);
+  let activeAdj=adjSem;
+  const endIds=l=>[typeof l.source==='object'?l.source.id:l.source, typeof l.target==='object'?l.target.id:l.target];
+  function linkActive(l){ if(linkMode==='temporal') return isTemporalRel(l.rel);
+    if(isTemporalRel(l.rel)) return false;
+    const [s,t]=endIds(l); const ai=byId.get(s),bi=byId.get(t);
+    return !(ai&&refHub[ai.idx])&&!(bi&&refHub[bi.idx]); }
+  const activeDeg=n=>linkMode==='temporal'?tmpDeg[n.idx]:semDeg[n.idx];
+
+  function computeComponents(A){ const comp=new Array(nodes.length).fill(-1); let nComp=0, largest=0;
+    for(let i=0;i<nodes.length;i++){ if(comp[i]!==-1)continue; const stack=[i]; comp[i]=nComp; let sz=0;
+      while(stack.length){ const v=stack.pop(); sz++; for(const u of A[v]) if(comp[u]===-1){comp[u]=nComp;stack.push(u);} } largest=Math.max(largest,sz); nComp++; }
+    return {nComp,largest}; }
+  function refreshStats(){ const {nComp,largest}=computeComponents(activeAdj);
+    document.getElementById('nodeCount').textContent=nodes.length;
+    document.getElementById('edgeCount').textContent=rawLinks.filter(linkActive).length;
+    document.getElementById('componentCount').textContent=nComp;
+    document.getElementById('largestComponent').textContent=largest; }
+  refreshStats();
 
   // ---- search/hop ----
   let hop=null, hits=new Set(), focusId=null;
@@ -203,7 +236,7 @@ const data = {"nodes":[],"links":[]};
     if(focusId!=null){ const fn=byId.get(focusId); if(fn){ hits.add(fn.idx); seeds.push(fn.idx); } }
     hop=new Int8Array(nodes.length).fill(-1); let fr=[];
     seeds.forEach(i=>{ if(hop[i]===-1){hop[i]=0;fr.push(i);} });
-    for(let lv=0;lv<2;lv++){ const nx=[]; for(const v of fr) for(const u of adj[v]) if(hop[u]===-1){hop[u]=lv+1;nx.push(u);} fr=nx; }
+    for(let lv=0;lv<2;lv++){ const nx=[]; for(const v of fr) for(const u of activeAdj[v]) if(hop[u]===-1){hop[u]=lv+1;nx.push(u);} fr=nx; }
     hitCountEl.textContent=q?('\u00b7 '+hits.size+' hit'+(hits.size===1?'':'s')):'';
     refresh();
     if(q && seeds.length){ flyTo(byId.get(nodes[seeds[0]].id)); }
@@ -212,12 +245,20 @@ const data = {"nodes":[],"links":[]};
     if(cf!=='all'){ if(cf==='entity'){ if(n.kind!=='entity')return false; } else if(n.cls!==cf||n.kind!=='fact')return false; }
     if(n.kind==='fact' && n.strength<parseFloat(strength.value)) return false; return true; }
   function dimT(n){ if(hop===null)return 0; const h=hop[n.idx]; if(h===0)return 0; if(h===1)return 0.42; if(h===2)return 0.68; return 0.88; }
-  function nodeVis(n){ if(!passesFilter(n)) return false; if(focusId!=null && hop && hop[n.idx]===-1) return false; return true; }
+  function nodeVis(n){ if(!passesFilter(n)) return false;
+    if(linkMode==='semantic'){ if(refHub[n.idx]) return false; }
+    else { if(!nodeHasTemporal[n.idx]) return false; }
+    if(focusId!=null && hop && hop[n.idx]===-1) return false; return true; }
   const avgCol=(a,b)=>{ const ca=baseColor(a),cb=baseColor(b); return [(ca[0]+cb[0])>>1,(ca[1]+cb[1])>>1,(ca[2]+cb[2])>>1]; };
   function nodeColor(n){ if(!passesFilter(n)) return mix(baseColor(n),0.95); return mix(baseColor(n),dimT(n)); }
   function nodeSize(n){ const base=n.kind==='entity'?0.79:0.9+n.strength*2.8; return base*(hop!==null&&hop[n.idx]===0?1.8:1); }
-  function linkColorOf(l){ const a=byId.get(typeof l.source==='object'?l.source.id:l.source), b=byId.get(typeof l.target==='object'?l.target.id:l.target);
-    if(!a||!b) return mix(PAL.entity,0.7); if(!nodeVis(a)||!nodeVis(b)) return mix(PAL.entity,0.96);
+  function linkVis(l){ if(!linkActive(l)) return false; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t); return !!a&&!!b&&nodeVis(a)&&nodeVis(b); }
+  function linkColorOf(l){ if(!linkActive(l)) return 'rgba(0,0,0,0)';
+    const [sid,tid]=endIds(l); const a=byId.get(sid), b=byId.get(tid);
+    if(!a||!b) return mix(PAL.entity,0.7); if(!nodeVis(a)||!nodeVis(b)) return 'rgba(0,0,0,0)';
+    if(linkMode==='temporal'){ const base=l.rel==='supersedes'?PAL.salient:PAL.episodic;
+      if(hop!==null){ const hit=hop[a.idx]===0||hop[b.idx]===0; return mix(base, hit?0.0:0.4); }
+      return mix(base,0.12); }
     const col=avgCol(a,b);
     if(hop!==null){ const ha=hop[a.idx],hb=hop[b.idx],hit=ha===0||hb===0; return mix(col, hit?0.0:Math.max(dimT(a),dimT(b),0.5)); }
     return mix(col,0.28); }
@@ -245,7 +286,7 @@ const data = {"nodes":[],"links":[]};
 
   // ---- build graph ----
   let Graph=null, labelMode='auto', autoRotate=true, rotateAngle=0, lastInteract=0, hoverId=null;
-  function importance(n){ const base = n.kind==='entity' ? degree[n.idx]*1.1 : (n.strength*3 + degree[n.idx]*0.18);
+  function importance(n){ const base = n.kind==='entity' ? activeDeg(n)*1.1 : (n.strength*3 + activeDeg(n)*0.18);
     return base + (hop!==null&&hop[n.idx]===0?1000:0); }
   function flyTo(o){ if(!Graph||o==null||o.x==null) return; const dist=70;
     const r=Math.hypot(o.x,o.y,o.z)||1; const k=(r+dist)/r;
@@ -274,8 +315,8 @@ const data = {"nodes":[],"links":[]};
       .linkColor(linkColorOf)
       .linkWidth(l=>0.6+l.weight*1.2)
       .linkOpacity(0.5)
-      .linkVisibility(l=>{ const a=byId.get(typeof l.source==='object'?l.source.id:l.source),b=byId.get(typeof l.target==='object'?l.target.id:l.target); return !!a&&!!b&&nodeVis(a)&&nodeVis(b); })
-      .linkDirectionalParticles(l=>{ const a=byId.get(typeof l.source==='object'?l.source.id:l.source),b=byId.get(typeof l.target==='object'?l.target.id:l.target); if(hop===null)return 0; return (a&&b&&(hop[a.idx]===0||hop[b.idx]===0))?2:0; })
+      .linkVisibility(linkVis)
+      .linkDirectionalParticles(l=>{ if(hop===null||!linkActive(l))return 0; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t); return (a&&b&&(hop[a.idx]===0||hop[b.idx]===0))?2:0; })
       .linkDirectionalParticleWidth(1.4).linkDirectionalParticleSpeed(0.006)
       .onNodeClick(o=>{ focusOn(o.id); flyTo(o); })
       .onBackgroundClick(()=>{ focusId=null; hideDetail(); recomputeHops(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); })
@@ -295,7 +336,7 @@ const data = {"nodes":[],"links":[]};
   } catch(e){ elErr.style.display='flex'; console.error(e); }
 
   function refresh(){ if(!Graph)return; Graph.nodeColor(o=>nodeColor(byId.get(o.id))).nodeVal(o=>nodeSize(byId.get(o.id)))
-    .nodeVisibility(o=>nodeVis(byId.get(o.id))).linkColor(linkColorOf).linkDirectionalParticles(Graph.linkDirectionalParticles()); }
+    .nodeVisibility(o=>nodeVis(byId.get(o.id))).linkVisibility(linkVis).linkColor(linkColorOf).linkDirectionalParticles(Graph.linkDirectionalParticles()); }
   function focusOn(id){ focusId=id; search.value=''; recomputeHops(); showDetail(id); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); }
 
   // ---- camera helpers ----
@@ -311,6 +352,16 @@ const data = {"nodes":[],"links":[]};
   function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
 
   // ---- buttons ----
+  function setLinkMode(m){ if(m===linkMode) return; linkMode=m; activeAdj = m==='temporal'?adjTmp:adjSem;
+    document.getElementById('modeSem').classList.toggle('on',m==='semantic');
+    document.getElementById('modeTmp').classList.toggle('on',m==='temporal');
+    document.getElementById('hint').textContent = m==='temporal'
+      ? 'Temporal axis — sequence (lineage) + supersedes (override) only. Nodes without a temporal edge are hidden.'
+      : 'Semantic axis — meaning links; year-reference hubs hidden.';
+    focusId=null; hideDetail(); search.value=''; hitCountEl.textContent='';
+    recomputeHops(); refreshStats(); if(Graph){ Graph.zoomToFit(700,40); if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); } }
+  document.getElementById('modeSem').onclick=()=>setLinkMode('semantic');
+  document.getElementById('modeTmp').onclick=()=>setLinkMode('temporal');
   document.getElementById('homeBtn').onclick=()=>{ if(Graph){ focusId=null; hideDetail(); recomputeHops(); Graph.zoomToFit(800,50); lastInteract=Date.now(); } };
   document.getElementById('rotateBtn').onclick=()=>setRotate(!autoRotate);
   document.getElementById('focusBtn').onclick=()=>{ if(focusId){ const o=Graph.graphData().nodes.find(n=>n.id===focusId); if(o) flyTo(o); } else if(Graph){ Graph.zoomToFit(700,50); } };
