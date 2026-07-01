@@ -33,6 +33,40 @@ function parseArgs(argv) {
   return args;
 }
 
+// Parse a temporal window from a natural-language query so the cold bookshelf can be
+// looked up by TIME (not just semantic/keyword). first_seen is stored ISO ("2026-06-25T..")
+// which a query like "June 25" never LIKE-matches — this bridges NL dates to an ISO range.
+// Returns { lo, hi } inclusive ISO-date bounds (YYYY-MM-DD) or null when no date intent.
+const MONTHS = { jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4, may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12 };
+function pad2(n) { return String(n).padStart(2, "0"); }
+function lastDay(y, m) { return new Date(y, m, 0).getDate(); }
+function parseDateRange(query, nowRef) {
+  const q = String(query || "").toLowerCase();
+  const defYear = (nowRef instanceof Date && !Number.isNaN(nowRef.getTime())) ? nowRef.getFullYear() : new Date().getFullYear();
+  // 1) ISO full date  2026-06-25
+  let m = q.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (m) { const d = `${m[1]}-${m[2]}-${m[3]}`; return { lo: d, hi: d }; }
+  // 2) ISO month  2026-06
+  m = q.match(/(\d{4})-(\d{2})(?!\d)/);
+  if (m) { const y = +m[1], mo = +m[2]; return { lo: `${m[1]}-${m[2]}-01`, hi: `${m[1]}-${m[2]}-${pad2(lastDay(y, mo))}` }; }
+  // 3) month name (+ optional qualifier / day / year)
+  const monthRe = new RegExp(`(late|early|mid|middle|end of|beginning of)?\\s*(${Object.keys(MONTHS).join("|")})\\b(?:\\s+(\\d{1,2})(?!\\d))?(?:\\s*[-–to]{1,3}\\s*(\\d{1,2})(?!\\d))?(?:,?\\s*(\\d{4}))?`, "i");
+  m = q.match(monthRe);
+  if (m) {
+    const qual = m[1] || "", mo = MONTHS[m[2]], d1 = m[3] ? +m[3] : null, d2 = m[4] ? +m[4] : null, yr = m[5] ? +m[5] : defYear;
+    const ld = lastDay(yr, mo);
+    if (d1 && d2) return { lo: `${yr}-${pad2(mo)}-${pad2(Math.min(d1, d2))}`, hi: `${yr}-${pad2(mo)}-${pad2(Math.min(ld, Math.max(d1, d2)))}` };
+    if (d1) { const d = `${yr}-${pad2(mo)}-${pad2(Math.min(d1, ld))}`; return { lo: d, hi: d }; }
+    // whole month, optionally narrowed by qualifier
+    let lo = 1, hi = ld;
+    if (/late|end of/.test(qual)) { lo = 21; hi = ld; }
+    else if (/early|beginning of/.test(qual)) { lo = 1; hi = 10; }
+    else if (/mid|middle/.test(qual)) { lo = 11; hi = 20; }
+    return { lo: `${yr}-${pad2(mo)}-${pad2(lo)}`, hi: `${yr}-${pad2(mo)}-${pad2(hi)}` };
+  }
+  return null;
+}
+
 const STOP = new Set(
   "the a an is are was were of for to in on and or that with as at by from this its not be no into what which who whom whose when where why how did do does has have had will would should could about over under more most than then them they their our your you i me my we us work works working update updates updated status note notes keep keeps keeping kept reminder reminders daily weekly monthly today yesterday tomorrow".split(" ")
 );
@@ -426,6 +460,48 @@ async function main() {
   }
   const archiveVecSet = new Set(archiveVecRows.map((r) => r.signature));
 
+  // 2d) TIER 3 (bookshelf) — TIME-WINDOW recall over demoted facts. Tiers 2b/2c reach the
+  // archive by keyword/vector similarity but are BLIND to time: a query like "what happened on
+  // June 25" names a DATE, not the topic words, so the right archived details are never matched.
+  // first_seen is stored ISO ("2026-06-25T.."), which NL dates never LIKE-match. Here we parse a
+  // date window from the query and pull archived facts whose first_seen falls inside it, ranked by
+  // in-window term relevance then recency. Fires ONLY when the query bears a date (the temporal
+  // intent signal), so standing/topical queries never drag in random archived rows. Tagged
+  // tier='archive' via='archive_time' so the ranker keeps it in the cold band below active seeds.
+  const ARCHIVE_TIME_ON = process.env.DREAM_ARCHIVE_TIME !== "0";
+  const ARCHIVE_TIME_BUDGET = Number(process.env.DREAM_ARCHIVE_TIME_BUDGET ?? Math.max(4, Math.floor(args.k / 2)));
+  let archiveTimeRows = [];
+  if (ARCHIVE_TIME_ON) {
+    const asOfDate = args.asOf ? new Date(args.asOf) : new Date();
+    const range = parseDateRange(args.query, asOfDate);
+    if (range) {
+      try {
+        const rows = db.prepare(`
+          SELECT n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
+                 n.strength AS strength, n.class AS class
+          FROM nodes n
+          WHERE n.kind='fact' AND n.notes='archive'
+            AND substr(n.first_seen,1,10) BETWEEN ? AND ?
+          ORDER BY n.first_seen DESC
+        `).all(range.lo, range.hi);
+        const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows].flatMap((r) => collapseKeys(r.fact, enumerative)));
+        const scored = rows.map((r) => {
+          const hay = normalizeForMatch(r.fact || "");
+          const hits = terms.reduce((acc, t) => acc + (hay.includes(t) ? 1 : 0), 0);
+          return { ...r, hits };
+        }).sort((a, b) => (b.hits - a.hits) || String(b.first_seen).localeCompare(String(a.first_seen)));
+        for (const r of scored) {
+          if (clusterSet.has(r.signature) || detailSet.has(r.signature) || archiveSet.has(r.signature) || archiveVecSet.has(r.signature)) continue;
+          const keys = collapseKeys(r.fact, enumerative);
+          if (keys.some((k) => usedKeys.has(k))) continue;
+          for (const k of keys) usedKeys.add(k);
+          archiveTimeRows.push(r);
+          if (archiveTimeRows.length >= ARCHIVE_TIME_BUDGET) break;
+        }
+      } catch (e) { archiveTimeRows = []; }
+    }
+  }
+
   // 3) Edges fully inside the cluster.
   const allEdges = db.prepare(`SELECT src, rel, dst, weight FROM edges`).all();
   const clusterEdges = allEdges
@@ -512,6 +588,16 @@ async function main() {
           superseded: !!sup, superseded_by: sup ? sup.survivor : null, tier: "archive", via: "archive_vec",
           avsim: Number((r.sim || 0).toFixed(4)),
         };
+      })).concat(archiveTimeRows.map((r) => {
+        // Archived fact reached by TIME window (query named a date) — cold-band tier='archive'.
+        const d = ageDays(r.first_seen, nowRef);
+        const sup = supersededBy.get(r.signature);
+        return {
+          id: r.signature, hops: 99, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
+          kind: "fact", fact: (r.fact || "").trim(),
+          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          superseded: !!sup, superseded_by: sup ? sup.survivor : null, tier: "archive", via: "archive_time",
+        };
       })),
       edges: clusterEdges,
     },
@@ -520,4 +606,8 @@ async function main() {
   console.log(JSON.stringify(out, null, 2));
 }
 
-main().catch((e) => { console.error("SEARCH ERROR:", e); process.exit(1); });
+if (require.main === module) {
+  main().catch((e) => { console.error("SEARCH ERROR:", e); process.exit(1); });
+}
+
+module.exports = { parseDateRange };
