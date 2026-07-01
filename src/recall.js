@@ -14,6 +14,22 @@ const cfg = require("../config");
 
 const DB_PATH = cfg.DB_PATH;
 
+// Decode a sqlite-vec float32 blob into a Float32Array. Node Buffers can sit at any
+// byteOffset in a shared pool (not guaranteed 4-byte aligned), so read floats explicitly
+// rather than aliasing the ArrayBuffer (which would throw on an unaligned offset).
+function fromVecBlob(buf) {
+  const f = new Float32Array(buf.length / 4);
+  for (let i = 0; i < f.length; i += 1) f[i] = buf.readFloatLE(i * 4);
+  return f;
+}
+// Embeddings are L2-normalized (embed.js normalize:true), so cosine similarity == dot product.
+function dot(a, b) {
+  let s = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i += 1) s += a[i] * b[i];
+  return s;
+}
+
 function parseArgs(argv) {
   const args = { query: "", maxHops: 2, seedLimit: 4, k: 12, nodeLimit: 80, asOf: "" };
   for (let i = 2; i < argv.length; i += 1) {
@@ -137,7 +153,8 @@ async function main() {
     }
   }
 
-  const qvec = toVecBlob(await embedOne(args.query));
+  const qFloat = await embedOne(args.query);
+  const qvec = toVecBlob(qFloat);
 
   // 1) Vector KNN -> candidate seeds (cosine distance; lower = closer). Seeds are FACTS
   //    only: entity hubs are also embedded, but a hub seed consumes a limited seed slot
@@ -508,6 +525,29 @@ async function main() {
     .filter((e) => clusterSet.has(e.src) && clusterSet.has(e.dst))
     .sort((a, b) => b.weight - a.weight || a.src.localeCompare(b.src) || a.dst.localeCompare(b.dst));
 
+  // Real per-node cosine for ACTIVE cluster nodes (A2 activation ranking). The bounded seed
+  // KNN (k*2) misses reinforced consolidated facts that only reach the pool via the graph walk;
+  // those get scored by a flat tier band downstream and sink below stale-but-similar restatements.
+  // Fetch each active node's embedding once (while the db is open) so activation = cosine +
+  // lambda*strength can rank the true answer above surface-similar noise. Embeddings are
+  // L2-normalized, so cosine == dot(qFloat, nodeVec).
+  const cosBySig = new Map();
+  for (const r of seedRows) cosBySig.set(r.signature, 1 - r.distance); // seeds already carry it
+  const needCos = clusterRows.map((r) => r.signature).filter((s) => !cosBySig.has(s));
+  if (needCos.length) {
+    const ph = needCos.map(() => "?").join(",");
+    const idRows = db.prepare(`SELECT id, signature FROM nodes WHERE signature IN (${ph})`).all(...needCos);
+    if (idRows.length) {
+      const idToSig = new Map(idRows.map((r) => [r.id, r.signature]));
+      const ph2 = idRows.map(() => "?").join(",");
+      const vrows = db.prepare(`SELECT rowid, embedding FROM vec_nodes WHERE rowid IN (${ph2})`).all(...idRows.map((r) => r.id));
+      for (const v of vrows) {
+        const sig = idToSig.get(v.rowid);
+        if (sig != null && v.embedding) cosBySig.set(sig, dot(qFloat, fromVecBlob(v.embedding)));
+      }
+    }
+  }
+
   db.close();
 
   // "Now" for relative-age tags: explicit --as-of, else the latest memory in the
@@ -517,6 +557,52 @@ async function main() {
     return t && t > m ? t : m;
   }, 0);
   const nowRef = args.asOf ? new Date(args.asOf) : (latest ? new Date(latest) : new Date());
+
+  // ---- Activation ranking (P11) ------------------------------------------------------------
+  // ACTIVATION = cosine + lambda*strength: rerank ACTIVE nodes so a reinforced consolidated fact
+  // (high ACT-R base-level activation = recency x frequency x schema, held in `strength`) can
+  // outrank a stale low-strength restatement that merely shares surface tokens. Cosine-dominant
+  // and SEMANTICALLY GATED — the strength bonus applies only once a node clears a cosine floor,
+  // so an off-topic strong fact is never promoted. This is seed/relevance SELECTION incl. strength,
+  // NOT a global time-reorder of rendered context (ARCHITECTURE principle 6 caution).
+  const ACT_LAMBDA = Number(process.env.DREAM_ACT_LAMBDA ?? 0.2);
+  const ACT_COS_FLOOR = Number(process.env.DREAM_ACT_COS_FLOOR ?? 0.30);
+  const ACT_SUPERSEDE_PENALTY = Number(process.env.DREAM_ACT_SUPERSEDE_PENALTY ?? 0.15);
+  const dateIntent = parseDateRange(args.query, nowRef) != null;
+  const histIntent = /\b(origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
+  const activationOf = (c, s, superseded) => {
+    const gate = c >= ACT_COS_FLOOR ? 1 : 0;
+    let lam = ACT_LAMBDA;
+    if (dateIntent && !histIntent) lam *= 0.5; // explicit-date lookup: favor cosine/date, damp strength
+    let a = c + lam * (s || 0) * gate;
+    if (superseded && !histIntent) a -= ACT_SUPERSEDE_PENALTY; // demote stale unless asked historically
+    return a;
+  };
+  const activeNodes = clusterRows.map((r) => {
+    const d = ageDays(r.first_seen, nowRef);
+    const sup = supersededBy.get(r.signature);
+    const cos = cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0;
+    const activation = activationOf(cos, r.strength, !!sup);
+    return {
+      id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
+      kind: r.kind, fact: (r.fact || "").trim(),
+      first_seen: r.first_seen || null,
+      age_days: d,
+      age: ageTag(d),
+      superseded: !!sup,
+      superseded_by: sup ? sup.survivor : null,
+      tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
+      via: r.via || undefined,
+      chain_id: chainIdBySig.has(r.signature) ? chainIdBySig.get(r.signature) : undefined,
+      observed_count: (r.observed_count && r.observed_count > 1) ? r.observed_count : undefined,
+      observed_since: (r.observed_count && r.observed_count > 1) ? (r.observed_since || null) : undefined,
+      semantic_similarity: Number(cos.toFixed(4)),
+      activation: Number(activation.toFixed(4)),
+    };
+  });
+  // Engine owns the ordering (P5/P11): emit active nodes most-activated first so the live
+  // graph-recall skill (which preserves recall order) benefits, not only the bench ranker.
+  activeNodes.sort((a, b) => (b.activation - a.activation) || (a.hops - b.hops) || String(a.id).localeCompare(String(b.id)));
 
   const out = {
     query: args.query,
@@ -530,29 +616,7 @@ async function main() {
     cluster: {
       nodeCount: clusterRows.length + detailRows.length + archiveRows.length + archiveVecRows.length,
       edgeCount: clusterEdges.length,
-      nodes: clusterRows.map((r) => {
-        const d = ageDays(r.first_seen, nowRef);
-        const sup = supersededBy.get(r.signature);
-        return {
-          id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
-          kind: r.kind, fact: (r.fact || "").trim(),
-          // Temporal signal for the synthesizer: a coarse RELATIVE age (brain-like,
-          // fuzzy) plus the encode date and a sortable age-in-days. A merge survivor
-          // (notes='gist') is a timeless schema fact; the rest are dated episodes.
-          first_seen: r.first_seen || null,
-          age_days: d,
-          age: ageTag(d),
-          // Sequencing signal: this node is the superseded ("from") side of a correction,
-          // so a more recent fact overrides it. Consumers should rank it BELOW its survivor.
-          superseded: !!sup,
-          superseded_by: sup ? sup.survivor : null,
-          tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
-          via: r.via || undefined,
-          chain_id: chainIdBySig.has(r.signature) ? chainIdBySig.get(r.signature) : undefined,
-          observed_count: (r.observed_count && r.observed_count > 1) ? r.observed_count : undefined,
-          observed_since: (r.observed_count && r.observed_count > 1) ? (r.observed_since || null) : undefined,
-        };
-      }).concat(detailRows.map((r) => {
+      nodes: activeNodes.concat(detailRows.map((r) => {
         // R2 detail constituent reached via the durable gist->detail pointer only after
         // demotion to the archive. It is a first-class drill-down answer, NOT a generic
         // keyword hit, so tag it as such and expose parent gist + provenance.

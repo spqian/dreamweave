@@ -111,6 +111,23 @@ forgotten. When a specific question names a cold fact, the keyword tier surfaces
    and the retained detail**, NOT in reordering the retrieval context (see principle 6).
    The two are different surfaces; don't conflate them.
 
+9. **Seeds rank by ACTIVATION (cosine ⊕ strength), not cosine alone.** The vector-KNN
+   seeds that enter recall's top-K are scored by semantic match **combined with base-level
+   activation** (`strength`), not raw cosine. `strength` is the engine's ACT-R base-level
+   activation — nightly **decay** (`strength·2^(−Δt/H)`, dream.js:411) + **reactivation**
+   boosts (dream.js:464) already fuse *recency × frequency × schema* — so ranking on cosine
+   alone discards the very signal the dream spends the whole run computing. Use
+   `activation = cosine + λ·strength`, **cosine-dominant** (bounded λ). This rescues a
+   buried, high-activation *consolidated* state into the window — the q286 failure was a
+   str-0.697 recent answer gist stranded at **rank 52** while a str-0.001 stale restatement
+   took the top-3 — after which principle-5 neighbor/chain expansion surfaces its lineage.
+   **This is distinct from principle 6:** it is *seed selection by relevance-incl-strength*
+   (which principle 6 explicitly names), **not** a global time-reorder of the rendered
+   context (that experiment regressed). It uses activation, **not a clock** — explicit-date
+   queries still route through the time-window tier, so old-dated-fact recall is unaffected
+   by decay. Bound λ so a strong *off-topic* fact can never outrank a strongly on-topic one;
+   validate across factual/temporal/contradiction, not just synthesis, before shipping.
+
 ## Neuroscience grounding (why these tiers)
 
 - **Complementary Learning Systems** (McClelland et al. 1995): a fast episodic store +
@@ -171,6 +188,15 @@ Key diagnoses from the question logs:
   (merge must preserve temporal sequence; keep the dated detail).
 - **The 500-cap is faithful to what Scout INJECTS, not what our side DB must REMEMBER.**
   Conflating the two caused the deletions. → the whole three-tier split.
+- **q286 (synthesis) proved a pure RANKING failure — not a recall or consolidation miss.**
+  On a deterministically-rebuilt 180d store the answer was fully present and correctly
+  consolidated (a str-0.697 *recent* gist "protect the operating review; move the more
+  flexible adjacent internal item", sitting on a 16-node Apr→Jun sequence/supersedes
+  delta-chain) yet lost the top-K to a str-0.001 *stale* restatement singleton because
+  seeds ranked by pure cosine — the answer gist sat at rank 52. Every pointed
+  single-instance question on the identical topic scored 6. `strength` (ACT-R base-level
+  activation: nightly decay + reactivation) was computed but discarded at read time.
+  → principle 9 (rank seeds by activation = cosine ⊕ strength).
 
 Resolved by the incremental run: the embedded (Tier-2) set stays bounded — demotion holds
 the cap (active plateaus ~2500, archive grows free at zero nightly cost), and incremental
