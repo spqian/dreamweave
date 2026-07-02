@@ -82,6 +82,16 @@ html[data-theme="dark"] #graph { background:
 .legend i { width:10px; height:10px; border-radius:50%; display:inline-block; }
 .small { font-size:12px; color:var(--cp-text-muted); }
 .hint { position:absolute; left:12px; bottom:12px; z-index:3; font-size:11px; color:var(--cp-text-soft); background:rgba(0,0,0,0.35); border:1px solid var(--cp-border); border-radius:8px; padding:4px 8px; pointer-events:none; }
+/* live layout controls */
+.layout { position:absolute; left:12px; top:58px; z-index:5; width:210px; border:1px solid var(--cp-border); border-radius:14px; background:var(--cp-panel-strong); box-shadow:var(--cp-shadow); font-size:12px; color:var(--cp-text); }
+.layout .lhead { display:flex; align-items:center; justify-content:space-between; padding:8px 10px; cursor:pointer; user-select:none; font-weight:600; }
+.layout .lbody { padding:2px 10px 10px; display:none; }
+.layout.open .lbody { display:block; }
+.layout .row { margin:8px 0; }
+.layout .row label { display:flex; justify-content:space-between; color:var(--cp-text-muted); margin-bottom:3px; }
+.layout .row input[type=range] { width:100%; accent-color:var(--cp-accent); }
+.layout .lreset { width:100%; margin-top:4px; padding:5px; font-size:12px; }
+.layout .cx { color:var(--cp-text); font-variant-numeric:tabular-nums; }
 .err { position:absolute; inset:0; display:none; align-items:center; justify-content:center; text-align:center; padding:40px; color:var(--cp-text-muted); }
 @media (max-width:1100px){ main{grid-template-columns:1fr;} .scene{min-height:640px;} #graph{height:640px;} }
 </style>
@@ -143,6 +153,19 @@ html[data-theme="dark"] #graph { background:
       <button class="tbtn on" id="rotateBtn" title="Toggle idle auto-rotation">↻ Auto</button>
       <button class="tbtn" id="focusBtn" title="Zoom to current selection">⊙ Focus</button>
       <button class="tbtn" id="labelBtn" title="Cycle label density (auto shows the most important nodes in view)">Labels: auto</button>
+    </div>
+    <div class="layout" id="layoutPanel">
+      <div class="lhead" id="layoutHead"><span>⚙ Layout</span><span id="layoutCaret">▸</span></div>
+      <div class="lbody">
+        <div class="row"><label>Horizontal spread <span class="cx" id="vxSpread"></span></label><input type="range" id="xSpread" min="1" max="7" step="0.1"></div>
+        <div class="row"><label>Vertical spread <span class="cx" id="vySpread"></span></label><input type="range" id="ySpread" min="1" max="7" step="0.1"></div>
+        <div class="row"><label>Depth spread <span class="cx" id="vzSpread"></span></label><input type="range" id="zSpread" min="1" max="7" step="0.1"></div>
+        <div class="row"><label>Repulsion <span class="cx" id="vCharge"></span></label><input type="range" id="charge" min="2" max="60" step="1"></div>
+        <div class="row"><label>Link distance <span class="cx" id="vLink"></span></label><input type="range" id="linkDist" min="4" max="60" step="1"></div>
+        <div class="row"><label>Rotate speed <span class="cx" id="vRot"></span></label><input type="range" id="rotSpeed" min="0" max="2" step="0.05"></div>
+        <div class="row"><label>Hub size <span class="cx" id="vHub"></span></label><input type="range" id="hubSize" min="1" max="12" step="0.5"></div>
+        <button class="tbtn lreset" id="layoutReset">Reset to default</button>
+      </div>
     </div>
     <div class="navpad">
       <button class="sp"></button><button id="orbUp" title="Tilt up">↑</button><button class="sp"></button>
@@ -254,7 +277,22 @@ const data = {"nodes":[],"links":[]};
   function tmpBg(n){ return linkMode==='temporal' && !nodeHasTemporal[n.idx] && !(hop!==null&&hop[n.idx]===0); }
   function nodeColor(n){ if(!passesFilter(n)) return mix(baseColor(n),0.95);
     if(tmpBg(n)) return mix(baseColor(n),0.86); return mix(baseColor(n),dimT(n)); }
-  function nodeSize(n){ const base=n.kind==='entity'?0.79:0.9+n.strength*2.8; let s=base*(hop!==null&&hop[n.idx]===0?1.8:1); if(tmpBg(n)) s*=0.5; return s; }
+  // Node size: facts scale with strength; ENTITY HUBS are bigger — the hub set AVERAGES ~LAYOUT.hub×
+  // a fact (live via the Hub size slider), and each hub grows with its connection count (more
+  // links → larger). We normalize the per-hub degree factor so the mean lands on the multiplier
+  // exactly, then clamp the range proportionally.
+  const _factBases=nodes.filter(n=>n.kind!=='entity').map(n=>0.9+n.strength*2.8);
+  const _avgFact=_factBases.length?_factBases.reduce((a,b)=>a+b,0)/_factBases.length:2.2;
+  const _entIdx=nodes.filter(n=>n.kind==='entity').map(n=>n.idx);
+  const _avgEntDeg=_entIdx.length?(_entIdx.reduce((a,i)=>a+(degree[i]||0),0)/_entIdx.length)||1:1;
+  const _entRaw=new Map(); let _mr=0;
+  _entIdx.forEach(i=>{ const v=Math.sqrt((degree[i]||1)/_avgEntDeg); _entRaw.set(i,v); _mr+=v; });
+  _mr=_entIdx.length?_mr/_entIdx.length:1;
+  function nodeSize(n){ let base;
+    if(n.kind==='entity'){ const H=(typeof LAYOUT!=='undefined'?LAYOUT.hub:5); base=_avgFact*H*((_entRaw.get(n.idx)||1)/(_mr||1));
+      base=Math.max(_avgFact*Math.max(1.1,H*0.42), Math.min(base, _avgFact*H*2.7)); }
+    else base=0.9+n.strength*2.8;
+    let s=base*(hop!==null&&hop[n.idx]===0?1.8:1); if(tmpBg(n)) s*=0.5; return s; }
   function linkVis(l){ if(!linkActive(l)) return false; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t); return !!a&&!!b&&nodeVis(a)&&nodeVis(b); }
   function linkColorOf(l){ if(!linkActive(l)) return 'rgba(0,0,0,0)';
     const [sid,tid]=endIds(l); const a=byId.get(sid), b=byId.get(tid);
@@ -303,12 +341,67 @@ const data = {"nodes":[],"links":[]};
           if(h===1||h===2){ const k=h===1?1.4:1.95; tx=fc.ax+(n.ax-fc.ax)*k; ty=fc.ay+(n.ay-fc.ay)*k; tz=fc.az+(n.az-fc.az)*k; } }
         n.vx+=(tx-n.x)*strength*alpha; n.vy+=(ty-n.y)*strength*alpha; n.vz+=(tz-n.z)*strength*alpha; } }
     f.initialize=function(arr){ ns=arr; }; return f; }
+  // ---- HUB-ANCHORED LAYERED LAYOUT ------------------------------------------
+  // Instead of positioning every node purely by its embedding, we lay the graph out in
+  // layers the way the user reads it:
+  //   1. ENTITY HUBS first — evenly spread on a shell (Fibonacci sphere, ordered by degree)
+  //      so the connection hubs form the skeleton and never pile up.
+  //   2. SALIENT / SEMANTIC facts dropped in as a small cloud around their most DISTINCTIVE hub
+  //      (the connected entity with the fewest links — its most specific referent), pulled close.
+  //   3. EPISODIC facts last, in the same clusters but nudged onto the outer shell of each hub.
+  // A fact is bound to its single most-specific entity (not the centroid of all its hubs, which
+  // would collapse everything to the middle), so each hub grows a visible cluster. Cloud size
+  // scales with how many facts share the hub. Result is stored on n._bx/_by/_bz and used as the
+  // force-anchor; the spread sliders scale it per axis. Everything is in ONE scale (no PCA mix).
+  function computeHubLayout(){
+    const ents=nodes.filter(n=>n.kind==='entity');
+    const es=ents.slice().sort((a,b)=>(degree[b.idx]||0)-(degree[a.idx]||0));
+    const M=es.length||1;
+    const ENT_R=3.6;                                              // hub shell radius (>> cloud radius)
+    for(let i=0;i<es.length;i++){ const t=(i+0.5)/M, y=1-2*t, r=Math.sqrt(Math.max(0,1-y*y)), phi=i*2.399963229;
+      es[i]._bx=Math.cos(phi)*r*ENT_R; es[i]._by=y*ENT_R; es[i]._bz=Math.sin(phi)*r*ENT_R; }
+    const rnd=s=>{ const a=Math.sin(s)*43758.5453; return a-Math.floor(a); };
+    // assign each fact to its most DISTINCTIVE connected entity (smallest degree = most specific);
+    // ties → the rarer hub. Facts with no connected hub get scattered on the outer shell below.
+    const assigned=new Map();                                    // hubIdx -> [factNodes]
+    for(const n of nodes){ if(n.kind==='entity') continue;
+      let best=null,bestDeg=Infinity;
+      for(const j of adj[n.idx]){ const m=nodes[j]; if(m.kind==='entity'&&m._bx!=null){ const d=degree[j]||1; if(d<bestDeg){ bestDeg=d; best=m; } } }
+      n._hub=best;
+      if(best){ if(!assigned.has(best.idx)) assigned.set(best.idx,[]); assigned.get(best.idx).push(n); } }
+    for(const n of nodes){ if(n.kind==='entity') continue;
+      const best=n._hub;
+      if(best){ const cnt=assigned.get(best.idx).length;
+        const cloud=0.34*Math.pow(cnt,0.34);                     // bigger hubs → bigger cloud
+        const layer=(n.cls==='episodic')?1.25:(n.cls==='salient'?0.55:0.85); // episodic on the outer shell
+        const ra=rnd(n.idx*12.9898+1.7), rb=rnd(n.idx*78.233+4.1), rc=rnd(n.idx*37.719+2.3);
+        const theta=ra*Math.PI*2, ph=Math.acos(2*rb-1), rr=cloud*layer*Math.cbrt(0.25+0.75*rc), sph=Math.sin(ph);
+        n._bx=best._bx+sph*Math.cos(theta)*rr; n._by=best._by+sph*Math.sin(theta)*rr; n._bz=best._bz+Math.cos(ph)*rr; }
+      else { // no connected hub → scatter on an OUTER shell (same scale as hubs, never raw PCA)
+        const ra=rnd(n.idx*3.17+7.1), rb=rnd(n.idx*9.73+13.3), R2=ENT_R*1.18;
+        const th=ra*Math.PI*2, ph=Math.acos(2*rb-1);
+        n._bx=Math.sin(ph)*Math.cos(th)*R2; n._by=Math.sin(ph)*Math.sin(th)*R2; n._bz=Math.cos(ph)*R2; } }
+    // normalize the layout envelope to the PCA radius so the spread sliders keep their feel
+    let pcaMax=0; for(const n of nodes){ if(n.px!=null){ const r=Math.hypot(n.px,n.py,n.pz); if(r>pcaMax)pcaMax=r; } }
+    if(!pcaMax) pcaMax=150;
+    let hubMax=0; for(const n of nodes){ if(n._bx==null) continue; const r=Math.hypot(n._bx,n._by,n._bz); if(r>hubMax)hubMax=r; }
+    const sc=pcaMax/(hubMax||1);
+    for(const n of nodes){ if(n._bx!=null){ n._bx*=sc; n._by*=sc; n._bz*=sc; } }
+  }
+  try { computeHubLayout(); } catch(e){ console.error('hub layout failed, falling back to PCA', e); }
+
+  // ---- live layout state (tunable via the ⚙ Layout panel) ----
+  // Anchors are the whitened PCA coords (n.px/py/pz). We scale each PCA axis independently
+  // so the cloud can be stretched along its dominant semantic axes. Defaults give the
+  // stretched, less-dense look; every value is live-editable and re-applied without a reload.
+  const LAYOUT_DEFAULT = { xs:4.8, ys:3.2, zs:3.9, charge:41, linkDist:31, rot:0.55, hub:5.0 };
+  const LAYOUT = Object.assign({}, LAYOUT_DEFAULT);
   try {
     Graph = ForceGraph3D({ controlType:'orbit' })(elGraph)
       .backgroundColor('rgba(0,0,0,0)')
       .showNavInfo(false)
       .width(elGraph.clientWidth).height(elGraph.clientHeight)
-      .graphData({ nodes:nodes.map(n=>{ const s={id:n.id}; if(n.px!=null){ const SP=1.8; const x=n.px*SP,y=n.py*SP,z=n.pz*SP; s.x=x; s.y=y; s.z=z; s.ax=x; s.ay=y; s.az=z; } return s; }), links:rawLinks.map(l=>({source:l.source,target:l.target,rel:l.rel,weight:l.weight})) })
+      .graphData({ nodes:nodes.map(n=>{ const s={id:n.id}; const bx=(n._bx!=null?n._bx:n.px), by=(n._by!=null?n._by:n.py), bz=(n._bz!=null?n._bz:n.pz); if(bx!=null){ s._px=bx; s._py=by; s._pz=bz; const x=bx*LAYOUT.xs,y=by*LAYOUT.ys,z=bz*LAYOUT.zs; s.x=x; s.y=y; s.z=z; s.ax=x; s.ay=y; s.az=z; } return s; }), links:rawLinks.map(l=>({source:l.source,target:l.target,rel:l.rel,weight:l.weight})) })
       .nodeColor(o=>nodeColor(byId.get(o.id)))
       .nodeVal(o=>nodeSize(byId.get(o.id)))
       .nodeOpacity(0.96)
@@ -324,8 +417,8 @@ const data = {"nodes":[],"links":[]};
       .onNodeClick(o=>{ focusOn(o.id); flyTo(o); })
       .onBackgroundClick(()=>{ focusId=null; hideDetail(); recomputeHops(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); })
       .onNodeHover(o=>{ elGraph.style.cursor=o?'pointer':null; hoverId=o?o.id:null; });
-    Graph.d3Force('charge').strength(-14);
-    if(Graph.d3Force('link')) Graph.d3Force('link').distance(14).strength(0.22);
+    Graph.d3Force('charge').strength(-LAYOUT.charge);
+    if(Graph.d3Force('link')) Graph.d3Force('link').distance(LAYOUT.linkDist).strength(0.22);
     Graph.d3Force('semantic', semanticForce(0.62));
     if(Graph.d3Force('center')) Graph.d3Force('center').strength(0.02);
     Graph.nodeRelSize(6).cooldownTicks(160);
@@ -333,7 +426,7 @@ const data = {"nodes":[],"links":[]};
       setTimeout(()=>{ try{ const c=Graph.cameraPosition(), t=camTarget(); Graph.cameraPosition({x:t.x+(c.x-t.x)*0.8,y:t.y+(c.y-t.y)*0.8,z:t.z+(c.z-t.z)*0.8}, t, 600); }catch(_){} }, 640);
       lastInteract=Date.now(); } });
     const controls=Graph.controls();
-    if(controls){ controls.autoRotate=true; controls.autoRotateSpeed=0.55;
+    if(controls){ controls.autoRotate=true; controls.autoRotateSpeed=LAYOUT.rot;
       controls.addEventListener && controls.addEventListener('start', ()=>{ lastInteract=Date.now(); controls.autoRotate=false; });
     }
   } catch(e){ elErr.style.display='flex'; console.error(e); }
@@ -355,6 +448,35 @@ const data = {"nodes":[],"links":[]};
   function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
 
   // ---- buttons ----
+  // Live layout panel: rescale PCA anchors (spread) + tune forces / rotation without a reload.
+  function applyLayout(reheat){
+    if(!Graph) return;
+    const gd=Graph.graphData();
+    for(const s of gd.nodes){ if(s._px==null) continue;
+      s.ax=s._px*LAYOUT.xs; s.ay=s._py*LAYOUT.ys; s.az=s._pz*LAYOUT.zs;
+      if(reheat){ s.x=s.ax; s.y=s.ay; s.z=s.az; s.vx=s.vy=s.vz=0; } }
+    if(Graph.d3Force('charge')) Graph.d3Force('charge').strength(-LAYOUT.charge);
+    if(Graph.d3Force('link')) Graph.d3Force('link').distance(LAYOUT.linkDist);
+    const c=Graph.controls(); if(c) c.autoRotateSpeed=LAYOUT.rot;
+    if(reheat && Graph.d3ReheatSimulation){ Graph.d3ReheatSimulation();
+      let _f=false; Graph.onEngineStop(()=>{ if(!_f){ _f=true; Graph.zoomToFit(600,30); } }); }
+  }
+  function bindSlider(id, key, outId, fmt){ const el=document.getElementById(id), out=document.getElementById(outId);
+    const sync=()=>{ if(out) out.textContent=(fmt?fmt(LAYOUT[key]):LAYOUT[key]); el.value=LAYOUT[key]; };
+    el.addEventListener('input',()=>{ LAYOUT[key]=parseFloat(el.value); if(out) out.textContent=(fmt?fmt(LAYOUT[key]):LAYOUT[key]);
+      if(key==='hub'){ if(Graph) Graph.nodeVal(o=>nodeSize(byId.get(o.id))); }        // resize hubs in place
+      else applyLayout(key==='xs'||key==='ys'||key==='zs'); });                        // spread reheats; charge/link/rotate in place
+    el.__sync=sync; sync(); }
+  (function(){
+    const one=x=>x.toFixed(1);
+    bindSlider('xSpread','xs','vxSpread',one); bindSlider('ySpread','ys','vySpread',one); bindSlider('zSpread','zs','vzSpread',one);
+    bindSlider('charge','charge','vCharge',x=>x.toFixed(0)); bindSlider('linkDist','linkDist','vLink',x=>x.toFixed(0)); bindSlider('rotSpeed','rot','vRot',x=>x.toFixed(2));
+    bindSlider('hubSize','hub','vHub',x=>x.toFixed(1)+'\u00d7');
+    const head=document.getElementById('layoutHead'), panel=document.getElementById('layoutPanel'), caret=document.getElementById('layoutCaret');
+    head.onclick=()=>{ const open=panel.classList.toggle('open'); caret.textContent=open?'▾':'▸'; };
+    document.getElementById('layoutReset').onclick=()=>{ Object.assign(LAYOUT,LAYOUT_DEFAULT);
+      ['xSpread','ySpread','zSpread','charge','linkDist','rotSpeed','hubSize'].forEach(id=>{ const el=document.getElementById(id); if(el.__sync)el.__sync(); }); applyLayout(true); if(Graph) Graph.nodeVal(o=>nodeSize(byId.get(o.id))); };
+  })();
   function setLinkMode(m){ if(m===linkMode) return; linkMode=m; activeAdj = m==='temporal'?adjTmp:adjSem;
     document.getElementById('modeSem').classList.toggle('on',m==='semantic');
     document.getElementById('modeTmp').classList.toggle('on',m==='temporal');
