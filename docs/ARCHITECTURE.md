@@ -128,6 +128,22 @@ forgotten. When a specific question names a cold fact, the keyword tier surfaces
    by decay. Bound λ so a strong *off-topic* fact can never outrank a strongly on-topic one;
    validate across factual/temporal/contradiction, not just synthesis, before shipping.
 
+10. **Date-anchored recall reconstructs from the DATE, not just the topic.** A dated query
+    ("what was on file by 2026-01-14", "how did X evolve May 27–29") names a *time*, and the
+    answer is often a specific active record whose exact-date snapshot carries *lower* cosine
+    than the abstract gist that paraphrases it — so pure vector-KNN never reaches it. When the
+    query bears explicit date intent, recall pulls active facts whose `first_seen` falls in the
+    window (term-gated, bounded, text-deduped so distinct dated records survive scope-collapse)
+    and scores them by cosine + a bounded date bonus, so the on-date record surfaces. This is
+    *reconstructive temporal navigation entered from the semantic anchor* — it fires ONLY on
+    date intent, so timeless standing-preference queries (the recency-bias guards) are untouched.
+    Combined with the cold-bookshelf time-window tier, this is how "I've seen this on that date"
+    recall works without a calendar subsystem.
+
+Single optimal path: recall features are unconditional — no env feature-flags gate real
+behavior (they are wired on, tuned by validated in-code constants). Only the durable
+capacity/retention knobs in the table below are configurable.
+
 ## Neuroscience grounding (why these tiers)
 
 - **Complementary Learning Systems** (McClelland et al. 1995): a fast episodic store +

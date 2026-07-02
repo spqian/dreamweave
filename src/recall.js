@@ -448,11 +448,13 @@ async function main() {
   // so this is a SECONDARY, bounded, deduped path. It is tagged tier='archive' so the ranker
   // (dream-search) scores it in the cold band and caps it BELOW the primary seed/gist cluster:
   // it ADDS reachable facts without displacing the active seeds (the A/B starvation failure).
-  const ARCHIVE_VEC_ON = process.env.DREAM_ARCHIVE_VEC !== "0";
-  const ARCHIVE_VEC_SIM = Number(process.env.DREAM_ARCHIVE_VEC_SIM ?? 0.5);
-  const ARCHIVE_VEC_BUDGET = Number(process.env.DREAM_ARCHIVE_VEC_BUDGET ?? Math.max(4, Math.floor(args.k / 2)));
+  // Bounded, deduped, cold-band SECONDARY path (always on): archived facts reached by vector
+  // similarity via vec_archive. Tagged tier='archive' so the ranker caps it below the active
+  // seed/gist cluster — it ADDS reachable facts without displacing active seeds.
+  const ARCHIVE_VEC_SIM = 0.5;
+  const ARCHIVE_VEC_BUDGET = Math.max(4, Math.floor(args.k / 2));
   let archiveVecRows = [];
-  if (ARCHIVE_VEC_ON) {
+  {
     try {
       const av = db.prepare(`
         SELECT n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
@@ -485,10 +487,9 @@ async function main() {
   // in-window term relevance then recency. Fires ONLY when the query bears a date (the temporal
   // intent signal), so standing/topical queries never drag in random archived rows. Tagged
   // tier='archive' via='archive_time' so the ranker keeps it in the cold band below active seeds.
-  const ARCHIVE_TIME_ON = process.env.DREAM_ARCHIVE_TIME !== "0";
-  const ARCHIVE_TIME_BUDGET = Number(process.env.DREAM_ARCHIVE_TIME_BUDGET ?? Math.max(4, Math.floor(args.k / 2)));
+  const ARCHIVE_TIME_BUDGET = Math.max(4, Math.floor(args.k / 2));
   let archiveTimeRows = [];
-  if (ARCHIVE_TIME_ON) {
+  {
     const asOfDate = args.asOf ? new Date(args.asOf) : new Date();
     const range = parseDateRange(args.query, asOfDate);
     if (range) {
@@ -516,6 +517,60 @@ async function main() {
           if (archiveTimeRows.length >= ARCHIVE_TIME_BUDGET) break;
         }
       } catch (e) { archiveTimeRows = []; }
+    }
+  }
+
+  // 2e) ACTIVE date-window detail SIDECAR. Tier 2d reaches only the COLD bookshelf by time; but at
+  // moderate horizons the answer to a dated query is usually still an ACTIVE record whose exact-date
+  // snapshot ranks just OUTSIDE the cosine seed cap — a specific enumerated "currently on file" list
+  // carries lower cosine than the abstract policy gist that paraphrases it, so pure KNN never
+  // surfaces (or even reaches) it. When the query names an explicit date/range, pull ACTIVE facts
+  // (detail/gist) whose first_seen falls in the window, term-gated + budgeted, and score them by
+  // real cosine + a bounded date bonus so the on-date record surfaces. This is RECONSTRUCTIVE
+  // temporal navigation entered from the semantic anchor: it fires ONLY on date intent, so timeless
+  // standing-preference queries (recency guards) are untouched, and it is term-gated so it never
+  // drags in random dated rows.
+  const ACTIVE_DATE_BUDGET = 6;
+  const ACTIVE_DATE_BOOST = 0.2;
+  let activeTimeRows = [];
+  {
+    const asOfDate2 = args.asOf ? new Date(args.asOf) : new Date();
+    const range2 = parseDateRange(args.query, asOfDate2);
+    if (range2) {
+      try {
+        const rows = db.prepare(`
+          SELECT n.id AS id, n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
+                 n.strength AS strength, n.class AS class, n.notes AS notes
+          FROM nodes n
+          WHERE n.kind='fact' AND n.notes IN ('detail','gist','harness-ingest')
+            AND substr(n.first_seen,1,10) BETWEEN ? AND ?
+        `).all(range2.lo, range2.hi);
+        // Dedup by TEXT only (enumerative=true skips the scope key): the whole point of a
+        // date-window pull is to surface the specific dated record even when a scope-mate (e.g.
+        // an abstract "family items stay private" gist) is already present in another tier.
+        const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows, ...archiveTimeRows].flatMap((r) => collapseKeys(r.fact, true)));
+        const scored = rows.map((r) => {
+          const hay = normalizeForMatch(r.fact || "");
+          const hits = terms.reduce((acc, t) => acc + (hay.includes(t) ? 1 : 0), 0);
+          return { ...r, hits };
+        }).filter((r) => r.hits >= 1)
+          .sort((a, b) => (b.hits - a.hits) || String(b.first_seen).localeCompare(String(a.first_seen)));
+        for (const r of scored) {
+          if (clusterSet.has(r.signature) || detailSet.has(r.signature) || archiveSet.has(r.signature) || archiveVecSet.has(r.signature)) continue;
+          const keys = collapseKeys(r.fact, true);
+          if (keys.some((k) => usedKeys.has(k))) continue;
+          for (const k of keys) usedKeys.add(k);
+          activeTimeRows.push(r);
+          if (activeTimeRows.length >= ACTIVE_DATE_BUDGET) break;
+        }
+        if (activeTimeRows.length) {
+          const ph = activeTimeRows.map(() => "?").join(",");
+          const vrows = db.prepare(`SELECT rowid, embedding FROM vec_nodes WHERE rowid IN (${ph})`).all(...activeTimeRows.map((r) => r.id));
+          const cosById = new Map();
+          for (const v of vrows) if (v.embedding) cosById.set(v.rowid, dot(qFloat, fromVecBlob(v.embedding)));
+          for (const r of activeTimeRows) r.cos = cosById.has(r.id) ? cosById.get(r.id) : 0;
+        }
+      } catch (e) { activeTimeRows = []; }
     }
   }
 
@@ -565,9 +620,9 @@ async function main() {
   // and SEMANTICALLY GATED — the strength bonus applies only once a node clears a cosine floor,
   // so an off-topic strong fact is never promoted. This is seed/relevance SELECTION incl. strength,
   // NOT a global time-reorder of rendered context (ARCHITECTURE principle 6 caution).
-  const ACT_LAMBDA = Number(process.env.DREAM_ACT_LAMBDA ?? 0.2);
-  const ACT_COS_FLOOR = Number(process.env.DREAM_ACT_COS_FLOOR ?? 0.30);
-  const ACT_SUPERSEDE_PENALTY = Number(process.env.DREAM_ACT_SUPERSEDE_PENALTY ?? 0.15);
+  const ACT_LAMBDA = 0.2;
+  const ACT_COS_FLOOR = 0.30;
+  const ACT_SUPERSEDE_PENALTY = 0.15;
   const dateIntent = parseDateRange(args.query, nowRef) != null;
   const histIntent = /\b(origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
   const activationOf = (c, s, superseded) => {
@@ -614,7 +669,7 @@ async function main() {
       class: r.class,
     })),
     cluster: {
-      nodeCount: clusterRows.length + detailRows.length + archiveRows.length + archiveVecRows.length,
+      nodeCount: clusterRows.length + detailRows.length + archiveRows.length + archiveVecRows.length + archiveTimeRows.length + activeTimeRows.length,
       edgeCount: clusterEdges.length,
       nodes: activeNodes.concat(detailRows.map((r) => {
         // R2 detail constituent reached via the durable gist->detail pointer only after
@@ -661,6 +716,23 @@ async function main() {
           kind: "fact", fact: (r.fact || "").trim(),
           first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
           superseded: !!sup, superseded_by: sup ? sup.survivor : null, tier: "archive", via: "archive_time",
+        };
+      })).concat(activeTimeRows.map((r) => {
+        // Active dated record surfaced by the date-window sidecar (query named a date). Scored by
+        // real cosine + a bounded date bonus so the on-date answer outranks the abstract paraphrase
+        // gist; tagged via='active_time'. detail/gist tier per its notes.
+        const d = ageDays(r.first_seen, nowRef);
+        const sup = supersededBy.get(r.signature);
+        const cos = typeof r.cos === "number" ? r.cos : 0;
+        return {
+          id: r.signature, hops: 1, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
+          kind: "fact", fact: (r.fact || "").trim(),
+          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          superseded: !!sup, superseded_by: sup ? sup.survivor : null,
+          tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : "detail",
+          via: "active_time",
+          semantic_similarity: Number(cos.toFixed(4)),
+          activation: Number((cos + ACTIVE_DATE_BOOST).toFixed(4)),
         };
       })),
       edges: clusterEdges,
