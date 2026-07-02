@@ -1,5 +1,11 @@
 # Architecture & Design Principles
 
+> **Reading order:** [FIRST-PRINCIPLES](./FIRST-PRINCIPLES.md) (*why the system is shaped this
+> way — the evidence-derived foundation, P0–P11*) → **ARCHITECTURE** (this doc — *the design that
+> follows*) → [JOURNEY](./JOURNEY.md) (*the chronological path of decisions and their evidence*).
+> The numbered principles below are the operational form of the first principles; each cross-refers
+> to its Layer-1/2/3 origin.
+
 This document is the **design guideline** for dream-memory. It records the core
 principles the engine must uphold. When in doubt, follow these; if a change violates
 one, it needs an explicit, documented reason.

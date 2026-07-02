@@ -38,8 +38,10 @@ The result is a small (~250-entry target), atomic, mostly-semantic, **fully conn
 
 > **Design guideline:** the engine follows a **three-tier memory model** (instincts /
 > RAG / bookshelf) with a few non-negotiable principles (embed-once, bounded nightly
-> cost, demote-don't-delete, gist-for-attention/detail-for-recall). See
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before making engine changes.
+> cost, demote-don't-delete, gist-for-attention/detail-for-recall). Start with
+> [`docs/FIRST-PRINCIPLES.md`](docs/FIRST-PRINCIPLES.md) (why), then
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the design) and
+> [`docs/JOURNEY.md`](docs/JOURNEY.md) (how we got here) before making engine changes.
 
 ### Optional: LLM judgment layer
 
