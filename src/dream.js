@@ -117,8 +117,36 @@ function budgetParams(factCount) {
   return { pressure: Number(pressure.toFixed(3)), forgetThreshold: Number(forgetThreshold.toFixed(3)), decayAccel: Number(decayAccel.toFixed(3)), mergeSim: Number(mergeSim.toFixed(3)), semanticFade: Number(semanticFade.toFixed(3)), status };
 }
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
-const UNTRUSTED = /<\/?untrusted_memory>/g;
-const STOPW = new Set("the a an is are was were of for to in on and or that with as at by from this its not be no into".split(" "));
+// unit-normalize a vector; dot product of two vectors (used for the gist vagueness trace).
+const unit = (v) => { let n = 0; for (let i = 0; i < v.length; i++) n += v[i] * v[i]; n = Math.sqrt(n) || 1; const o = new Float32Array(v.length); for (let i = 0; i < v.length; i++) o[i] = v[i] / n; return o; };
+const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+// HARD-SPECIFIC extraction for the vagueness trace. A "hard specific" is an answer-bearing
+// literal the LLM cannot reconstruct from a generalization: money, percentage, multiple, and
+// counted quantities. DATES/TIMES are deliberately EXCLUDED — per-day "as of 2026-03-26"
+// restatement timestamps are CORRECTLY dropped by generalization and would swamp the signal.
+// Returns a Set of normalized token strings so the same value stated two ways collides.
+const HARD_SPEC = {
+  money: /\$\s?\d[\d.,]*(?:\s?[-–]\s?\d[\d.,]*)?\s?(?:million|billion|thousand|[mbk])?\b/gi,
+  pct: /\b\d+(?:\.\d+)?\s?%/g,
+  mult: /\b\d+(?:\.\d+)?\s?x\b/gi,
+  count: /\b\d{1,4}\s+(?:people|employees|seats|headcount|customers|users|accounts|deals|reps|hires|roles|units|shares|basis points|bps)\b/gi,
+};
+function extractHardSpecifics(text) {
+  const out = new Set();
+  if (!text) return out;
+  for (const re of Object.values(HARD_SPEC)) {
+    const m = text.match(re);
+    if (!m) continue;
+    for (let t of m) {
+      t = t.toLowerCase().replace(/\s+/g, "")
+        .replace(/million/g, "m").replace(/billion/g, "b").replace(/thousand/g, "k")
+        .replace(/–/g, "-");
+      if (t) out.add(t);
+    }
+  }
+  return out;
+}
+const UNTRUSTED = /<\/?untrusted_memory>/g;const STOPW = new Set("the a an is are was were of for to in on and or that with as at by from this its not be no into".split(" "));
 
 function deriveSlug(fact) {
   const w = ent.normalize(fact).split(" ").filter((x) => !STOPW.has(x) && x.length > 2).slice(0, 5).join("-");
@@ -1029,6 +1057,45 @@ async function reflect(db, opts) {
   // the lookup layer. This is the "vague gist + look-it-up" model: the 500-cap bounds
   // what we INJECT, not what we REMEMBER. Default (unset) = destructive merge (legacy).
   const keepDetail = keepDetail0;
+  // VAGUENESS TRACE (mathematically-measured "feeling of vagueness"): for each merge,
+  // measure how much semantic spread we averaged into one gist = mean cosine distance of
+  // the member embeddings to the cluster centroid. ~0 = we merged near-duplicates (a
+  // faithful restatement); high = we collapsed a heterogeneous set into one summary
+  // (genuinely lossy). Stored as a scalar on the survivor and surfaced by recall as a
+  // "generalized summary" hint, so the agent knows to drill the time-indexed bookshelf for
+  // specifics rather than enumerate from the gist. Dispersion is computed HERE (async
+  // embed) and combined with the cumulative retained-detail count inside the txn below.
+  const dispBySurvivor = new Map();
+  const lossBySurvivor = new Map();
+  for (const dec of decisions) {
+    if (!dec) continue;
+    const memFacts = dec.memberSigs
+      .map((s) => (db.prepare("SELECT fact FROM nodes WHERE signature=? AND kind='fact'").get(s) || {}).fact)
+      .filter(Boolean);
+    if (memFacts.length < 2) continue;
+    // SALIENT-LOSS (recall-biased): hard specifics (money/pct/mult/count; dates excluded) present
+    // across the members but ABSENT from the merged gist text = answer-bearing information the
+    // gist can no longer reconstruct. This is OUTPUT information loss, unlike dispersion which
+    // only measures INPUT heterogeneity (a near-dup restatement that drops a figure has low
+    // dispersion but total salient-loss — the false negative the old metric produced on q136).
+    const memberSpecs = new Set();
+    for (const f of memFacts) for (const t of extractHardSpecifics(f)) memberSpecs.add(t);
+    if (memberSpecs.size) {
+      const survSpecs = extractHardSpecifics(dec.fact);
+      let dropped = 0;
+      for (const t of memberSpecs) if (!survSpecs.has(t)) dropped += 1;
+      lossBySurvivor.set(dec.survivorSig, { dropped, total: memberSpecs.size });
+    }
+    try {
+      const vecs = (await embedTexts(memFacts)).map(unit);
+      const dim = vecs[0].length;
+      const c = new Float32Array(dim);
+      for (const v of vecs) for (let i = 0; i < dim; i++) c[i] += v[i];
+      const cu = unit(c);
+      const disp = vecs.reduce((a, v) => a + (1 - dot(v, cu)), 0) / vecs.length;
+      dispBySurvivor.set(dec.survivorSig, disp);
+    } catch (e) { process.stderr.write(`[reflect] vagueness embed failed: ${e.message}\n`); }
+  }
   const txM = db.transaction(() => {
     for (const dec of decisions) {
       if (!dec) continue;
@@ -1105,6 +1172,27 @@ async function reflect(db, opts) {
           db.prepare("DELETE FROM detail_of WHERE detail_sig=? OR gist_sig=?").run(m.signature, m.signature);
           reclaimed += 1;
         }
+      }
+      // Stamp the vagueness scalar. PRIMARY signal = salient-loss (recall-biased): if the gist
+      // dropped ANY hard specific a member carried, tag it clearly vague (>=0.5, above the 0.35
+      // hint threshold) so the agent drills for the exact figure — over-firing is harmless
+      // (a hint on a gist that DOES carry the value is still answered directly). SECONDARY =
+      // dispersion (halved) as a weak OR-signal for heterogeneous merges that carry no hard
+      // token; kept gentle so genuine synthesis/generalization gists are not aggressively tagged.
+      const disp = dispBySurvivor.get(dec.survivorSig);
+      const loss = lossBySurvivor.get(dec.survivorSig);
+      const detailCount = keepDetail
+        ? (db.prepare("SELECT count(*) c FROM detail_of WHERE gist_sig=?").get(survivor.signature) || {}).c || members.length
+        : members.length;
+      const dispTerm = disp != null ? disp * Math.log2(1 + detailCount) : 0;
+      let vagueness = null;
+      if (loss && loss.dropped > 0) {
+        vagueness = clamp01(0.5 + 0.5 * (loss.dropped / loss.total));
+      } else if (disp != null) {
+        vagueness = clamp01(0.5 * dispTerm);
+      }
+      if (vagueness != null) {
+        db.prepare("UPDATE nodes SET vagueness=? WHERE id=?").run(vagueness, survivor.id);
       }
       clustersMerged += 1;
     }
@@ -1357,6 +1445,26 @@ function doctor(db) {
 }
 
 // ---- PROJECT helpers --------------------------------------------------------
+// ENGINE-OWNED ANCHOR MEMORY (weave channel E). A standing "how to use memory" instruction the
+// engine ALWAYS projects at the top of the always-on flat list, so every consumer (Clawpilot
+// weave + the bench) inherits it identically — no system-prompt access required. It converts the
+// per-gist vagueness tag into ACTION: on a generalized/compressed note, re-search (graph_recall)
+// for the exact figure before concluding it is unavailable. Proven to reliably drive recovery
+// (3/3) in the offline lookup probe; the tag alone is unreliable (1/3).
+const ANCHOR_MEMORY_FACT =
+  "[memory-usage] When a recalled note is marked as a generalized summary or says a value was " +
+  "compressed/omitted, do not answer exact figures/dates from it directly — run graph_recall " +
+  "for the specific value first. Exact numbers and dates are kept in the detailed store even " +
+  "when the summary omits them; never enumerate a list or cite a precise figure from a summary " +
+  "without confirming it against a specific recall.";
+function anchorRecord() {
+  return {
+    memory_id: "memory-usage-anchor", signature: "memory-usage-anchor",
+    category: "instruction", tier: "gist", strength: 1,
+    first_seen: null, age: null,
+    fact: ANCHOR_MEMORY_FACT, display: ANCHOR_MEMORY_FACT,
+  };
+}
 // PROJECTION (CLS-tiered, sequence-first). The host injects this flat list; ordering
 // is the only temporal channel attention has, so we don't squander it on strength.
 // Two tiers, mirroring complementary learning systems:
@@ -1397,7 +1505,8 @@ function exportHarness(db, asOf) {
   };
 
   // Gist first (primacy for standing facts), then the episodic timeline in order.
-  return [...gist.map((n) => rec(n, "gist")), ...episodic.map((n) => rec(n, "episodic"))];
+  // The engine-owned anchor memory always leads (channel E).
+  return [anchorRecord(), ...gist.map((n) => rec(n, "gist")), ...episodic.map((n) => rec(n, "episodic"))];
 }
 
 function recordProjection(db, file) {

@@ -98,7 +98,7 @@ function ensureSchema(db) {
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_archive USING vec0(embedding float[${cfg.EMBED_DIM}] distance_metric=cosine)`);
 
   // Guarded migrations for databases created before fact/kind columns existed.
-  for (const col of ["kind TEXT", "fact TEXT"]) {
+  for (const col of ["kind TEXT", "fact TEXT", "vagueness REAL"]) {
     try { db.exec(`ALTER TABLE nodes ADD COLUMN ${col}`); } catch (e) { /* already present */ }
   }
 }

@@ -8,6 +8,7 @@ Use this skill as memory expansion on top of injected memory entries.
 Triggering and usage policy:
 - Invoke this skill whenever a user query may map to existing memory entries (people, systems, incidents, releases, topics, prior decisions, prior threads), including ambiguous follow-ups.
 - If there is a memory hit, ALWAYS expand it with graph context. Never stop at the first matching memory line.
+- Compressed / generalized summaries: if a matched entry is marked as a generalized summary or says a value was compressed/omitted (a "vagueness" hint on a gist), do NOT answer an exact figure/date or enumerate a list from it directly — run recall for the specific value first, and only report "not found" after that specific recall returns nothing. Exact numbers and dates are retained in the store even when the summary omits them.
 
 Matching policy (semantic/fuzzy):
 - Treat query->memory matching as semantic/fuzzy, not verbatim text matching.

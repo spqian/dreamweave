@@ -18,7 +18,7 @@ const db = new Database(cfg.DB_PATH, { readonly: true });
 try { sqliteVec.load(db); } catch { /* vec not needed for this read */ }
 const rows = db
   .prepare(
-    "SELECT signature, fact, class, salience, notes, first_seen FROM nodes WHERE " +
+    "SELECT signature, fact, class, salience, notes, first_seen, vagueness FROM nodes WHERE " +
       where + " ORDER BY first_seen ASC"
   )
   .all();

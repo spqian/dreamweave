@@ -215,7 +215,7 @@ async function main() {
       )
       SELECT w.sig AS signature, MIN(w.hops) AS hops,
              COALESCE(n.strength, 0) AS strength, n.class AS class, n.fact AS fact, n.kind AS kind,
-             n.first_seen AS first_seen, n.notes AS notes
+             n.first_seen AS first_seen, n.notes AS notes, n.vagueness AS vagueness
       FROM walk w LEFT JOIN nodes n ON n.signature = w.sig
       GROUP BY w.sig
       ORDER BY hops ASC, strength DESC, signature ASC
@@ -286,7 +286,7 @@ async function main() {
       if (chainSigs.size) {
         const ph = [...chainSigs].map(() => "?").join(",");
         const rows = db.prepare(
-          `SELECT signature, COALESCE(strength,0) AS strength, class, fact, kind, first_seen, notes
+          `SELECT signature, COALESCE(strength,0) AS strength, class, fact, kind, first_seen, notes, vagueness
            FROM nodes WHERE kind='fact' AND signature IN (${ph})`
         ).all(...chainSigs);
         for (const r of rows) if (sharesQueryTopic(r.fact)) clusterRows.push({ ...r, hops: 1, via: "sequence" });
@@ -603,8 +603,6 @@ async function main() {
     }
   }
 
-  db.close();
-
   // "Now" for relative-age tags: explicit --as-of, else the latest memory in the
   // cluster (the bench simulates time, so we anchor to the most recent fact seen).
   const latest = clusterRows.reduce((m, r) => {
@@ -612,6 +610,91 @@ async function main() {
     return t && t > m ? t : m;
   }, 0);
   const nowRef = args.asOf ? new Date(args.asOf) : (latest ? new Date(latest) : new Date());
+  const dateIntent = parseDateRange(args.query, nowRef) != null;
+
+  // 2f) ANCHOR-DAY active recall (DATELESS episode reconstruction). Tiers 2d/2e reconstruct a dated
+  // window ONLY when the query NAMES a date. But a specifics/completeness question usually names only
+  // the TOPIC ("what exact format did Jordan record for Marcus, and did he move any calendar items
+  // THAT SESSION?") — no date, yet the answer is the set of items from the DAY the topic anchors to.
+  // Tier 2a drills a gist down its SEMANTIC tree (gist -> its own detail_of children); this instead
+  // reconstructs the TEMPORAL EPISODE: the sibling facts recorded the SAME DAY as the strongest
+  // on-topic DATED hit, which 2a never reaches because they are not detail_of the matched gist. This
+  // is what lets the agent enumerate an episode's specifics AND reason about ABSENCE ("nothing else
+  // moved that day") — a ranked top-K cannot confirm a negative. Fires only when specifics are sought
+  // (enumerative / "exact" / "that session" intent, or the top anchor is a vagueness-flagged gist)
+  // AND the query bears NO explicit date (2d/2e own that case), so standing/synthesis queries are
+  // untouched. Anchor days come from the highest-cosine NON-gist dated records (a gist's first_seen is
+  // a latest-sighting, not the episode date). Term-gated + budgeted so it ADDS the episode's relevant
+  // records without flooding; tagged via='anchor_day'. Engine-native so BOTH the live graph-recall
+  // skill and any flat projection inherit it (not a bench-only file trick).
+  const specificsIntent = enumerative || /\b(exact|exactly|precise|verbatim|specific|list|which|how\s+many|enumerate|that\s+(session|meeting|day|call|week|conversation)|in\s+that\s+(session|meeting|call))\b/i.test(args.query || "");
+  const ANCHOR_COS_FLOOR = 0.30;
+  let anchorDayRows = [];
+  if (!dateIntent && terms.length) {
+    const dayOf = (fs) => String(fs || "").slice(0, 10);
+    const isGistRow = (r) => !!(r.notes && /\bgist\b/.test(r.notes));
+    const anchorCand = clusterRows
+      .filter((r) => !isGistRow(r) && dayOf(r.first_seen))
+      .map((r) => ({ r, cos: cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0 }))
+      .sort((a, b) => b.cos - a.cos);
+    // The top overall hit being a vagueness-flagged gist is itself a "specifics live elsewhere" signal.
+    let topAnchorIsVagueGist = false;
+    {
+      let best = null, bc = -1;
+      for (const r of clusterRows) {
+        const c = cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0;
+        if (c > bc) { bc = c; best = r; }
+      }
+      topAnchorIsVagueGist = !!(best && isGistRow(best) && best.vagueness != null && best.vagueness >= 0.35);
+    }
+    if ((specificsIntent || topAnchorIsVagueGist) && anchorCand.length && anchorCand[0].cos >= ANCHOR_COS_FLOOR) {
+      const days = [];
+      for (const c of anchorCand) {
+        const d = dayOf(c.r.first_seen);
+        if (d && !days.includes(d)) days.push(d);
+        if (days.length >= 2) break;
+      }
+      if (days.length) {
+        try {
+          const dph = days.map(() => "?").join(",");
+          const rows = db.prepare(`
+            SELECT n.id AS id, n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
+                   n.strength AS strength, n.class AS class, n.notes AS notes
+            FROM nodes n
+            WHERE n.kind='fact' AND n.notes IN ('detail','gist','harness-ingest')
+              AND substr(n.first_seen,1,10) IN (${dph})
+          `).all(...days);
+          const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows, ...archiveTimeRows, ...activeTimeRows].flatMap((r) => collapseKeys(r.fact, true)));
+          const scored = rows.map((r) => {
+            const hay = normalizeForMatch(r.fact || "");
+            const hits = terms.reduce((a, t) => a + (hay.includes(t) ? 1 : 0), 0);
+            return { ...r, hits };
+          }).filter((r) => r.hits >= 1)
+            .sort((a, b) => (b.hits - a.hits) || String(b.first_seen).localeCompare(String(a.first_seen)));
+          const ANCHOR_DAY_BUDGET = 12;
+          for (const r of scored) {
+            if (clusterSet.has(r.signature) || detailSet.has(r.signature) || archiveSet.has(r.signature) || archiveVecSet.has(r.signature)) continue;
+            if (activeTimeRows.some((x) => x.signature === r.signature)) continue;
+            if (anchorDayRows.some((x) => x.signature === r.signature)) continue;
+            const keys = collapseKeys(r.fact, true);
+            if (keys.some((k) => usedKeys.has(k))) continue;
+            for (const k of keys) usedKeys.add(k);
+            anchorDayRows.push(r);
+            if (anchorDayRows.length >= ANCHOR_DAY_BUDGET) break;
+          }
+          if (anchorDayRows.length) {
+            const ph = anchorDayRows.map(() => "?").join(",");
+            const vrows = db.prepare(`SELECT rowid, embedding FROM vec_nodes WHERE rowid IN (${ph})`).all(...anchorDayRows.map((r) => r.id));
+            const cosById = new Map();
+            for (const v of vrows) if (v.embedding) cosById.set(v.rowid, dot(qFloat, fromVecBlob(v.embedding)));
+            for (const r of anchorDayRows) r.cos = cosById.has(r.id) ? cosById.get(r.id) : 0;
+          }
+        } catch (e) { anchorDayRows = []; }
+      }
+    }
+  }
+
+  db.close();
 
   // ---- Activation ranking (P11) ------------------------------------------------------------
   // ACTIVATION = cosine + lambda*strength: rerank ACTIVE nodes so a reinforced consolidated fact
@@ -623,7 +706,6 @@ async function main() {
   const ACT_LAMBDA = 0.2;
   const ACT_COS_FLOOR = 0.30;
   const ACT_SUPERSEDE_PENALTY = 0.15;
-  const dateIntent = parseDateRange(args.query, nowRef) != null;
   const histIntent = /\b(origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
   const activationOf = (c, s, superseded) => {
     const gate = c >= ACT_COS_FLOOR ? 1 : 0;
@@ -647,6 +729,7 @@ async function main() {
       superseded: !!sup,
       superseded_by: sup ? sup.survivor : null,
       tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
+      vagueness: (r.notes && /\bgist\b/.test(r.notes) && r.vagueness != null) ? Number(r.vagueness.toFixed(3)) : undefined,
       via: r.via || undefined,
       chain_id: chainIdBySig.has(r.signature) ? chainIdBySig.get(r.signature) : undefined,
       observed_count: (r.observed_count && r.observed_count > 1) ? r.observed_count : undefined,
@@ -669,7 +752,7 @@ async function main() {
       class: r.class,
     })),
     cluster: {
-      nodeCount: clusterRows.length + detailRows.length + archiveRows.length + archiveVecRows.length + archiveTimeRows.length + activeTimeRows.length,
+      nodeCount: clusterRows.length + detailRows.length + archiveRows.length + archiveVecRows.length + archiveTimeRows.length + activeTimeRows.length + anchorDayRows.length,
       edgeCount: clusterEdges.length,
       nodes: activeNodes.concat(detailRows.map((r) => {
         // R2 detail constituent reached via the durable gist->detail pointer only after
@@ -733,6 +816,24 @@ async function main() {
           via: "active_time",
           semantic_similarity: Number(cos.toFixed(4)),
           activation: Number((cos + ACTIVE_DATE_BOOST).toFixed(4)),
+        };
+      })).concat(anchorDayRows.map((r) => {
+        // Same-day episode sibling reached by DATELESS anchor-day recall (tier 2f): the query sought
+        // specifics but named no date, so we reconstructed the day of the strongest on-topic hit and
+        // pulled its topic-relevant co-occurring records. Tagged via='anchor_day' so the consumer sees
+        // an episode cluster (shared Source date) and can enumerate specifics / reason about absence.
+        const d = ageDays(r.first_seen, nowRef);
+        const sup = supersededBy.get(r.signature);
+        const cos = typeof r.cos === "number" ? r.cos : 0;
+        return {
+          id: r.signature, hops: 1, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
+          kind: "fact", fact: (r.fact || "").trim(),
+          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          superseded: !!sup, superseded_by: sup ? sup.survivor : null,
+          tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : "detail",
+          via: "anchor_day",
+          semantic_similarity: Number(cos.toFixed(4)),
+          activation: Number((cos + 0.1).toFixed(4)),
         };
       })),
       edges: clusterEdges,
