@@ -157,23 +157,71 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
    With `MEMORY_INCREMENTAL_WEAVE=1`, only new/dirty facts are woven; otherwise the pass can inspect the full active graph. It adds `mentions`, corroborated `related_to`, low-confidence `similar_to`, and rescue links so active facts have zero islands.
 
 5. **REPORT → CALLER JUDGES → APPLY (all judgment surfaces).**
-   The engine is local-only. For each surface, run the report command, have the caller judge only the reported facts, write exactly the contracted decision JSON, then run the matching apply command:
-   - `report-entities` → `apply-entities --file decisions.json`
-   - `report-aliases` → `apply-aliases --file decisions.json`
-   - `report-salience` → `apply-salience --file decisions.json`
-   - `report-merges` (or `consolidate`) → `apply-merges --file decisions.json`
-   - `report-synthesis` → `apply-synthesis --file decisions.json` (caller owns any repeat loop)
+   The engine is **local-only and never calls an LLM**: it emits candidate JSON (`report-*`), the
+   **caller (host LLM) is the judge**, and the engine applies the caller's decision (`apply-*`). Run the
+   surfaces in this order, each as report → judge → write `decisions.json` → apply:
+   **entities → aliases → salience → merges → synthesis**. `report-*` are read-only and take `--as-of`;
+   `apply-*` read `--file <decisions.json>` and also take `--as-of`. `sig` strings are stable between a
+   report and its apply — judge only the facts in the report, **never invent facts, sigs, or members**.
 
-   Apply commands validate/sanitize decision JSON, mutate the db, and repair/re-weave as needed. Merge apply creates a `notes='gist'` survivor, retains constituents as `detail` when configured, stamps `vagueness`, and preserves `supersedes` lineage. Run `budget` to inspect pressure and prioritize merge work.
+   For each surface, the report OUTPUT the caller reads and the decision INPUT the caller must write:
+
+   - **entities** — type the recurring named subjects of each fact.
+     report: `{surface:"entities", facts:[{sig,fact}]}`
+     judge: for each fact list concrete named entities (people/orgs/teams/places/projects/systems/recurring topics); resolve a bare first name to its full name when another fact disambiguates; **skip** dates, numbers, generic nouns, one-off phrases. Type ∈ `person|org|team|place|project|system|topic`; `sig` = `"<type>:<kebab-name>"`; `forms` = lowercased surface strings (full name + long tokens, ≥3 chars).
+     decision: `[{sig, type, forms:[...]}]`
+
+   - **aliases** — merge entity hubs that name the SAME entity.
+     report: `{surface:"aliases", hubs:[{sig,label}]}`
+     judge: group first-name↔full-name, abbreviation↔expansion, spelling/case variants. **Be conservative** — distinct people who merely share a name are NOT the same. Use exact `sig` strings; only emit groups that actually merge.
+     decision: `[{canonical:"<sig to keep>", aliases:["<sig to fold in>", ...]}]`
+
+   - **salience** — flag the rare critical facts (frequency ≠ importance).
+     report: `{surface:"salience", facts:[{sig,fact}]}`
+     judge: score each 0–2; **2** = firm decision/commitment, security/serious incident, exec/leadership or org-structure fact, core identity/role, or a hard deadline whose loss damages recall. Be strict — only a small minority are 2. Return the sigs you scored 2 (engine caps flagged share at ~20%).
+     decision: `{salientSigs:[...]}`
+
+   - **merges** (alias `consolidate`) — roll up each near-duplicate cluster into ONE richer fact.
+     report: `{surface:"merges", clusters:[[{sig,fact}], ...]}`
+     judge: per cluster, merge ONLY facts about the same subject that are redundant/incremental/a correction sequence; write one consolidated `fact` that preserves every distinct still-true detail and names all specifics; prefer the LATEST value on conflict but keep prior value as context if it aids recall. If a cluster mixes unrelated subjects, **do not merge it** (emit `null` / omit). `survivorSig` = the member whose identity to preserve; `memberSigs` = all members in the cluster (≥2 live).
+     decision: `[{fact, survivorSig, memberSigs:[...]} | null]`  (null/omitted cluster = no merge)
+
+   - **synthesis** — generalize a dormant recurrence family into one concept.
+     report: `{surface:"synthesis", pools:[{poolId, members:[{sig,fact,firstSeen}], hotSiblings:[{sig,fact}]}]}`
+     judge: partition each pool into sub-themes; for each genuine family (≥2 instances) write one `concept` naming the pattern, count/`scale`, time `span`, and typical outcome — but NOT individual ids/timestamps (those stay archived as detail). **Refuse** to generalize coincidental members (unrelated subjects sharing only timing) — leave them out of every group. Never demote `hotSiblings`. Every `memberSig` MUST come from the pool.
+     decision: `[{poolId, groups:[{concept, memberSigs:[...], span, scale}]}]`
+     Synthesis is a caller-owned LOOP: re-run report→judge→apply until a turn yields zero groups (bound to ~3 turns).
+
+   Apply commands validate/sanitize the decision, mutate the db, and re-weave / `repairGraph` as needed.
+   **`apply-merges` is the load-bearing stage**: it creates the `notes='gist'` survivor **born
+   signature-first (`memory_id=''`)**, retains constituents as `notes='detail'` (recall-only, not
+   injected), stamps `vagueness` via `extractHardSpecifics`, and preserves `supersedes` lineage. This is
+   why consolidation must route through apply — NOT through re-`m_remember` (that re-ingests a merged fact
+   as a fresh flat harness memory, losing the db-native gist provenance/tier/vagueness). Run `budget` to
+   inspect pressure and prioritize merge work.
 
 6. **DOCTOR (health gate).**
    `node <AGENT_MEMORY>/src/dream.js doctor` — exits 3 if any active fact island or dangling edge remains. Must be clean before projecting.
 
-7. **PROJECT (diff back to harness).**
-   - `node <AGENT_MEMORY>/src/dream.js export-harness` → FACTS only, inject-ready; excludes entity hubs, `detail`, and `archive`.
-   - Apply only the diff with host memory tools: remember new/changed projected facts; forget stale projected facts.
-   - `node <AGENT_MEMORY>/src/dream.js record-projection --file <projection.json>` with new ids/signatures, so tomorrow's ingest recognizes the projection.
-   - Re-run `ingest-harness --file <fresh snapshot> --prune` + `verify-sync` to confirm db and harness are aligned.
+7. **PROJECT (sync the db back to the harness — produce the real diff).**
+   The db is the source of truth; the flat harness is a disposable projection of it. This stage makes the
+   harness equal the engine's `export-harness` set and teaches the db the harness ids it assigns. **Follow
+   the step-by-step runbook in [`projection-sync.md`](./projection-sync.md).** In summary:
+   - `export-harness --as-of <today>` → the target projection. Each record carries `memory_id`,
+     `signature`, `tier`, `category`, `first_seen`, `fact`, `display`. Records with **`memory_id===""`**
+     are **db-native survivors** (merge gists / synthesis concepts born signature-first) that are **not yet
+     in the harness** — these are what create the nightly diff.
+   - **ADD** each blank-`memory_id` survivor with `m_remember` (attribute it `source:"dream"`, tier `gist`,
+     and preserve `first_seen`, not `now`); capture the assigned id; collect `{signature, memory_id}` pairs.
+   - **FORGET** every harness id **not present** in the export set with `m_forget` — these are the merged
+     constituents now demoted to `detail`/`archive` (kept in the db for recall, no longer injected). This is
+     the "forget the raw parts" shrink.
+   - **UPDATE** any projected record whose `display` text changed (gist re-summary / supersede rewrite):
+     `m_forget` old + `m_remember` new, then record the new pair.
+   - `record-projection --file projection.json` with the `{signature, memory_id}` pairs so tomorrow's
+     ingest recognizes the survivors (idempotent — no duplicates next night).
+   - Re-run `ingest-harness --file <fresh snapshot> --prune` + `verify-sync` to confirm alignment. `--prune`
+     only tombstones **Tier-1 projected** facts the user deleted; it never touches `detail`/`archive`.
 
 8. **VIZ + JOURNAL.**
    `node <AGENT_MEMORY>/src/dream.js export-viz`; the run is journaled in `dream_journal`. Write one quiet notification only for material changes.
