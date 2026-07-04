@@ -5,7 +5,8 @@
 //
 // Subcommands:
 //   migrate-model              one-time: split nodes into kind=fact / kind=entity, re-signature facts
-//   ingest-harness  --file F [--prune]   harness -> db, memory_id-keyed, lossless (sync)
+//   ingest-harness  --file F [--prune] [--backfill-dates]   harness -> db, memory_id-keyed, lossless (sync)
+//                                        (--backfill-dates re-anchors existing nodes' first_seen to createdAt, earlier-only)
 //   verify-sync     --file F             hard gate: every harness id present in db (exit 3 if not)
 //   dream           [--advance-days N]   decay + auto-reactivate + evaporate + housekeeping (+journal)
 //   weave                               co-mention + vector links; GUARANTEES zero fact islands
@@ -282,7 +283,7 @@ function migrateModel(db) {
 }
 
 // ---- INGEST -----------------------------------------------------------------
-async function ingestHarness(db, file, prune, asOf) {
+async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const raw = prof("ingest.parse", () => JSON.parse(fs.readFileSync(file, "utf8")));
   const mems = Array.isArray(raw) ? raw : (raw.memories || []);
   const now = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
@@ -294,24 +295,41 @@ async function ingestHarness(db, file, prune, asOf) {
   // `ex` row is mutated on each write so a later duplicate memory_id sees prior tx state,
   // preserving the old transaction-visibility semantics.
   const exByMem = new Map();
-  for (const r of db.prepare("SELECT id, memory_id, fact, salience, notes FROM nodes WHERE memory_id<>'' AND memory_id<>'live' ORDER BY id").all()) {
+  for (const r of db.prepare("SELECT id, memory_id, fact, salience, notes, first_seen FROM nodes WHERE memory_id<>'' AND memory_id<>'live' ORDER BY id").all()) {
     if (!exByMem.has(r.memory_id)) exByMem.set(r.memory_id, r);
   }
   const delVec = db.prepare("DELETE FROM vec_nodes WHERE rowid=?");
   const updChanged = db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END WHERE id=?");
   const updRevive = db.prepare("UPDATE nodes SET salience=?, notes=NULL WHERE id=?");
   const updSal = db.prepare("UPDATE nodes SET salience=? WHERE id=?");
+  const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=? WHERE id=?");
   const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
         VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`);
-  const res = { harness_count: mems.length, created: 0, refreshed: 0, pruned: 0 };
+  const res = { harness_count: mems.length, created: 0, refreshed: 0, backfilled: 0, pruned: 0 };
   const harnessIds = new Set(mems.map((m) => m.id || m.memory_id).filter(Boolean));
   const tx = db.transaction(() => {
     for (const m of mems) {
       const mid = m.id || m.memory_id; if (!mid) continue;
       const fact = String(m.fact || "").replace(UNTRUSTED, "").trim();
       const category = m.category || "fact";
+      // first_seen must be EVENT-anchored, not ingest-anchored: the harness carries the
+      // memory's real creation date (createdAt). Honor it for new nodes so age tags,
+      // episodic ordering, and date-window (archive_time) recall reflect when the event
+      // actually happened — falling back to the ingest clock only when it's absent/unparseable.
+      const created = m.createdAt || m.created_at || m.first_seen;
+      const fs = (created && !Number.isNaN(Date.parse(created))) ? new Date(created).toISOString() : now;
       const ex = exByMem.get(mid);
       if (ex) {
+        // Opt-in one-time repair (--backfill-dates): existing nodes stamped with an
+        // ingest-clock first_seen (the pre-fix bug) get re-anchored to the real event
+        // date. Only ever move first_seen EARLIER — the bug always over-stamped it to
+        // a later ingest date, and this direction also protects merged survivors whose
+        // first_seen is the (earlier) min of their members from being pushed forward.
+        if (backfillDates && created && !Number.isNaN(Date.parse(created)) && ex.first_seen && Date.parse(fs) < Date.parse(ex.first_seen)) {
+          updFirstSeen.run(fs, ex.id);
+          ex.first_seen = fs;
+          res.backfilled += 1;
+        }
         const newFact = fact || ex.fact;
         if (newFact !== ex.fact) {
           // BUG-FIX: text changed for an existing memory — its stored vector is now stale.
@@ -336,7 +354,7 @@ async function ingestHarness(db, file, prune, asOf) {
       const cls = CAT2CLASS[category] || "semantic";
       const sig = uniqueSig(db, `fact:${deriveSlug(fact)}`);
       const id = nextId(db);
-      insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], now, now, now, "harness-ingest", fact, "");
+      insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], fs, now, now, "harness-ingest", fact, "");
       exByMem.set(mid, { id, memory_id: mid, fact, salience: category, notes: "harness-ingest" });
       res.created += 1;
     }
@@ -1648,7 +1666,7 @@ async function main() {
     let r, gate = false;
     if (cmd === "init") r = { initialized: true, db: DB_PATH, data_dir: DATA_DIR };
     else if (cmd === "migrate-model") r = migrateModel(db);
-    else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"]); gate = !r.complete; }
+    else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"], flags["backfill-dates"] === true || flags["backfill-dates"] === "true"); gate = !r.complete; }
     else if (cmd === "verify-sync") { r = verifySync(db, flags.file); gate = !r.complete; }
     else if (cmd === "dream") r = dreamCore(db, flags);
     else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
