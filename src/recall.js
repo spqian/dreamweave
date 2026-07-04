@@ -706,20 +706,32 @@ async function main() {
   const ACT_LAMBDA = 0.2;
   const ACT_COS_FLOOR = 0.30;
   const ACT_SUPERSEDE_PENALTY = 0.15;
+  // Detail is the granular lookup-only tier (a merge's kept members / drilled corrections). When a
+  // detail fact is pulled into the GENERAL semantic cluster (graph/sequence walk) it must not out-rank
+  // co-retrieved gist/episodic facts of similar cosine: for a window/synthesis query ("how did X evolve
+  // over these days") an out-of-window detail revision otherwise seeds the top of what the agent reads,
+  // right beside the timeless gist, and the answerer conflates them into a false in-window narrative
+  // (q035: a March $465M revision surfacing for a January window). A modest penalty sinks such detail
+  // below same-topic gist/episodic while leaving high-cosine detail (exact-figure lookups whose closest
+  // match IS the detail) reachable. The specifics/enumeration path (tiers 2e/2f, active_time/anchor_day)
+  // sets its own boosted activation and bypasses this, so intentional detail surfacing is unaffected.
+  const ACT_DETAIL_PENALTY = 0.12;
   const histIntent = /\b(origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
-  const activationOf = (c, s, superseded) => {
+  const activationOf = (c, s, superseded, detail) => {
     const gate = c >= ACT_COS_FLOOR ? 1 : 0;
     let lam = ACT_LAMBDA;
     if (dateIntent && !histIntent) lam *= 0.5; // explicit-date lookup: favor cosine/date, damp strength
     let a = c + lam * (s || 0) * gate;
     if (superseded && !histIntent) a -= ACT_SUPERSEDE_PENALTY; // demote stale unless asked historically
+    if (detail) a -= ACT_DETAIL_PENALTY; // sink granular detail below same-topic gist/episodic in the general cluster
     return a;
   };
   const activeNodes = clusterRows.map((r) => {
     const d = ageDays(r.first_seen, nowRef);
     const sup = supersededBy.get(r.signature);
     const cos = cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0;
-    const activation = activationOf(cos, r.strength, !!sup);
+    const isDetail = !!(r.notes && /\bdetail\b/.test(r.notes));
+    const activation = activationOf(cos, r.strength, !!sup, isDetail);
     return {
       id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
       kind: r.kind, fact: (r.fact || "").trim(),

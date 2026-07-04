@@ -341,7 +341,12 @@ async function ingestHarness(db, file, prune, asOf) {
       res.created += 1;
     }
     if (prune) {
-      const stale = db.prepare("SELECT id, signature, memory_id FROM nodes WHERE kind='fact' AND memory_id<>''").all().filter((n) => !harnessIds.has(n.memory_id));
+      // Prune tombstones only TIER-1 PROJECTED facts the harness no longer carries (the user
+      // deleted them). detail/archive rows are db-internal tiers ("demote, don't delete") that
+      // are intentionally absent from the flat harness — a demoted member keeps its old memory_id
+      // (apply-merges does not clear it), so WITHOUT this tier filter prune would delete the very
+      // retained detail the tiering promised to keep. Exclude them.
+      const stale = db.prepare("SELECT id, signature, memory_id FROM nodes WHERE kind='fact' AND memory_id<>'' AND (notes IS NULL OR notes NOT IN ('detail','archive'))").all().filter((n) => !harnessIds.has(n.memory_id));
       for (const n of stale) {
         db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id, now, "pruned: left harness");
         // Delete the node's EDGES too. Without this, a sequence/supersedes/related_to edge
