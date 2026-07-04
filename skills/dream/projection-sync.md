@@ -58,14 +58,24 @@ For each harness memory `h` in `H` whose `h.id` is **NOT** in `exportedIds`:
   export means the engine intentionally demoted it, never data loss.
 
 ### 3. UPDATE — re-project changed text
-For each `r` in `P` with a non-empty `memory_id` that matches some `h` in `H` **but `r.display !== h.fact`**
+For each `r` in `P` with a non-empty `memory_id` that matches some `h` in `H` **whose underlying fact
+changed** — compare `r.fact` against `h`'s text with any leading age prefix stripped,
+i.e. `r.fact !== stripAge(h.fact)` where `stripAge(t) = t.replace(/^\[[^\]]+\]\s+/, "")`
 (a gist got re-summarized, or a supersede rewrite changed it):
 - `m_forget(h.id)`, then `m_remember(r.display, …attribution…)`, capture the new id, and append
   `{ signature: r.signature, memory_id: newId }` to `projPairs`.
 - (If your host has an in-place update that preserves the id, use it and still record the pair.)
 
+> **Diff on the fact, NOT `r.display`.** Episodic `display` is age-prefixed (`[past couple weeks] …`),
+> and that prefix drifts as time passes. Comparing `r.display` would flag a memory as "changed" every
+> time its age bucket rolls over, triggering a needless `m_forget`+`m_remember` — pure churn that
+> re-creates the memory (and risks a host resetting its `createdAt`) even though nothing meaningful
+> changed. Comparing the stripped fact means we only re-create on a genuine content change. Tradeoff:
+> an untouched memory's injected age tag can lag one bucket until the fact itself changes; refresh age
+> tags deliberately (a periodic full re-project) rather than on every rollover.
+
 ### 4. KEEP — no-op
-`r.memory_id` present in `H` with identical text → do nothing.
+`r.memory_id` present in `H` and `r.fact === stripAge(h.fact)` → do nothing (even if the age tag differs).
 
 ## Attribution mapping (export record → harness memory)
 Set these on every `m_remember` you issue in ADD/UPDATE. The point is that a projected survivor must read
@@ -79,6 +89,14 @@ as a **consolidation-born dream memory**, not a fresh session note:
 | `createdAt`   | `r.first_seen` — **preserve it; do not reset to now** |
 | tier hint     | `r.tier` (`gist`/`episodic`) if the host stores a tier/tag |
 
+> **`createdAt` is load-bearing and MUST round-trip.** Every recreate (ADD and UPDATE) passes
+> `createdAt = r.first_seen`, which is now the memory's real event date. If the host `m_remember`
+> silently stamps its own "now" instead of honoring this argument, then every diff-driven recreate
+> launders the event date away — the exact failure that collapsed a whole store onto ingest/rebuild
+> dates. **Verify once** that the host honors it: after a projection that recreated ≥1 memory,
+> re-read that memory and confirm its `createdAt` equals the `first_seen` you sent (not ~now). If it
+> doesn't, that's a **host bug** — stop relying on `createdAt` as the event-date source and treat the
+> engine's `repair-dates` (in-text dates) as the source of truth until the host is fixed.
 > If the host `m_remember` cannot set `source`/`createdAt`, project anyway but record the limitation — the
 > db-side provenance (tier, vagueness, first_seen) still lives in the engine; the harness copy is only a
 > projection. The **must-have** is that survivors are projected and `record-projection` runs.
@@ -113,6 +131,7 @@ survivor by its id and **refresh** it instead of creating a duplicate — the lo
 P = export-harness --as-of today            # target projection (array)
 H = m_list_memories                         # current flat harness
 exportedIds = { r.memory_id for r in P if r.memory_id != "" }
+stripAge = t -> t.replace(/^\[[^\]]+\]\s+/, "")   # drop the age prefix from a stored display
 projPairs = []
 
 # 1. ADD new survivors
@@ -124,8 +143,8 @@ for r in P where r.memory_id == "":
 for h in H where h.id not in exportedIds:
     m_forget(h.id)
 
-# 3. UPDATE changed
-for r in P where r.memory_id != "" and text_of(H, r.memory_id) != r.display:
+# 3. UPDATE changed  (compare the FACT, not the age-prefixed display -> no churn on age rollover)
+for r in P where r.memory_id != "" and r.fact != stripAge(text_of(H, r.memory_id)):
     m_forget(r.memory_id)
     id = m_remember(r.display, category=r.category, source="dream", createdAt=r.first_seen)
     projPairs += { signature: r.signature, memory_id: id }
