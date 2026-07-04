@@ -42,6 +42,7 @@ Important flags verified against `src/dream.js`:
 - `ingest-harness --file <snapshot.json> [--prune] [--as-of <iso>] [--backfill-dates]`
   - `--backfill-dates` (one-time repair): re-anchors existing nodes' `first_seen` to the snapshot's `createdAt`, earlier-only. Use once on stores created before `first_seen` became event-anchored, whose nodes read a wrong "[just now]"/ingest-date age.
 - `verify-sync --file <snapshot.json>`
+- `repair-dates [--dry-run] [--allow-later]` (rescue repair): re-anchors `first_seen` to the earliest explicit date found in each fact's **text** (e.g. `"raised 2026-06-26T18:15:02Z"`). Use when `createdAt` is unusable — e.g. a host that resets `createdAt` to "today" on every store rebuild, so `--backfill-dates` can't help. Scans all fact nodes (needs no snapshot), earlier-only by default (never pushes a date forward); `--dry-run` previews. Facts with no in-text date are left as-is.
 - `dream [--advance-days N]`
 - `weave [--k N] [--sim N] [--as-of <iso>] [--supersede]`
 - `report-entities|report-aliases|report-merges|report-salience|report-synthesis [--as-of <iso>]`

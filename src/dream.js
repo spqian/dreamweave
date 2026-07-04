@@ -8,6 +8,8 @@
 //   ingest-harness  --file F [--prune] [--backfill-dates]   harness -> db, memory_id-keyed, lossless (sync)
 //                                        (--backfill-dates re-anchors existing nodes' first_seen to createdAt, earlier-only)
 //   verify-sync     --file F             hard gate: every harness id present in db (exit 3 if not)
+//   repair-dates    [--dry-run] [--allow-later]  re-anchor first_seen to the earliest date in each
+//                                        fact's TEXT (rescue when createdAt is unusable); earlier-only
 //   dream           [--advance-days N]   decay + auto-reactivate + evaporate + housekeeping (+journal)
 //   weave                               co-mention + vector links; GUARANTEES zero fact islands
 //   report-* / apply-*                   caller-driven judgment contract (local-only)
@@ -30,7 +32,7 @@ const { embedTexts, embedOne, toVecBlob } = require("./embed");
 const { buildNodeText } = require("./graphtext");
 const ent = require("./entities");
 const { ensureSchema } = require("./schema");
-const { ageDays, ageTag } = require("./timeline");
+const { ageDays, ageTag, earliestTextDate } = require("./timeline");
 const cfg = require("../config");
 const tuning = require("./tuning");
 
@@ -387,6 +389,37 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
   res.missing = mems.map((m) => m.id || m.memory_id).filter((x) => x && !dbIds.has(x));
   res.complete = res.missing.length === 0;
+  return res;
+}
+
+// ---- REPAIR DATES FROM TEXT --------------------------------------------------
+// Last-resort first_seen repair for stores whose createdAt has become useless
+// (e.g. a host that rewrites createdAt on every rebuild, collapsing all dates
+// onto "today"). The real event date usually survives *inside the fact text*
+// ("raised 2026-06-26T18:15:02Z", "answered ... on 2026-07-01"), so we re-anchor
+// first_seen to the earliest explicit date found in each node's own text.
+// Scans EVERY fact node (including demoted Tier-2/3 rows absent from the flat
+// harness), so it needs no snapshot. Earlier-only by default (never pushes a
+// date forward — the failure mode we are undoing is dates jumping to "now");
+// pass allowLater to trust the text date unconditionally.
+function repairDatesFromText(db, { dryRun, allowLater } = {}) {
+  const rows = db.prepare("SELECT id, first_seen, fact FROM nodes WHERE kind='fact'").all();
+  const upd = db.prepare("UPDATE nodes SET first_seen=? WHERE id=?");
+  const res = { scanned: rows.length, matched: 0, updated: 0, no_date: 0, skipped_not_earlier: 0, dry_run: !!dryRun, allow_later: !!allowLater, sample: [] };
+  const apply = db.transaction(() => {
+    for (const n of rows) {
+      const td = earliestTextDate(n.fact);
+      if (!td) { res.no_date += 1; continue; }
+      res.matched += 1;
+      const older = !n.first_seen || Date.parse(td) < Date.parse(n.first_seen);
+      if (!allowLater && !older) { res.skipped_not_earlier += 1; continue; }
+      if (n.first_seen === td) continue;
+      if (!dryRun) upd.run(td, n.id);
+      res.updated += 1;
+      if (res.sample.length < 8) res.sample.push({ id: n.id, from: n.first_seen, to: td, fact: (n.fact || "").slice(0, 80) });
+    }
+  });
+  apply();
   return res;
 }
 
@@ -1668,6 +1701,7 @@ async function main() {
     else if (cmd === "migrate-model") r = migrateModel(db);
     else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"], flags["backfill-dates"] === true || flags["backfill-dates"] === "true"); gate = !r.complete; }
     else if (cmd === "verify-sync") { r = verifySync(db, flags.file); gate = !r.complete; }
+    else if (cmd === "repair-dates") r = repairDatesFromText(db, { dryRun: flags["dry-run"] === true || flags["dry-run"] === "true", allowLater: flags["allow-later"] === true || flags["allow-later"] === "true" });
     else if (cmd === "dream") r = dreamCore(db, flags);
     else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
     else if (cmd === "report-entities") r = reportEntities(db, { asOf: flags["as-of"] });
@@ -1688,7 +1722,7 @@ async function main() {
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
     else if (cmd === "config") r = configCmd(process.argv);
-    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|dream|weave|report-entities|apply-entities|report-aliases|apply-aliases|report-merges|apply-merges|report-salience|apply-salience|report-synthesis|apply-synthesis|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
+    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|repair-dates|dream|weave|report-entities|apply-entities|report-aliases|apply-aliases|report-merges|apply-merges|report-salience|apply-salience|report-synthesis|apply-synthesis|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
     console.log(JSON.stringify(r, null, 2));
     if (gate) process.exitCode = 3;
   } finally { db.close(); }

@@ -30,4 +30,25 @@ function relAge(firstSeen, now) {
   return ageTag(ageDays(firstSeen, now));
 }
 
-module.exports = { ageDays, ageTag, relAge };
+// Pull the EARLIEST explicit calendar date out of a fact's text — the most
+// reliable event-date signal when createdAt/ingest timestamps are unusable
+// (e.g. a host that resets createdAt on rebuild). Matches ISO dates with an
+// optional time component ("2026-06-26", "2026-06-26T18:15:02Z", "2026-06-26 18:15").
+// Conservative on purpose: only 20xx YYYY-MM-DD forms (never version numbers,
+// money ranges, or bare years), month 01-12, day 01-31, and must parse. Returns
+// the earliest match as an ISO string, or null when the text carries no date.
+const DATE_RE = /\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?:[T ]([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?\b/g;
+function earliestTextDate(text) {
+  if (!text) return null;
+  let best = null;
+  let m;
+  DATE_RE.lastIndex = 0;
+  while ((m = DATE_RE.exec(text)) !== null) {
+    const t = Date.parse(m[0]);
+    if (Number.isNaN(t)) continue;
+    if (best === null || t < best) best = t;
+  }
+  return best === null ? null : new Date(best).toISOString();
+}
+
+module.exports = { ageDays, ageTag, relAge, earliestTextDate };
