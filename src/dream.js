@@ -8,10 +8,9 @@
 //   ingest-harness  --file F [--prune]   harness -> db, memory_id-keyed, lossless (sync)
 //   verify-sync     --file F             hard gate: every harness id present in db (exit 3 if not)
 //   dream           [--advance-days N]   decay + auto-reactivate + evaporate + housekeeping (+journal)
-//   weave [--llm]                        co-mention + vector links; GUARANTEES zero fact islands
-//                                        (--llm adds typed entity extraction + alias canonicalization)
-//   reflect                              LLM judgment pass: salience tagging + semantic merge (needs DREAM_LLM)
-//   consolidate                          report duplicate-fact merge candidates (agent confirms)
+//   weave                               co-mention + vector links; GUARANTEES zero fact islands
+//   report-* / apply-*                   caller-driven judgment contract (local-only)
+//   consolidate                          alias for report-merges
 //   doctor                               health report; exit 3 if islands or dangling edges
 //   export-harness                       FACTS only, inject-ready, strongest first
 //   record-projection --file F           store harness ids after projection
@@ -30,8 +29,6 @@ const { embedTexts, embedOne, toVecBlob } = require("./embed");
 const { buildNodeText } = require("./graphtext");
 const ent = require("./entities");
 const { ensureSchema } = require("./schema");
-const { getLLM } = require("./llm");
-const judge = require("./judge");
 const { ageDays, ageTag } = require("./timeline");
 const cfg = require("../config");
 const tuning = require("./tuning");
@@ -39,10 +36,6 @@ const tuning = require("./tuning");
 // Resolved behavioral knobs (defaults <- memory.config.json <- env override).
 // One snapshot per process; the CLI `config` subcommand re-reads fresh.
 const T = tuning.resolve();
-// Effective env for the optional LLM judge: the `judgment` knob supplies DREAM_LLM
-// unless an explicit DREAM_LLM env var is already set (which still wins).
-const llmEnv = () => ({ ...process.env, DREAM_LLM: T.llmSpec || process.env.DREAM_LLM || "" });
-
 // ---- PHASE PROFILER (env MEMORY_PROFILE=1) ---------------------------------
 // Lightweight per-phase wall-clock timing to stderr, to find where nightly cost
 // scales with store size. Zero overhead when off.
@@ -121,7 +114,7 @@ const clamp01 = (x) => Math.max(0, Math.min(1, x));
 const unit = (v) => { let n = 0; for (let i = 0; i < v.length; i++) n += v[i] * v[i]; n = Math.sqrt(n) || 1; const o = new Float32Array(v.length); for (let i = 0; i < v.length; i++) o[i] = v[i] / n; return o; };
 const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
 // HARD-SPECIFIC extraction for the vagueness trace. A "hard specific" is an answer-bearing
-// literal the LLM cannot reconstruct from a generalization: money, percentage, multiple, and
+// literal a generalized gist cannot reconstruct: money, percentage, multiple, and
 // counted quantities. DATES/TIMES are deliberately EXCLUDED — per-day "as of 2026-03-26"
 // restatement timestamps are CORRECTLY dropped by generalization and would swamp the signal.
 // Returns a Set of normalized token strings so the same value stated two ways collides.
@@ -665,7 +658,7 @@ function dreamCore(db, flags) {
 
 // ---- WEAVE: connect every fact (zero islands) -------------------------------
 // Build a forms-aware entity vocab: label-derived forms (formsFor) UNION any extra
-// surface forms stored on the hub node's text column (set by LLM/corpus extraction
+// surface forms stored on the hub node's text column (set by caller/corpus extraction
 // and alias folding), so abbreviations and first-name aliases still match.
 function vocabWithForms(db) {
   const rows = db.prepare("SELECT signature, text FROM nodes WHERE kind='entity'").all();
@@ -701,8 +694,6 @@ async function weave(db, opts) {
   const now = (opts && opts.asOf) ? new Date(opts.asOf).toISOString() : new Date().toISOString();
   const K = (opts && opts.k) || 3;
   const SIM = (opts && opts.sim) || 0.45;
-  const llm = (opts && opts.llm) ? getLLM(llmEnv()) : { available: false };
-
   // INCREMENTAL WEAVE (env MEMORY_INCREMENTAL_WEAVE=1): brain-faithful — only process
   // NEW facts (first_seen > last_weave) and DIRTY ones (merge survivors whose text
   // changed: gist updated since last_weave). Existing facts already have their entity
@@ -723,20 +714,14 @@ async function weave(db, opts) {
   // 2) extract new entities from facts -> create hubs. SELF-BOOTSTRAPPING: the corpus
   //    extractor learns the entity vocabulary from recurrence (no seed/deny lists), so a
   //    candidate becomes a hub only if it recurs across facts (or has a strong email signal).
-  //    When an LLM is enabled it ADDS a typed read (catches single-name principals and
-  //    types orgs/places correctly); the two are unioned for best recall.
+  //    Caller-provided typed reads are applied separately via apply-entities.
   const allActive = db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const factRows = incremental ? allActive.filter(isToWeave) : allActive;
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
   const corpusEnts = prof(`weave.extractCorpus(facts=${factRows.length})`, () => ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 }));
-  let llmEnts = [];
-  if (llm.available && factRows.length) {
-    try { llmEnts = await profA(`weave.extractEntitiesLLM(facts=${factRows.length})`, () => judge.extractEntitiesLLM(factRows.map((f) => f.fact || ""), llm)); }
-    catch (e) { process.stderr.write(`[weave] llm extract failed: ${e.message}\n`); }
-  }
   const allEnts = new Map();
-  for (const e of [...corpusEnts, ...llmEnts]) {
+  for (const e of corpusEnts) {
     if (!allEnts.has(e.sig)) allEnts.set(e.sig, { sig: e.sig, type: e.type, forms: new Set(e.forms) });
     else e.forms.forEach((f) => allEnts.get(e.sig).forms.add(f));
   }
@@ -753,22 +738,7 @@ async function weave(db, opts) {
   });
   tx1();
 
-  // 2.5) CANONICALIZATION (LLM): fold alias hubs ("Jamie" -> "person:jamie-chen",
-  //      "SF" -> "place:san-francisco") into one canonical hub before linking.
-  //      In incremental mode, only run when NEW hubs appeared (no new entities => no new
-  //      aliases to reconcile) — bounds the nightly LLM cost.
   let aliasesMerged = 0;
-  if (llm.available && (!incremental || newHubs > 0)) {
-    const hubs = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all()
-      .map((r) => ({ sig: r.signature, label: ent.labelOf(r.signature) }));
-    let groups = [];
-    try { groups = await profA(`weave.canonicalizeLLM(hubs=${hubs.length})`, () => judge.canonicalizeLLM(hubs, llm)); }
-    catch (e) { process.stderr.write(`[weave] llm canon failed: ${e.message}\n`); }
-    const tx = db.transaction(() => {
-      for (const g of groups) for (const a of g.aliases) { mergeEntityHub(db, g.canonical, a); aliasesMerged += 1; }
-    });
-    prof(`weave.canonApply(groups=${groups.length})`, () => tx());
-  }
   vocab = vocabWithForms(db);
 
   // 3) co-mention edges fact -> entity. For toWeave (new/dirty) facts: link all entities
@@ -993,91 +963,173 @@ async function weave(db, opts) {
   prof("weave.repairGraph", () => repairGraph(db));
   const degFinal = degreeMap(db);
   const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !degFinal.get(s));
-  return { new_entity_hubs: newHubs, llm_entities: llmEnts.length, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, sequence_edges: sequenceEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
+  return { new_entity_hubs: newHubs, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, sequence_edges: sequenceEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
 }
 
-// ---- REFLECT: the LLM JUDGMENT pass (salience + semantic merge) -------------
-// The headline LLM stage of a nightly dream. Two judgments the engine can't make
-// mechanically:
-//   SALIENCE  — tag the genuinely important facts so they survive cap-eviction and
-//               decay slowly (importance != frequency).
-//   MERGE     — roll up near-duplicate/incremental clusters into one richer fact,
-//               so the bank stays under the entry cap by CONSOLIDATING rather than
-//               blindly evicting. This is what lifts long-horizon synthesis recall.
-// No-op (returns zeros) when no LLM is configured.
-async function reflect(db, opts) {
-  const now = (opts && opts.asOf) ? new Date(opts.asOf).toISOString() : new Date().toISOString();
-  const llm = getLLM(llmEnv());
-  if (!llm.available) return { llm: "none", note: "reflect requires the judgment knob (or DREAM_LLM); skipped", salient_tagged: 0, clusters_merged: 0, entries_reclaimed: 0 };
+// ---- REPORT/APPLY: caller-driven judgment contract ---------------------------
+const ENTITY_DECISION_TYPES = new Set(["person", "org", "team", "place", "project", "system", "topic"]);
 
-  const keepDetail0 = T.keepDetail || (opts && opts.keepDetail);
-  // Nightly LLM cost must scale with NEW material, not total store size. Exclude Tier-3
-  // archive ALWAYS (it is inert), and 'detail' in retain mode (already archived for
-  // recall). This is the filter the audit flagged: archive was previously sent to the
-  // salience LLM every night, so cost grew with the archive — the exact thing we forbid.
+function readDecisionFile(file) {
+  if (!file) throw new Error("missing --file <decisions.json>");
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function reportFactRowsForWeave(db) {
+  return db.prepare("SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all()
+    .map((f) => ({ sig: f.sig, fact: f.fact || "" }));
+}
+
+function reportEntities(db) {
+  return { surface: "entities", facts: reportFactRowsForWeave(db) };
+}
+
+function cleanEntityDecisions(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = new Map();
+  for (const e of raw) {
+    if (!e || typeof e.sig !== "string") continue;
+    const sig = e.sig.trim().toLowerCase();
+    let type = String(e.type || ent.typeOf(sig) || "topic").toLowerCase().trim();
+    if (!ENTITY_DECISION_TYPES.has(type)) type = "topic";
+    if (!sig.startsWith(`${type}:`) || sig.length < type.length + 3 || sig.length > 80) continue;
+    const forms = new Set(Array.isArray(e.forms) ? e.forms.map((f) => String(f).toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim()).filter((f) => f.length >= 3) : []);
+    for (const f of ent.formsFor(sig)) forms.add(f);
+    if (!forms.size) continue;
+    if (!out.has(sig)) out.set(sig, { sig, type, forms: new Set() });
+    forms.forEach((f) => out.get(sig).forms.add(f));
+  }
+  return [...out.values()].map((e) => ({ sig: e.sig, type: e.type, forms: [...e.forms] }));
+}
+
+async function applyEntities(db, raw, opts = {}) {
+  const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
+  const decisions = cleanEntityDecisions(raw);
+  let created = 0, updated = 0;
+  const tx = db.transaction(() => {
+    for (const e of decisions) {
+      const existing = db.prepare("SELECT id, text FROM nodes WHERE signature=? AND kind='entity'").get(e.sig);
+      const formsStr = [...new Set(e.forms)].filter((f) => f.length >= 3).join("|");
+      if (existing) {
+        const forms = new Set([...(existing.text || "").split("|"), ...formsStr.split("|")].map((f) => f.trim().toLowerCase()).filter((f) => f.length >= 3));
+        db.prepare("UPDATE nodes SET text=? WHERE id=?").run([...forms].join("|"), existing.id);
+        updated += 1;
+      } else {
+        const id = nextId(db);
+        db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
+          VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", formsStr);
+        created += 1;
+      }
+    }
+  });
+  tx();
+  const weaveResult = await weave(db, { asOf: opts.asOf });
+  repairGraph(db);
+  return { surface: "entities", accepted: decisions.length, created, updated, weave: weaveResult };
+}
+
+function reportAliases(db) {
+  const hubs = db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all()
+    .map((r) => ({ sig: r.signature, label: ent.labelOf(r.signature) }));
+  return { surface: "aliases", hubs };
+}
+
+function cleanAliasDecisions(db, raw) {
+  if (!Array.isArray(raw)) return [];
+  const valid = new Set(db.prepare("SELECT signature FROM nodes WHERE kind='entity'").all().map((r) => r.signature));
+  const groups = [];
+  for (const g of raw) {
+    if (!g || typeof g.canonical !== "string" || !Array.isArray(g.aliases)) continue;
+    if (!valid.has(g.canonical)) continue;
+    const aliases = g.aliases.filter((a) => typeof a === "string" && valid.has(a) && a !== g.canonical);
+    const uniq = [...new Set(aliases)];
+    if (uniq.length) groups.push({ canonical: g.canonical, aliases: uniq });
+  }
+  return groups;
+}
+
+async function applyAliases(db, raw, opts = {}) {
+  const groups = cleanAliasDecisions(db, raw);
+  let aliasesMerged = 0;
+  const tx = db.transaction(() => {
+    for (const g of groups) for (const a of g.aliases) { mergeEntityHub(db, g.canonical, a); aliasesMerged += 1; }
+  });
+  tx();
+  const weaveResult = await weave(db, { asOf: opts.asOf });
+  repairGraph(db);
+  return { surface: "aliases", groups: groups.length, aliases_merged: aliasesMerged, weave: weaveResult };
+}
+
+function reportSalience(db) {
+  const keepDetail0 = T.keepDetail;
   const notColdSql = keepDetail0
     ? " AND (notes IS NULL OR notes NOT IN ('detail','archive'))"
     : " AND (notes IS NULL OR notes<>'archive')";
-
-  // SALIENCE: judge importance over not-yet-salient facts. In incremental mode, only
-  // judge facts NEW since the last reflect (importance is decided once, not re-judged
-  // nightly) — bounds LLM cost to new material.
-  const incrementalR = (opts && opts.incremental) || T.incrementalWeave;
+  const incrementalR = T.incrementalWeave;
   const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
   const newOnlySql = incrementalR ? ` AND first_seen > '${lastReflect.replace(/'/g, "")}'` : "";
+  const facts = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notColdSql}${newOnlySql}`).all();
+  return { surface: "salience", facts };
+}
+
+function cleanSalienceDecision(db, raw) {
+  const candidates = reportSalience(db).facts;
+  const valid = new Set(candidates.map((f) => f.sig));
+  const sigs = raw && Array.isArray(raw.salientSigs) ? raw.salientSigs : [];
+  const cap = Math.max(1, Math.floor(candidates.length * 0.2));
+  return [...new Set(sigs.filter((s) => typeof s === "string" && valid.has(s)))].slice(0, cap);
+}
+
+function applySalience(db, raw, opts = {}) {
+  const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
+  const sigs = cleanSalienceDecision(db, raw);
   let salientTagged = 0;
-  const candidates = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notColdSql}${newOnlySql}`).all();
-  let flagged = new Set();
-  try { flagged = await profA(`reflect.salienceLLM(cand=${candidates.length})`, () => judge.salienceLLM(candidates, llm)); }
-  catch (e) { process.stderr.write(`[reflect] salience failed: ${e.message}\n`); }
-  const txS = db.transaction(() => {
-    for (const sig of flagged) {
+  const tx = db.transaction(() => {
+    for (const sig of sigs) {
       db.prepare("UPDATE nodes SET class='salient', salience='decision', strength=? , last_reactivated=? WHERE signature=? AND kind='fact'")
         .run(clamp01((db.prepare("SELECT strength FROM nodes WHERE signature=?").get(sig) || {}).strength + 0.05 || 0.9), now, sig);
       salientTagged += 1;
     }
   });
-  txS();
+  tx();
+  repairGraph(db);
+  return { surface: "salience", salient_tagged: salientTagged };
+}
 
-  // MERGE: get near-duplicate clusters, let the LLM decide + write the rollup, apply.
-  // Incremental: only seed merge clusters from facts new since last reflect.
-  const cons = await profA("reflect.consolidate", () => consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: keepDetail0, seedAfter: incrementalR ? lastReflect : null }));
-  const clusters = cons.clusters || [];
-  let decisions = [];
-  if (clusters.length) {
-    try { decisions = await profA(`reflect.mergeClustersLLM(clusters=${clusters.length})`, () => judge.mergeClustersLLM(clusters, llm)); }
-    catch (e) { process.stderr.write(`[reflect] merge failed: ${e.message}\n`); }
+async function reportMerges(db, opts = {}) {
+  const incrementalR = T.incrementalWeave;
+  const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : null;
+  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: T.keepDetail, seedAfter: incrementalR ? lastReflect : null });
+  return { surface: "merges", clusters: cons.clusters || [] };
+}
+
+function cleanMergeDecisions(db, raw) {
+  if (!Array.isArray(raw)) return [];
+  const exists = db.prepare("SELECT 1 FROM nodes WHERE signature=? AND kind='fact'");
+  const out = [];
+  for (const dec of raw) {
+    if (!dec || typeof dec.fact !== "string" || dec.fact.trim().length < 8 || typeof dec.survivorSig !== "string" || !Array.isArray(dec.memberSigs)) continue;
+    const survivorSig = dec.survivorSig;
+    const memberSigs = [...new Set(dec.memberSigs.filter((s) => typeof s === "string"))];
+    if (!memberSigs.includes(survivorSig)) memberSigs.unshift(survivorSig);
+    const live = memberSigs.filter((s) => exists.get(s));
+    if (live.length < 2 || !exists.get(survivorSig)) continue;
+    out.push({ fact: dec.fact.trim(), survivorSig, memberSigs: live });
   }
+  return out;
+}
+
+async function applyMerges(db, raw, opts = {}) {
+  const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
+  const decisions = cleanMergeDecisions(db, raw);
   let clustersMerged = 0, reclaimed = 0, retained = 0;
-  // RETAIN-DETAIL mode (env MEMORY_MERGE_KEEP=1): the merge writes a GIST survivor for
-  // the projection, but the detailed constituents are KEPT in the db (flagged
-  // notes='detail') instead of deleted — so recall (m_recall / recall.js over the full
-  // side store) can still surface the specific fact when a question needs the detail.
-  // The projection (exportHarness) injects the gist and skips 'detail'; the side DB is
-  // the lookup layer. This is the "vague gist + look-it-up" model: the 500-cap bounds
-  // what we INJECT, not what we REMEMBER. Default (unset) = destructive merge (legacy).
-  const keepDetail = keepDetail0;
-  // VAGUENESS TRACE (mathematically-measured "feeling of vagueness"): for each merge,
-  // measure how much semantic spread we averaged into one gist = mean cosine distance of
-  // the member embeddings to the cluster centroid. ~0 = we merged near-duplicates (a
-  // faithful restatement); high = we collapsed a heterogeneous set into one summary
-  // (genuinely lossy). Stored as a scalar on the survivor and surfaced by recall as a
-  // "generalized summary" hint, so the agent knows to drill the time-indexed bookshelf for
-  // specifics rather than enumerate from the gist. Dispersion is computed HERE (async
-  // embed) and combined with the cumulative retained-detail count inside the txn below.
+  const keepDetail = T.keepDetail || (opts && opts.keepDetail);
   const dispBySurvivor = new Map();
   const lossBySurvivor = new Map();
   for (const dec of decisions) {
-    if (!dec) continue;
     const memFacts = dec.memberSigs
-      .map((s) => (db.prepare("SELECT fact FROM nodes WHERE signature=? AND kind='fact'").get(s) || {}).fact)
+      .map((sig) => (db.prepare("SELECT fact FROM nodes WHERE signature=? AND kind='fact'").get(sig) || {}).fact)
       .filter(Boolean);
     if (memFacts.length < 2) continue;
-    // SALIENT-LOSS (recall-biased): hard specifics (money/pct/mult/count; dates excluded) present
-    // across the members but ABSENT from the merged gist text = answer-bearing information the
-    // gist can no longer reconstruct. This is OUTPUT information loss, unlike dispersion which
-    // only measures INPUT heterogeneity (a near-dup restatement that drops a figure has low
-    // dispersion but total salient-loss — the false negative the old metric produced on q136).
     const memberSpecs = new Set();
     for (const f of memFacts) for (const t of extractHardSpecifics(f)) memberSpecs.add(t);
     if (memberSpecs.size) {
@@ -1094,28 +1146,17 @@ async function reflect(db, opts) {
       const cu = unit(c);
       const disp = vecs.reduce((a, v) => a + (1 - dot(v, cu)), 0) / vecs.length;
       dispBySurvivor.set(dec.survivorSig, disp);
-    } catch (e) { process.stderr.write(`[reflect] vagueness embed failed: ${e.message}\n`); }
+    } catch (e) { process.stderr.write(`[apply-merges] vagueness embed failed: ${e.message}\n`); }
   }
   const txM = db.transaction(() => {
     for (const dec of decisions) {
-      if (!dec) continue;
       const survivor = db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(dec.survivorSig);
       if (!survivor) continue;
-      const members = dec.memberSigs.map((s) => db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(s)).filter(Boolean);
+      const members = dec.memberSigs.map((sig) => db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(sig)).filter(Boolean);
       if (members.length < 2) continue;
-      // survivor inherits the consolidated text + the strongest signal in the cluster.
-      // It is now a GIST/schema node (notes='gist') — a fusion of several episodes, so
-      // the projection treats it as timeless rather than placing it on the episodic timeline.
       const maxStrength = Math.max(...members.map((m) => m.strength || 0));
       const anySalient = members.some((m) => m.class === "salient");
       const maxReacts = Math.max(...members.map((m) => m.reactivations || 0));
-      // first_seen is the immutable ORIGINAL record date ("when first noted") — it drives the
-      // Source: citation the agent reads. A merge survivor may be a LATER re-emission of the
-      // same fact; keeping the survivor's own (later) first_seen loses the original posting
-      // date and makes "when was it first recorded/posted" unanswerable (e.g. q010: conference
-      // posted day7, but a day10 re-emission survived -> agent cited day10). The gist must carry
-      // the EARLIEST date across its constituents. Recency is unaffected: it keys off
-      // last_reactivated (set to `now` here), not first_seen, and is only a rank tie-break.
       const minFirstSeen = members.reduce((m, n) => {
         const t = Date.parse(n.first_seen || "");
         return (Number.isFinite(t) && (m == null || t < m.t)) ? { t, s: n.first_seen } : m;
@@ -1124,19 +1165,13 @@ async function reflect(db, opts) {
       db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist' WHERE id=?")
         .run(dec.fact, dec.fact, anySalient ? "salient" : (survivor.class === "episodic" ? "semantic" : survivor.class),
           anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, survivor.id);
-      // re-embed survivor to its new text so retrieval matches the merged content
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
       for (const m of members) {
         if (m.id === survivor.id) continue;
-        // copy the member's mention edges onto the survivor (so the gist stays connected)
         for (const e of db.prepare("SELECT dst, rel, weight FROM edges WHERE src=? AND rel='mentions'").all(m.signature)) {
           const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='mentions' AND dst=?").get(survivor.signature, e.dst);
           if (!dup && survivor.signature !== e.dst) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "mentions", e.dst, e.weight, now, now);
         }
-        // MOVE the member's chronological/correction lineage (sequence/supersedes) onto the
-        // survivor so the timeline stays navigable from the active gist. Re-point both
-        // directions, dedup, drop self-loops, then remove the originals from the member so
-        // the chain is never duplicated (and never dangles once the member is demoted/deleted).
         for (const e of db.prepare("SELECT src, rel, dst, weight FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(m.signature, m.signature)) {
           const nsrc = e.src === m.signature ? survivor.signature : e.src;
           const ndst = e.dst === m.signature ? survivor.signature : e.dst;
@@ -1146,25 +1181,14 @@ async function reflect(db, opts) {
         }
         db.prepare("DELETE FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").run(m.signature, m.signature);
         if (keepDetail) {
-          // RETAIN: keep the detailed fact in the DB as a lookup-only 'detail' node.
-          // Not projected (gist is), but fully retrievable via recall. Link it to the
-          // gist so a graph walk from the gist can reach the specifics.
           db.prepare("UPDATE nodes SET notes='detail', last_reactivated=? WHERE id=?").run(now, m.id);
           const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='related_to' AND dst=?").get(survivor.signature, m.signature);
           if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", m.signature, 0.6, now, now);
-          // R1: durable gist->detail lineage that survives demotion (edges get GC'd
-          // when the detail is demoted to Tier-3 archive; this cold table does not).
           db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(m.signature, survivor.signature, now);
-          // Reparent: if this member was itself a gist with its own retained details,
-          // flatten the chain so those details now point at the new (current) survivor.
-          // Collision-safe (copy-if-absent then drop old rows): a plain UPDATE can hit the
-          // (detail_sig,gist_sig) PK when a detail already points at the survivor, and the
-          // detail_sig<>survivor guard prevents a self-referential (survivor,survivor) row.
           db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) SELECT detail_sig, ?, first_seen FROM detail_of WHERE gist_sig=? AND detail_sig<>?").run(survivor.signature, m.signature, survivor.signature);
           db.prepare("DELETE FROM detail_of WHERE gist_sig=?").run(m.signature);
           retained += 1;
         } else {
-          // DESTRUCTIVE (legacy): tombstone + delete the member.
           db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(m.signature, m.memory_id || "", now, `merged into ${survivor.signature}`);
           db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
           db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(m.id));
@@ -1173,12 +1197,6 @@ async function reflect(db, opts) {
           reclaimed += 1;
         }
       }
-      // Stamp the vagueness scalar. PRIMARY signal = salient-loss (recall-biased): if the gist
-      // dropped ANY hard specific a member carried, tag it clearly vague (>=0.5, above the 0.35
-      // hint threshold) so the agent drills for the exact figure — over-firing is harmless
-      // (a hint on a gist that DOES carry the value is still answered directly). SECONDARY =
-      // dispersion (halved) as a weak OR-signal for heterogeneous merges that carry no hard
-      // token; kept gentle so genuine synthesis/generalization gists are not aggressively tagged.
       const disp = dispBySurvivor.get(dec.survivorSig);
       const loss = lossBySurvivor.get(dec.survivorSig);
       const detailCount = keepDetail
@@ -1186,29 +1204,63 @@ async function reflect(db, opts) {
         : members.length;
       const dispTerm = disp != null ? disp * Math.log2(1 + detailCount) : 0;
       let vagueness = null;
-      if (loss && loss.dropped > 0) {
-        vagueness = clamp01(0.5 + 0.5 * (loss.dropped / loss.total));
-      } else if (disp != null) {
-        vagueness = clamp01(0.5 * dispTerm);
-      }
-      if (vagueness != null) {
-        db.prepare("UPDATE nodes SET vagueness=? WHERE id=?").run(vagueness, survivor.id);
-      }
+      if (loss && loss.dropped > 0) vagueness = clamp01(0.5 + 0.5 * (loss.dropped / loss.total));
+      else if (disp != null) vagueness = clamp01(0.5 * dispTerm);
+      if (vagueness != null) db.prepare("UPDATE nodes SET vagueness=? WHERE id=?").run(vagueness, survivor.id);
       clustersMerged += 1;
     }
   });
   txM();
-
-  // re-embed any survivor whose vec row we dropped, then re-weave to heal islands.
-  // Never re-embed Tier-3 archive nodes (they are intentionally un-embedded).
   const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
-  if (missing.length) await profA(`reflect.reembed(missing=${missing.length})`, () => reembed(db, missing));
-  await profA("reflect.reweave", () => weave(db, { asOf: opts && opts.asOf, llm: false }));
-  if (incrementalR) setMeta(db, "last_reflect", now);
+  if (missing.length) await profA(`apply-merges.reembed(missing=${missing.length})`, () => reembed(db, missing));
+  const weaveResult = await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf }));
+  setMeta(db, "last_reflect", now);
   repairGraph(db);
-  return { llm: llm.label, salient_tagged: salientTagged, clusters_seen: clusters.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed, details_retained: retained };
+  return { surface: "merges", decisions: decisions.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed, details_retained: retained, weave: weaveResult };
 }
 
+function reportSynthesis(db, opts = {}) {
+  const cand = emitCandidates(db, { ...(opts.detect || {}), asOf: opts.asOf });
+  return { surface: "synthesis", pools: cand.pools || [] };
+}
+
+function cleanSynthesisDecisions(db, raw, opts = {}) {
+  if (!Array.isArray(raw)) return [];
+  const pools = reportSynthesis(db, opts).pools;
+  const byPool = new Map(pools.map((p) => [p.poolId, p]));
+  const out = [];
+  for (const obj of raw) {
+    if (!obj || typeof obj.poolId !== "string" || !Array.isArray(obj.groups) || !byPool.has(obj.poolId)) continue;
+    const p = byPool.get(obj.poolId);
+    const valid = new Set(p.members.map((m) => m.sig));
+    const claimed = new Set();
+    const groups = [];
+    for (const g of obj.groups) {
+      if (!g || typeof g.concept !== "string" || g.concept.trim().length < 12 || !Array.isArray(g.memberSigs)) continue;
+      const memberSigs = [...new Set(g.memberSigs.filter((sig) => valid.has(sig) && !claimed.has(sig)))];
+      if (memberSigs.length < 2) continue;
+      memberSigs.forEach((sig) => claimed.add(sig));
+      groups.push({ concept: g.concept.trim(), memberSigs, span: typeof g.span === "string" ? g.span.trim() : "", scale: typeof g.scale === "string" ? g.scale.trim() : "" });
+    }
+    if (groups.length) out.push({ poolId: obj.poolId, groups });
+  }
+  return out;
+}
+
+async function applySynthesis(db, raw, opts = {}) {
+  const decisions = cleanSynthesisDecisions(db, raw, opts);
+  let conceptsCreated = 0, membersDemoted = 0;
+  const applied = [];
+  for (const dec of decisions) {
+    for (const g of dec.groups) {
+      const r = await applyConcept(db, g, { asOf: opts.asOf });
+      if (r.applied) { conceptsCreated += 1; membersDemoted += r.demoted; applied.push({ poolId: dec.poolId, concept: r.concept_sig, demoted: r.demoted }); }
+    }
+  }
+  const weaveResult = conceptsCreated ? await weave(db, { asOf: opts.asOf }) : null;
+  repairGraph(db);
+  return { surface: "synthesis", decisions: decisions.length, concepts_created: conceptsCreated, members_demoted: membersDemoted, applied, weave: weaveResult };
+}
 // ---- CONSOLIDATE (report merge candidates; pressure-aware threshold) --------
 async function consolidate(db, opts) {
   const factCount = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact'").get().c;
@@ -1270,7 +1322,7 @@ function emitCandidates(db, opts = {}) {
     minAge: opts.minAge != null ? opts.minAge : 14,                    // member had a chance to be re-asked (days)
     quietFor: opts.quietFor != null ? opts.quietFor : 14,              // cluster maturity: newest member older than this
   };
-  const now = Date.now();
+  const now = opts.asOf ? Date.parse(opts.asOf) : Date.now();
   const ageD = (iso) => (iso ? (now - Date.parse(iso)) / 86400000 : 0);
   const generalized = new Set(db.prepare("SELECT detail_sig FROM detail_of").all().map((r) => r.detail_sig));
   const facts = db.prepare(`SELECT id, signature, class, strength, reactivations, first_seen, COALESCE(fact,'') fact, notes FROM nodes WHERE ${ACTIVE_FACT}`).all()
@@ -1372,41 +1424,6 @@ async function applyConcept(db, group, opts = {}) {
   });
   const res = tx();
   return { applied: true, concept: conceptText, ...res };
-}
-
-// ---- SYNTHESIS: bounded multi-turn auto loop (engine-internal DREAM_LLM path) -
-// The headless/bench front-end: emit -> judge(DREAM_LLM) -> validate -> apply -> re-emit until
-// fixpoint or turn-cap. Stateless turns (all state in the db), best-effort & non-blocking (an
-// LLM failure stops the loop, never corrupts the store), transcripted for audit. The live
-// conversational skill drives the same emit-candidates / apply primitives in-context instead.
-async function synthesizeAuto(db, opts = {}) {
-  const llm = getLLM(llmEnv());
-  if (!llm || !llm.available) return { ran: false, reason: "no LLM (judgment off / DREAM_LLM unset)" };
-  const maxTurns = opts.maxTurns || 3;
-  const transcript = [];
-  let totalConcepts = 0, totalDemoted = 0, turn = 0;
-  for (; turn < maxTurns; turn += 1) {
-    const cand = emitCandidates(db, opts.detect || {});
-    if (!cand.pools.length) break;
-    let decisions = [];
-    try { decisions = await judge.synthesizeClustersLLM(cand.pools, llm, {}); }
-    catch (e) { transcript.push({ turn, error: String((e && e.message) || e) }); break; }
-    let appliedThisTurn = 0;
-    const applied = [];
-    for (const dec of decisions) {
-      for (const g of dec.groups) {
-        try {
-          const r = await applyConcept(db, g, { asOf: opts.asOf });
-          if (r.applied) { totalConcepts += 1; totalDemoted += r.demoted; appliedThisTurn += 1; applied.push({ concept: r.concept, demoted: r.demoted }); }
-        } catch (e) { transcript.push({ turn, applyError: String((e && e.message) || e), concept: g.concept }); }
-      }
-    }
-    transcript.push({ turn, pools: cand.pools.length, decided: decisions.length, applied });
-    if (!appliedThisTurn) break;
-  }
-  repairGraph(db);
-  if (opts.transcript) { try { fs.appendFileSync(opts.transcript, transcript.map((t) => JSON.stringify(t)).join("\n") + "\n"); } catch { /* audit best-effort */ } }
-  return { ran: true, turns: turn, concepts_created: totalConcepts, members_demoted: totalDemoted, llm: llm.label, transcript };
 }
 
 // ---- BUDGET (report entry budget + prioritized worklist) --------------------
@@ -1589,21 +1606,21 @@ function stats(db) {
 
 // ---- CLI --------------------------------------------------------------------
 
-// `config` subcommand: inspect / set the five behavioral knobs (persisted to
-// memory.config.json). Used by the LLM-driven install interview and by humans.
+// `config` subcommand: inspect / set the four behavioral knobs (persisted to
+// memory.config.json).
 function configCmd(argv) {
   const sub = (argv[3] || "show").toLowerCase();
   if (sub === "show") {
     const r = tuning.resolve();
     return {
       configPath: r.configPath, configExists: r.configExists, knobs: r.knobs,
-      resolved: { entryTarget: r.entryTarget, entryMax: r.entryMax, tier2Max: r.tier2Max, tiered: r.tiered, keepDetail: r.keepDetail, forgetMultiplier: r.forgetMultiplier, incrementalWeave: r.incrementalWeave, supersede: r.supersede, llmSpec: r.llmSpec },
+      resolved: { entryTarget: r.entryTarget, entryMax: r.entryMax, tier2Max: r.tier2Max, tiered: r.tiered, keepDetail: r.keepDetail, forgetMultiplier: r.forgetMultiplier, incrementalWeave: r.incrementalWeave, supersede: r.supersede },
       summary: tuning.describe(r),
     };
   }
   if (sub === "list" || sub === "knobs") {
     const out = {};
-    for (const [name, spec] of Object.entries(tuning.KNOBS)) out[name] = { values: spec.values || "off | <provider>:<model>", default: spec.default, help: spec.help };
+    for (const [name, spec] of Object.entries(tuning.KNOBS)) out[name] = { values: spec.values, default: spec.default, help: spec.help };
     return { knobs: out };
   }
   if (sub === "init") { const r = tuning.ensureConfig(); return { ...r, configPath: tuning.CONFIG_PATH }; }
@@ -1629,15 +1646,17 @@ async function main() {
     else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"]); gate = !r.complete; }
     else if (cmd === "verify-sync") { r = verifySync(db, flags.file); gate = !r.complete; }
     else if (cmd === "dream") r = dreamCore(db, flags);
-    else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], llm: flags.llm === true || flags.llm === "true", supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
-    else if (cmd === "reflect") r = await reflect(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
-    else if (cmd === "consolidate") r = await consolidate(db, { sim: Number(flags.sim) || 0 });
-    else if (cmd === "emit-candidates") r = emitCandidates(db, { tight: flags.tight != null ? Number(flags.tight) : undefined, minSize: flags["min-size"] != null ? Number(flags["min-size"]) : undefined, quietFor: flags["quiet-for"] != null ? Number(flags["quiet-for"]) : undefined, minAge: flags["min-age"] != null ? Number(flags["min-age"]) : undefined, maxStrength: flags["max-strength"] != null ? Number(flags["max-strength"]) : undefined });
-    else if (cmd === "synthesize") {
-      const detect = {};
-      for (const [f, k] of [["tight", "tight"], ["min-size", "minSize"], ["quiet-for", "quietFor"], ["min-age", "minAge"], ["max-strength", "maxStrength"]]) if (flags[f] != null) detect[k] = Number(flags[f]);
-      r = await synthesizeAuto(db, { asOf: flags["as-of"], maxTurns: flags["max-turns"] != null ? Number(flags["max-turns"]) : undefined, transcript: flags.transcript, detect });
-    }
+    else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
+    else if (cmd === "report-entities") r = reportEntities(db, { asOf: flags["as-of"] });
+    else if (cmd === "apply-entities") r = await applyEntities(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "report-aliases") r = reportAliases(db, { asOf: flags["as-of"] });
+    else if (cmd === "apply-aliases") r = await applyAliases(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "report-salience") r = reportSalience(db, { asOf: flags["as-of"] });
+    else if (cmd === "apply-salience") r = applySalience(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "report-merges" || cmd === "consolidate") r = await reportMerges(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
+    else if (cmd === "apply-merges") r = await applyMerges(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "report-synthesis") r = reportSynthesis(db, { asOf: flags["as-of"] });
+    else if (cmd === "apply-synthesis") r = await applySynthesis(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
     else if (cmd === "apply-concept") { const g = JSON.parse(fs.readFileSync(flags.file, "utf8")); r = await applyConcept(db, g, { asOf: flags["as-of"] }); repairGraph(db); }
     else if (cmd === "budget") r = await budget(db);
     else if (cmd === "doctor") { r = doctor(db); gate = !r.healthy; }
@@ -1646,7 +1665,7 @@ async function main() {
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
     else if (cmd === "config") r = configCmd(process.argv);
-    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|dream|weave|reflect|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
+    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|dream|weave|report-entities|apply-entities|report-aliases|apply-aliases|report-merges|apply-merges|report-salience|apply-salience|report-synthesis|apply-synthesis|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
     console.log(JSON.stringify(r, null, 2));
     if (gate) process.exitCode = 3;
   } finally { db.close(); }
@@ -1655,4 +1674,4 @@ if (require.main === module) {
   main().catch((e) => { console.error("ERROR:", e); process.exit(1); });
 }
 
-module.exports = { emitCandidates, applyConcept, synthesizeAuto, repairGraph };
+module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph };

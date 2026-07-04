@@ -20,7 +20,7 @@ The end state is not a tiny whole-bank store. It is a **three-tier memory system
 ### Architecture
 `memory.db` is the **durable compute engine and retrieval index**. The **harness bank is a disposable nightly projection** of it. Daytime, other skills call host memory tools directly, so new memories live in the harness until the next dream pass pulls them into the db. The loop is:
 
-> **INGEST harness → VERIFY sync → DREAM decay/reactivation/demotion → WEAVE graph/vector links → REFLECT/CONSOLIDATE judgment → PROJECT back to harness.**
+> **INGEST harness → VERIFY sync → DREAM decay/reactivation/demotion → WEAVE graph/vector links → REPORT candidates → CALLER judges → APPLY decisions → PROJECT back to harness.**
 
 All db operations go through one CLI (`<AGENT_MEMORY>` = this package's install dir, the folder containing `src/` and `config.js`):
 
@@ -31,17 +31,21 @@ node <AGENT_MEMORY>/src/dream.js <subcommand> [flags]
 Current subcommands are:
 
 ```text
-init | migrate-model | ingest-harness | verify-sync | dream | weave | reflect |
-consolidate | budget | doctor | export-harness | record-projection | export-viz | stats
+init | migrate-model | ingest-harness | verify-sync | dream | weave |
+report-entities | apply-entities | report-aliases | apply-aliases |
+report-merges | apply-merges | report-salience | apply-salience |
+report-synthesis | apply-synthesis | consolidate | budget | doctor |
+export-harness | record-projection | export-viz | stats | config
 ```
 
 Important flags verified against `src/dream.js`:
 - `ingest-harness --file <snapshot.json> [--prune] [--as-of <iso>]`
 - `verify-sync --file <snapshot.json>`
 - `dream [--advance-days N]`
-- `weave [--k N] [--sim N] [--as-of <iso>] [--llm] [--supersede]`
-- `reflect [--as-of <iso>] [--sim N]`
-- `consolidate [--sim N]`
+- `weave [--k N] [--sim N] [--as-of <iso>] [--supersede]`
+- `report-entities|report-aliases|report-merges|report-salience|report-synthesis [--as-of <iso>]`
+- `apply-entities|apply-aliases|apply-merges|apply-salience|apply-synthesis --file <decisions.json>`
+- `consolidate [--sim N]` (alias of `report-merges`)
 - `export-harness [--as-of <iso>]`
 - `record-projection --file <projection.json>`
 
@@ -55,10 +59,9 @@ Important flags verified against `src/dream.js`:
 - `MEMORY_MODEL_CACHE` overrides the local model cache; otherwise `<dataDir>/model-cache`.
 - `MEMORY_MODEL` selects the embedding model; default `Xenova/all-MiniLM-L6-v2`.
 - `MEMORY_EMBED_DIM` defaults to `384`.
-- `DREAM_LLM` enables the judgment layer used by `reflect` / typed extraction.
 
-### Behavioral configuration — the five knobs (`src/tuning.js`)
-Behavior is controlled by **five user-facing knobs**, resolved with precedence
+### Behavioral configuration — the four knobs (`src/tuning.js`)
+Behavior is controlled by **four user-facing knobs**, resolved with precedence
 **env override → persisted `memory.config.json` → built-in default**. The defaults ship the
 intended three-tier experience (no flags needed). Inspect/set them with the `config` subcommand:
 
@@ -73,11 +76,10 @@ node <AGENT_MEMORY>/src/dream.js config set <knob> <value>
 | `retention` | **preserve** / prune | preserve = tiered demote-to-Tier3 (never delete); prune = legacy destructive |
 | `capacity` | compact / **standard** / expansive | Tier-1 target/max + Tier-2 cap (250/500/2500) |
 | `forgetting` | slow / **natural** / fast | half-life multiplier (×2 / ×1 / ×0.5) |
-| `judgment` | **off** / `<provider>:<model>` | engine-internal `DREAM_LLM` judge for headless runs; **off** ⇒ the host LLM running this skill judges via `consolidate` |
 | `connections` | **incremental** / thorough | incremental vs full nightly weave |
 
 Correction lineage (`supersedes` edges) is **always on** — not a knob (`MEMORY_SUPERSEDE` is a
-bench-only override). Raw `MEMORY_*` / `DREAM_LLM` env vars still override any knob (bench/CI
+bench-only override). Raw `MEMORY_*` env vars still override low-level behavior (bench/CI
 escape hatch). The legacy flag names referenced below (`MEMORY_TIER2_MAX`, `MEMORY_MERGE_KEEP`,
 `MEMORY_INCREMENTAL_WEAVE`, `MEMORY_SUPERSEDE`) are those override hooks — out of the box they
 are now driven by the knobs above, with tiered retention **on by default**.
@@ -95,13 +97,13 @@ Cold storage. A demoted fact keeps its raw text with `notes='archive'` but loses
 
 ### Design principles to preserve
 - **Embed once.** Do not re-embed the whole bank nightly; reuse stored vectors and embed only new/changed text.
-- **Bound nightly cost.** With `MEMORY_INCREMENTAL_WEAVE=1`, weave/reflect focus on new or dirty facts; Tier 3 is excluded from nightly graph/vector work.
+- **Bound nightly cost.** With `MEMORY_INCREMENTAL_WEAVE=1`, weave and report/apply passes focus on new or dirty facts; Tier 3 is excluded from nightly graph/vector work.
 - **Demote, don't delete.** Tier caps bound activation and retrieval competition, not total knowledge. Overflow moves down a tier.
 - **Gist for attention, detail for recall.** Merge writes a `gist` survivor for Tier 1 and, with `MEMORY_MERGE_KEEP=1`, retains dated constituents as `detail` in Tier 2.
 - **Recall returns neighbors.** Retrieval must surface connected clusters (`mentions`, `related_to`, `supersedes`, gist↔detail), because synthesis questions need related evidence.
 - **Merge preserves temporal sequence.** The gist may summarize, but dated detail must survive so "what changed" and "what is latest" remain answerable.
 - **Relevance order is primary.** Do not globally reorder retrieved context by time; temporal age is metadata. A global gist-then-timeline reorder regressed factual and synthesis answers.
-- **No fabrication.** LLM judgment decides types, aliases, merges, and importance only over existing memory content.
+- **No fabrication.** Caller judgment decides types, aliases, merges, and importance only over existing memory content.
 
 ## Data model — two node kinds
 - **FACT node** — `kind='fact'`, signature `fact:<slug>`, `memory_id` = the harness id when projected. Carries `strength`; decays/reactivates; can project to the harness unless marked `detail` or `archive`. Storage is keyed on `memory_id`, never on signature.
@@ -124,20 +126,19 @@ Cold storage. A demoted fact keeps its raw text with `notes='archive'` but loses
 
 **Schema-accelerated consolidation:** facts attached to established, specific entity schemas consolidate faster and decay slower. Ubiquitous connectors do not carry discriminating schema signal.
 
-**Promotion ≠ importance.** Repetition can make a fact durable; it does not make it salient. Salience comes from `category: decision` or LLM/agent judgment over genuinely high-stakes content.
+**Promotion ≠ importance.** Repetition can make a fact durable; it does not make it salient. Salience comes from `category: decision` or caller judgment over genuinely high-stakes content.
 
 **Evaporation/demotion:** legacy single-tier mode can tombstone faded facts. In tiered retention mode (`MEMORY_MERGE_KEEP=1` or `MEMORY_TIER2_MAX>0`), destructive eviction is replaced by demotion to Tier 3 wherever the engine is preserving retained knowledge.
 
 ## Tool (deterministic) vs Agent (judgment)
-- **Tool — reproducible, no LLM** (`src/dream.js`): ingest, verify, decay, auto-reactivate, evaporate/demote, co-mention + vector weave, incremental graph maintenance, budget, doctor, export, viz.
-- **Agent — judgment, during a run**: canonical entity resolution and alias review; confirming/typing structural edges and writing bridge facts; confirming merge candidates from `consolidate`; rewriting fact prose to name neighbors. **No fabrication** — a rewrite/bridge may only assert what existing memories entail.
-- **LLM judgment (`reflect`)**: when `DREAM_LLM` is configured, salience tagging and semantic merge decisions can run headlessly. The model is a judge, not an author.
+- **Tool — reproducible, no network calls** (`src/dream.js`): ingest, verify, decay, auto-reactivate, evaporate/demote, co-mention + vector weave, report candidate JSON, deterministic apply, graph maintenance, budget, doctor, export, viz.
+- **Agent/caller — judgment, during a run**: reads `report-*` JSON, decides entity typing, aliases, salience, merges, and synthesis groups, then passes decision JSON to `apply-*`. **No fabrication** — a decision may only assert what existing memories entail.
 
 ## How two nodes are linkable
 Two nodes are linkable when they **share a referent**. Signals, in priority:
 1. **Entity co-mention** (lexical + canonical/alias) → typed `fact→entity` edge.
 2. **Vector kNN** → candidate `fact↔fact` links. Commit `related_to` only when the pair also shares an entity; otherwise use low-confidence `similar_to`.
-3. **Model relation-typing** → typed structural edges + bridge facts, with no fabrication.
+3. **Caller relation-typing** → typed structural edges + bridge facts, with no fabrication.
 
 ## Nightly algorithm (stages — contract: input → output → invariant)
 
@@ -152,13 +153,18 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
    Decays active facts/edges, auto-reactivates subjects that reappeared, promotes episodic→semantic when schema/repetition warrants it, evaporates or demotes according to retention mode and tier pressure, prunes old tombstones/weak edges, sets `last_dream`, and reports budget/tier counts.
 
 4. **WEAVE (connect active facts).**
-   `node <AGENT_MEMORY>/src/dream.js weave` (add `--llm` when `DREAM_LLM` is set; `--supersede` or `MEMORY_SUPERSEDE=1` enables correction lineage).
-   With `MEMORY_INCREMENTAL_WEAVE=1`, only new/dirty facts are woven; otherwise the pass can inspect the full active graph. It adds `mentions`, corroborated `related_to`, low-confidence `similar_to`, and rescue links so active facts have zero islands. `weave --llm` also runs typed entity extraction and alias canonicalization.
+   `node <AGENT_MEMORY>/src/dream.js weave` (`--supersede` or `MEMORY_SUPERSEDE=1` enables correction lineage).
+   With `MEMORY_INCREMENTAL_WEAVE=1`, only new/dirty facts are woven; otherwise the pass can inspect the full active graph. It adds `mentions`, corroborated `related_to`, low-confidence `similar_to`, and rescue links so active facts have zero islands.
 
-5. **REFLECT / CONSOLIDATE (judgment).**
-   - `node <AGENT_MEMORY>/src/dream.js reflect` — requires `DREAM_LLM`; scores salience and applies LLM-approved merges. In retain-detail mode, merge survivors become `gist` while constituents stay as `detail` for recall.
-   - `node <AGENT_MEMORY>/src/dream.js consolidate` — reports duplicate/rollup candidates for an agent to confirm manually. The agent should remember one richer canonical fact, forget/project constituents only after the new fact is safely stored, then re-ingest and re-weave.
-   - `node <AGENT_MEMORY>/src/dream.js budget` — reports active fact pressure, forecast, and recommended worklist.
+5. **REPORT → CALLER JUDGES → APPLY (all judgment surfaces).**
+   The engine is local-only. For each surface, run the report command, have the caller judge only the reported facts, write exactly the contracted decision JSON, then run the matching apply command:
+   - `report-entities` → `apply-entities --file decisions.json`
+   - `report-aliases` → `apply-aliases --file decisions.json`
+   - `report-salience` → `apply-salience --file decisions.json`
+   - `report-merges` (or `consolidate`) → `apply-merges --file decisions.json`
+   - `report-synthesis` → `apply-synthesis --file decisions.json` (caller owns any repeat loop)
+
+   Apply commands validate/sanitize decision JSON, mutate the db, and repair/re-weave as needed. Merge apply creates a `notes='gist'` survivor, retains constituents as `detail` when configured, stamps `vagueness`, and preserves `supersedes` lineage. Run `budget` to inspect pressure and prioritize merge work.
 
 6. **DOCTOR (health gate).**
    `node <AGENT_MEMORY>/src/dream.js doctor` — exits 3 if any active fact island or dangling edge remains. Must be clean before projecting.
