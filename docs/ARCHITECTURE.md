@@ -74,9 +74,10 @@ forgotten. When a specific question names a cold fact, the keyword tier surfaces
    single-tier (legacy) mode.
 
 4. **Gist for attention, detail for recall.** A merge writes a `gist` survivor for the
-   projection (Tier 1) and keeps the specific constituents as `detail` in Tier 2 (env
-   `MEMORY_MERGE_KEEP`). Synthesis/"what's the policy" hits the gist; "what exactly did
-   X commit to" retrieves the detail. Never let the gist *overwrite* the episode.
+   projection (Tier 1) and **always** keeps every constituent — including the survivor's
+   own pre-merge verbatim — as `detail` in Tier 2 (non-destructive by invariant, not a
+   flag). Synthesis/"what's the policy" hits the gist; "what exactly did X commit to"
+   retrieves the detail. The gist never *overwrites* an episode.
 
 5. **Recall returns NEIGHBORS — this is how we aid SYNTHESIS.** The graph layer exists
    so retrieval traverses: a hit pulls in its graph neighbors (shared-entity facts,
@@ -170,7 +171,6 @@ capacity/retention knobs in the table below are configurable.
 | `MEMORY_ENTRY_TARGET` | Tier-1 projection target (~250–500).                   |
 | `MEMORY_ENTRY_MAX`    | Tier-1 hard cap (legacy single-tier eviction).         |
 | `MEMORY_TIER2_MAX`    | Tier-2 (RAG) cap; overflow → Tier-3 archive. 0 = off.  |
-| `MEMORY_MERGE_KEEP=1` | Non-destructive merge: keep `detail` constituents.     |
 | `DREAM_LLM`           | Model spec for the judgment layer (typed extract,      |
 |                       | canonicalization, salience, merge). Empty = mechanical.|
 | `MEMORY_SUPERSEDE=1`  | Supersede-aware consolidation (corrections).           |

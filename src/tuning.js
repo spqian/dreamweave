@@ -124,8 +124,10 @@ function resolve(env = process.env) {
   const entryTarget = numEnv(env.MEMORY_ENTRY_TARGET, cap.target);
   const entryMax    = numEnv(env.MEMORY_ENTRY_MAX, cap.max);
   const tier2Max    = numEnv(env.MEMORY_TIER2_MAX, preserve ? cap.tier2 : 0);
-  const keepDetail  = boolEnv(env.MEMORY_MERGE_KEEP, preserve);
-  const tiered      = keepDetail || tier2Max > 0;
+  // NOTE: merge is now ALWAYS non-destructive (constituents are retained as Tier-2
+  // 'detail', never deleted or overwritten) — there is no merge-keep flag. The
+  // retention knob governs only the decay/over-cap forgetting lifecycle via tier2Max.
+  const tiered      = tier2Max > 0;
 
   const forgetMultiplier = numEnv(env.MEMORY_FORGET_MULT, FORGETTING[knobs.forgetting] ?? 1);
   const incrementalWeave = boolEnv(env.MEMORY_INCREMENTAL_WEAVE, knobs.connections !== "thorough");
@@ -134,7 +136,7 @@ function resolve(env = process.env) {
 
   return {
     knobs, configPath: CONFIG_PATH, configExists: configExists(),
-    entryTarget, entryMax, tier2Max, tiered, keepDetail,
+    entryTarget, entryMax, tier2Max, tiered,
     forgetMultiplier, incrementalWeave, supersede, entityMinFacts,
   };
 }

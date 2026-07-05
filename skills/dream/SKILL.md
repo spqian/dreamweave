@@ -82,7 +82,7 @@ node <AGENT_MEMORY>/src/dream.js config set <knob> <value>
 
 Correction lineage (`supersedes` edges) is **always on** — not a knob (`MEMORY_SUPERSEDE` is a
 bench-only override). Raw `MEMORY_*` env vars still override low-level behavior (bench/CI
-escape hatch). The legacy flag names referenced below (`MEMORY_TIER2_MAX`, `MEMORY_MERGE_KEEP`,
+escape hatch). The legacy flag names referenced below (`MEMORY_TIER2_MAX`,
 `MEMORY_INCREMENTAL_WEAVE`, `MEMORY_SUPERSEDE`) are those override hooks — out of the box they
 are now driven by the knobs above, with tiered retention **on by default**.
 
@@ -101,7 +101,7 @@ Cold storage. A demoted fact keeps its raw text with `notes='archive'` but loses
 - **Embed once.** Do not re-embed the whole bank nightly; reuse stored vectors and embed only new/changed text.
 - **Bound nightly cost.** With `MEMORY_INCREMENTAL_WEAVE=1`, weave and report/apply passes focus on new or dirty facts; Tier 3 is excluded from nightly graph/vector work.
 - **Demote, don't delete.** Tier caps bound activation and retrieval competition, not total knowledge. Overflow moves down a tier.
-- **Gist for attention, detail for recall.** Merge writes a `gist` survivor for Tier 1 and, with `MEMORY_MERGE_KEEP=1`, retains dated constituents as `detail` in Tier 2.
+- **Gist for attention, detail for recall.** Merge writes a `gist` survivor for Tier 1 and **always** retains every dated constituent — including the survivor's own pre-merge verbatim — as `detail` in Tier 2 (non-destructive by invariant).
 - **Recall returns neighbors.** Retrieval must surface connected clusters (`mentions`, `related_to`, `supersedes`, gist↔detail), because synthesis questions need related evidence.
 - **Merge preserves temporal sequence.** The gist may summarize, but dated detail must survive so "what changed" and "what is latest" remain answerable.
 - **Relevance order is primary.** Do not globally reorder retrieved context by time; temporal age is metadata. A global gist-then-timeline reorder regressed factual and synthesis answers.
@@ -130,7 +130,7 @@ Cold storage. A demoted fact keeps its raw text with `notes='archive'` but loses
 
 **Promotion ≠ importance.** Repetition can make a fact durable; it does not make it salient. Salience comes from `category: decision` or caller judgment over genuinely high-stakes content.
 
-**Evaporation/demotion:** legacy single-tier mode can tombstone faded facts. In tiered retention mode (`MEMORY_MERGE_KEEP=1` or `MEMORY_TIER2_MAX>0`), destructive eviction is replaced by demotion to Tier 3 wherever the engine is preserving retained knowledge.
+**Evaporation/demotion:** legacy single-tier mode (retention=prune, `MEMORY_TIER2_MAX=0`) can tombstone faded/over-cap facts via decay. In tiered retention mode (`MEMORY_TIER2_MAX>0`), destructive eviction is replaced by demotion to Tier 3. Merge itself is **always** non-destructive regardless of mode.
 
 ## Tool (deterministic) vs Agent (judgment)
 - **Tool — reproducible, no network calls** (`src/dream.js`): ingest, verify, decay, auto-reactivate, evaporate/demote, co-mention + vector weave, report candidate JSON, deterministic apply, graph maintenance, budget, doctor, export, viz.

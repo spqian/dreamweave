@@ -1116,10 +1116,9 @@ async function applyAliases(db, raw, opts = {}) {
 }
 
 function reportSalience(db) {
-  const keepDetail0 = T.keepDetail;
-  const notColdSql = keepDetail0
-    ? " AND (notes IS NULL OR notes NOT IN ('detail','archive'))"
-    : " AND (notes IS NULL OR notes<>'archive')";
+  // Merge is always non-destructive: demoted 'detail' constituents always exist and
+  // must never be re-surfaced as salience candidates.
+  const notColdSql = " AND (notes IS NULL OR notes NOT IN ('detail','archive'))";
   const incrementalR = T.incrementalWeave;
   const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
   const newOnlySql = incrementalR ? ` AND first_seen > '${lastReflect.replace(/'/g, "")}'` : "";
@@ -1154,7 +1153,7 @@ function applySalience(db, raw, opts = {}) {
 async function reportMerges(db, opts = {}) {
   const incrementalR = T.incrementalWeave;
   const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : null;
-  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: T.keepDetail, seedAfter: incrementalR ? lastReflect : null });
+  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: true, seedAfter: incrementalR ? lastReflect : null });
   return { surface: "merges", clusters: cons.clusters || [] };
 }
 
@@ -1177,8 +1176,7 @@ function cleanMergeDecisions(db, raw) {
 async function applyMerges(db, raw, opts = {}) {
   const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
   const decisions = cleanMergeDecisions(db, raw);
-  let clustersMerged = 0, reclaimed = 0, retained = 0;
-  const keepDetail = T.keepDetail || (opts && opts.keepDetail);
+  let clustersMerged = 0, retained = 0;
   const dispBySurvivor = new Map();
   const lossBySurvivor = new Map();
   for (const dec of decisions) {
@@ -1218,10 +1216,24 @@ async function applyMerges(db, raw, opts = {}) {
         return (Number.isFinite(t) && (m == null || t < m.t)) ? { t, s: n.first_seen } : m;
       }, null);
       const survFirstSeen = (minFirstSeen && minFirstSeen.s) || survivor.first_seen;
+      // NON-DESTRUCTIVE MERGE. The survivor node is rewritten into the Tier-1 gist,
+      // but its ORIGINAL verbatim is NEVER lost: we clone it into a Tier-2 'detail'
+      // (exactly like every other member) so completed-action / state-transition
+      // facts (e.g. "I sent X" vs "do not send X until approved") stay recoverable.
+      const survOrig = { fact: survivor.fact, text: survivor.text || survivor.fact, class: survivor.class || "semantic", salience: survivor.salience || "", strength: survivor.strength || 0, reactivations: survivor.reactivations || 0, first_seen: survivor.first_seen };
       db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist' WHERE id=?")
         .run(dec.fact, dec.fact, anySalient ? "salient" : (survivor.class === "episodic" ? "semantic" : survivor.class),
           anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, survivor.id);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
+      // Preserve the survivor's own pre-merge verbatim as a detail of the new gist
+      // (memory_id='' — details are archival, not projected to the flat harness).
+      const survCloneSig = uniqueSig(db, `fact:${deriveSlug(survOrig.fact || survivor.signature)}`);
+      db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.strength, survOrig.reactivations, survOrig.first_seen, now, now, "detail", survOrig.fact, survOrig.text);
+      db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", survCloneSig, 0.6, now, now);
+      db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(survCloneSig, survivor.signature, survOrig.first_seen);
+      retained += 1;
       for (const m of members) {
         if (m.id === survivor.id) continue;
         for (const e of db.prepare("SELECT dst, rel, weight FROM edges WHERE src=? AND rel='mentions'").all(m.signature)) {
@@ -1236,28 +1248,18 @@ async function applyMerges(db, raw, opts = {}) {
           if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(nsrc, e.rel, ndst, e.weight, now, now);
         }
         db.prepare("DELETE FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").run(m.signature, m.signature);
-        if (keepDetail) {
-          db.prepare("UPDATE nodes SET notes='detail', last_reactivated=? WHERE id=?").run(now, m.id);
-          const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='related_to' AND dst=?").get(survivor.signature, m.signature);
-          if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", m.signature, 0.6, now, now);
-          db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(m.signature, survivor.signature, now);
-          db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) SELECT detail_sig, ?, first_seen FROM detail_of WHERE gist_sig=? AND detail_sig<>?").run(survivor.signature, m.signature, survivor.signature);
-          db.prepare("DELETE FROM detail_of WHERE gist_sig=?").run(m.signature);
-          retained += 1;
-        } else {
-          db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(m.signature, m.memory_id || "", now, `merged into ${survivor.signature}`);
-          db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
-          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(m.id));
-          db.prepare("DELETE FROM nodes WHERE id=?").run(m.id);
-          db.prepare("DELETE FROM detail_of WHERE detail_sig=? OR gist_sig=?").run(m.signature, m.signature);
-          reclaimed += 1;
-        }
+        // Always demote members to Tier-2 'detail' (never delete): full-fidelity invariant.
+        db.prepare("UPDATE nodes SET notes='detail', last_reactivated=? WHERE id=?").run(now, m.id);
+        const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='related_to' AND dst=?").get(survivor.signature, m.signature);
+        if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", m.signature, 0.6, now, now);
+        db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(m.signature, survivor.signature, now);
+        db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) SELECT detail_sig, ?, first_seen FROM detail_of WHERE gist_sig=? AND detail_sig<>?").run(survivor.signature, m.signature, survivor.signature);
+        db.prepare("DELETE FROM detail_of WHERE gist_sig=?").run(m.signature);
+        retained += 1;
       }
       const disp = dispBySurvivor.get(dec.survivorSig);
       const loss = lossBySurvivor.get(dec.survivorSig);
-      const detailCount = keepDetail
-        ? (db.prepare("SELECT count(*) c FROM detail_of WHERE gist_sig=?").get(survivor.signature) || {}).c || members.length
-        : members.length;
+      const detailCount = (db.prepare("SELECT count(*) c FROM detail_of WHERE gist_sig=?").get(survivor.signature) || {}).c || members.length;
       const dispTerm = disp != null ? disp * Math.log2(1 + detailCount) : 0;
       let vagueness = null;
       if (loss && loss.dropped > 0) vagueness = clamp01(0.5 + 0.5 * (loss.dropped / loss.total));
@@ -1272,7 +1274,7 @@ async function applyMerges(db, raw, opts = {}) {
   const weaveResult = await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf }));
   setMeta(db, "last_reflect", now);
   repairGraph(db);
-  return { surface: "merges", decisions: decisions.length, clusters_merged: clustersMerged, entries_reclaimed: reclaimed, details_retained: retained, weave: weaveResult };
+  return { surface: "merges", decisions: decisions.length, clusters_merged: clustersMerged, entries_reclaimed: 0, details_retained: retained, weave: weaveResult };
 }
 
 function reportSynthesis(db, opts = {}) {
@@ -1670,7 +1672,7 @@ function configCmd(argv) {
     const r = tuning.resolve();
     return {
       configPath: r.configPath, configExists: r.configExists, knobs: r.knobs,
-      resolved: { entryTarget: r.entryTarget, entryMax: r.entryMax, tier2Max: r.tier2Max, tiered: r.tiered, keepDetail: r.keepDetail, forgetMultiplier: r.forgetMultiplier, incrementalWeave: r.incrementalWeave, supersede: r.supersede },
+      resolved: { entryTarget: r.entryTarget, entryMax: r.entryMax, tier2Max: r.tier2Max, tiered: r.tiered, forgetMultiplier: r.forgetMultiplier, incrementalWeave: r.incrementalWeave, supersede: r.supersede },
       summary: tuning.describe(r),
     };
   }

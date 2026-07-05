@@ -102,7 +102,7 @@ Restart so it picks up the new `dream` and `graph-recall` skills.
 ## Precedence & power-user overrides
 Resolution order is **env override → persisted `memory.config.json` → built-in default**. Every
 knob still has a raw env escape hatch (`MEMORY_TIER2_MAX`, `MEMORY_ENTRY_TARGET/MAX`,
-`MEMORY_MERGE_KEEP`, `MEMORY_FORGET_MULT`, `MEMORY_INCREMENTAL_WEAVE`, `MEMORY_SUPERSEDE`,
+`MEMORY_FORGET_MULT`, `MEMORY_INCREMENTAL_WEAVE`, `MEMORY_SUPERSEDE`,
 `DREAM_LLM`) so benches / CI can pin exact low-level values without touching the config file.
 
 ## Uninstall

@@ -53,11 +53,10 @@ r = T.resolve({
   MEMORY_ENTRY_TARGET: "999",
   MEMORY_FORGET_MULT: "0.25",
   MEMORY_TIER2_MAX: "0",
-  MEMORY_MERGE_KEEP: "0",
 });
 chk(r.entryTarget === 999, "env MEMORY_ENTRY_TARGET overrides capacity profile");
 chk(r.forgetMultiplier === 0.25, "env MEMORY_FORGET_MULT overrides forgetting knob");
-chk(r.tiered === false, "env can force single-tier (TIER2_MAX=0 + MERGE_KEEP=0)");
+chk(r.tiered === false, "env can force single-tier (TIER2_MAX=0)");
 
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
 console.log(ok ? "\nPASS ✓ tuning resolver" : "\nFAILED ✗");
