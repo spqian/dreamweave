@@ -130,6 +130,52 @@ function collapseKeys(fact, enumerative) {
   return keys;
 }
 
+// Significant query terms shared by the lexical-seed channel and the Tier-3 keyword tiers.
+// Mirrors the `terms` extraction downstream (kept in one place so both stay in sync).
+function significantTerms(query, limit) {
+  return [...new Set((String(query || "").toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) || []).filter((t) => !STOP.has(t)))].slice(0, limit || 10);
+}
+
+// HYBRID LEXICAL SEEDS. Dense cosine seeding buries a specific committed fact whose long
+// sentence dilutes its embedding (measured: the gold q122 answer sits at cosine rank #9)
+// beneath ~100 generic near-duplicate restatements of the same standing posture — even
+// though that fact UNIQUELY carries the query's discriminating terms (lexical rank #1, 5
+// term hits vs <=3 for every competitor). A pure term-overlap LIKE scan over ACTIVE facts
+// surfaces such a fact. We return its strongest matches as SUPPLEMENTARY seeds: they are
+// ADDED to (never substituted for) the cosine seeds, so a purely-semantic query is
+// unchanged, while a lexically-distinctive fact gets pulled into the graph walk where the
+// downstream cosine-dominant activation ranker can float it. Additive by construction, so
+// the blast radius is bounded — an off-topic lexical coincidence merely adds a node the
+// ranker scores low. `minHitsFloor`/`budget` are exposed for testing.
+function selectLexicalSeeds(db, query, opts = {}) {
+  const budget = opts.budget != null ? opts.budget : 2;
+  const terms = opts.terms || significantTerms(query);
+  if (terms.length < 2 || budget <= 0) return [];
+  // Require a lexically-distinctive match: at least 2 terms, and at least ~40% of the
+  // query's significant terms — enough to demand the fact is ABOUT the query, not a
+  // one-token coincidence, without over-fitting to any single question.
+  const minHits = Math.max(opts.minHitsFloor || 2, Math.ceil(terms.length * 0.4));
+  const perTerm = terms.map(() => "(lower(fact) LIKE ?)");
+  const hitExpr = perTerm.map((p) => `(CASE WHEN ${p} THEN 1 ELSE 0 END)`).join(" + ");
+  const likeParams = terms.map((t) => `%${t}%`);
+  const rows = db.prepare(
+    `SELECT signature, COALESCE(strength, 0) AS strength, (${hitExpr}) AS hits
+     FROM nodes
+     WHERE kind='fact' AND (notes IS NULL OR notes <> 'archive') AND (${perTerm.join(" OR ")})
+     ORDER BY hits DESC, strength DESC
+     LIMIT 100`
+  ).all(...likeParams, ...likeParams);
+  const exclude = opts.exclude instanceof Set ? opts.exclude : new Set(opts.exclude || []);
+  const out = [];
+  for (const r of rows) {
+    if (r.hits < minHits) break; // rows are hit-desc, so once below floor all remaining are too
+    if (exclude.has(r.signature)) continue;
+    out.push({ signature: r.signature, hits: r.hits, strength: r.strength });
+    if (out.length >= budget) break;
+  }
+  return out;
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (!args.query.trim()) {
@@ -190,7 +236,17 @@ async function main() {
     .map((x) => x.r);
 
   const seedRows = rankedKnn.slice(0, args.seedLimit);
-  const seeds = seedRows.map((r) => r.signature);
+  const cosineSeeds = seedRows.map((r) => r.signature);
+
+  // Supplement the cosine seeds with lexically-distinctive ACTIVE facts (hybrid dense+sparse
+  // seeding). ADDITIVE: cosine seeds are never displaced, so semantic-only queries are
+  // unchanged; a fact that uniquely carries the query's discriminating terms but has merely
+  // mediocre cosine (long-sentence embedding dilution, drowned in a dense restatement cluster)
+  // now seeds the walk and can be floated by the downstream activation ranker.
+  const lexSeedRows = selectLexicalSeeds(db, args.query, { exclude: new Set(cosineSeeds), budget: 2 });
+  const lexSeeds = lexSeedRows.map((r) => r.signature);
+  const lexSeedSet = new Set(lexSeeds);
+  const seeds = [...cosineSeeds, ...lexSeeds];
 
   // Graph expansion runs only when we have vector seeds; but the Tier-3 keyword search
   // below MUST run regardless (an archive-only DB, or a query whose answer was demoted,
@@ -715,6 +771,8 @@ async function main() {
   // below same-topic gist/episodic while leaving high-cosine detail (exact-figure lookups whose closest
   // match IS the detail) reachable. The specifics/enumeration path (tiers 2e/2f, active_time/anchor_day)
   // sets its own boosted activation and bypasses this, so intentional detail surfacing is unaffected.
+  // A LEXICALLY-SEEDED detail is likewise an intentional surfacing (the query's discriminating terms
+  // matched it directly), so it is exempted from this penalty upstream (see isDetail computation).
   const ACT_DETAIL_PENALTY = 0.12;
   const histIntent = /\b(origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
   const activationOf = (c, s, superseded, detail) => {
@@ -730,7 +788,7 @@ async function main() {
     const d = ageDays(r.first_seen, nowRef);
     const sup = supersededBy.get(r.signature);
     const cos = cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0;
-    const isDetail = !!(r.notes && /\bdetail\b/.test(r.notes));
+    const isDetail = !!(r.notes && /\bdetail\b/.test(r.notes)) && !lexSeedSet.has(r.signature);
     const activation = activationOf(cos, r.strength, !!sup, isDetail);
     return {
       id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
@@ -742,7 +800,7 @@ async function main() {
       superseded_by: sup ? sup.survivor : null,
       tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
       vagueness: (r.notes && /\bgist\b/.test(r.notes) && r.vagueness != null) ? Number(r.vagueness.toFixed(3)) : undefined,
-      via: r.via || undefined,
+      via: r.via || (lexSeedSet.has(r.signature) ? "lexical" : undefined),
       chain_id: chainIdBySig.has(r.signature) ? chainIdBySig.get(r.signature) : undefined,
       observed_count: (r.observed_count && r.observed_count > 1) ? r.observed_count : undefined,
       observed_since: (r.observed_count && r.observed_count > 1) ? (r.observed_since || null) : undefined,
@@ -859,4 +917,4 @@ if (require.main === module) {
   main().catch((e) => { console.error("SEARCH ERROR:", e); process.exit(1); });
 }
 
-module.exports = { parseDateRange };
+module.exports = { parseDateRange, selectLexicalSeeds, significantTerms };
