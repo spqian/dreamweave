@@ -255,19 +255,21 @@ async function main() {
   let clusterRows = [];
   if (seeds.length > 0) {
     const seedsJson = JSON.stringify(seeds);
+    // The graph is undirected for recall, so we walk edges in BOTH directions. Earlier this
+    // materialised a `bidir` UNION view over the whole edges table and joined the recursive walk
+    // against it — but a CTE-derived view is not indexable, so every recursion step full-scanned
+    // ~2x the edge count (measured 17s over a 1.16M-edge store). Joining the base `edges` table
+    // directly in two recursive terms lets SQLite use idx_edges_src / idx_edges_dst, so each step
+    // touches only the local frontier (measured 2.5s, byte-identical reachable set). maxHops is
+    // bound twice (once per direction term).
     clusterRows = db.prepare(`
       WITH RECURSIVE
-      bidir(a, b, rel, weight) AS (
-        SELECT src, dst, rel, weight FROM edges
-        UNION ALL
-        SELECT dst, src, rel, weight FROM edges
-      ),
       walk(sig, hops) AS (
         SELECT value, 0 FROM json_each(?)
         UNION
-        SELECT b.b, walk.hops + 1
-        FROM walk JOIN bidir b ON b.a = walk.sig
-        WHERE walk.hops < ?
+        SELECT e.dst, walk.hops + 1 FROM walk JOIN edges e ON e.src = walk.sig WHERE walk.hops < ?
+        UNION
+        SELECT e.src, walk.hops + 1 FROM walk JOIN edges e ON e.dst = walk.sig WHERE walk.hops < ?
       )
       SELECT w.sig AS signature, MIN(w.hops) AS hops,
              COALESCE(n.strength, 0) AS strength, n.class AS class, n.fact AS fact, n.kind AS kind,
@@ -276,7 +278,7 @@ async function main() {
       GROUP BY w.sig
       ORDER BY hops ASC, strength DESC, signature ASC
       LIMIT ?
-    `).all(seedsJson, args.maxHops, args.nodeLimit);
+    `).all(seedsJson, args.maxHops, args.maxHops, args.nodeLimit);
   }
 
   // 1b) SEQUENCE-CHAIN EXPANSION. A `sequence` edge records the temporally-ordered evolution of

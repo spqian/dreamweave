@@ -35,6 +35,7 @@ function ensureSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
     CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
+    CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(rel);
 
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 
