@@ -67,7 +67,8 @@ const VIZ_OUT = cfg.VIZ_OUT;           // per-user rendered output
 
 const HALFLIFE = { salient: 365, semantic: 180, episodic: 3 };
 const INIT = { salient: 0.90, semantic: 0.70, episodic: 0.30 };
-const CAT2CLASS = { decision: "salient", fact: "semantic", context: "episodic", preference: "semantic" };
+// No CAT2CLASS: the ingest surface may NOT assert class. Every harness memory enters as
+// episodic; the engine earns semantic (reactivation) and salient (the dream salience judge).
 const CLASS2CAT = { salient: "decision", semantic: "fact", episodic: "context" };
 const FORGET = 0.15;
 const EDGE_DECAY = { mentions: 1.0, related_to: 0.985, similar_to: 0.97, supersedes: 1.0, sequence: 1.0, default: 0.99 }; // multiplicative per run
@@ -353,7 +354,12 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
         // else: fully unchanged (fact, salience, not archived) -> SKIP the no-op write.
         res.refreshed += 1; continue;
       }
-      const cls = CAT2CLASS[category] || "semantic";
+      // The surface (harness) emits raw EPISODIC traces only — it may not assert importance.
+      // Every ingested memory enters episodic; the engine's dreaming EARNS the higher classes:
+      // semantic via reactivation (durability from repetition) and salient ONLY via the nightly
+      // salience judge. `category` is retained below as a display label (in the salience column),
+      // never as a class, so a harness 'decision' tag can't pin low-stakes daily-life facts.
+      const cls = "episodic";
       const sig = uniqueSig(db, `fact:${deriveSlug(fact)}`);
       const id = nextId(db);
       insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], fs, now, now, "harness-ingest", fact, "");
@@ -440,9 +446,9 @@ function verifySync(db, file) {
 const SCHEMA_FULL = 6;            // entity mentioned by >=6 *specific* facts = fully-established schema
 const SCHEMA_UBIQUITOUS = 0.20;   // entities mentioned by > this fraction of facts are generic connectors
 const SCHEMA_HALFLIFE_BONUS = 0.6; // up to +60% half-life for a fully schema-embedded fact
-// NOTE: salient is an IMPORTANCE class (Sev1/2, security, exec decision), set at encoding
-// (category 'decision') or by AGENT content-elevation during the dream — never auto-earned by
-// reactivation frequency. Repetition makes facts durable (semantic), not important.
+// NOTE: salient is an IMPORTANCE class (Sev1/2, security, exec decision), earned ONLY by the
+// dream's salience judgment (applySalience) — never asserted by the ingest surface and never
+// auto-earned by reactivation frequency. Repetition makes facts durable (semantic), not important.
 
 function computeSchemaFit(db) {
   const factCount = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c || 1;
@@ -529,9 +535,9 @@ function dreamCore(db, flags) {
     const reacts = s.reactivations + 1; // exactly one per run
     let cls = s.class;
     // Repetition builds DURABILITY: episodic -> semantic (schema-accelerated). It does NOT
-    // confer IMPORTANCE: there is no auto path to 'salient' — salient is an importance tag set
-    // at encoding (category 'decision') or by agent content-elevation (Sev1/2, security, exec
-    // decision) during the dream judgment phase. Frequency != criticality.
+    // confer IMPORTANCE: there is no auto path to 'salient' — salient is set ONLY by the dream's
+    // salience judgment (agent content-elevation: Sev1/2, security, exec decision, core
+    // identity/role, hard deadline). The ingest surface cannot assert it. Frequency != criticality.
     if (cls === "episodic" && reacts >= promoThreshold(sf)) {
       cls = "semantic"; promoSem += 1;
       J("reinforce", s.signature, `PROMOTE episodic->semantic (reacts=${reacts}, schema=${sf.toFixed(2)}, thresh=${promoThreshold(sf)})`);

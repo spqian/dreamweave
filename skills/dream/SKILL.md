@@ -120,7 +120,7 @@ Cold storage. A demoted fact keeps its raw text with `notes='archive'` but loses
 - **Invariants** checked by `doctor`: every active FACT node has degree ≥ 1 (zero islands); every edge endpoint resolves to a node (no dangling). Tier 3 archive rows are intentionally edgeless and excluded from island checks.
 
 ## Strength model (forgetting curve) — active FACT nodes
-`S ∈ [0,1]`. **Class & initial S:** salient (Sev1/2, security, exec/architectural decision, big business value) `0.90`; semantic (identity/role, how a system works, ownership, durable lesson, stable preference) `0.70`; episodic (point-in-time status, JIT/approval snapshots, who's-on-call) `0.30`. The initial class comes from the harness `category` (`decision→salient`, `fact→semantic`, `context→episodic`, `preference→semantic`).
+`S ∈ [0,1]`. **Every ingested memory enters as EPISODIC** (initial `S=0.30`) — the surface emits raw traces and may not assert importance. The engine EARNS the higher classes during dreaming: **semantic** (`0.70`-band: identity/role, how a system works, ownership, durable lesson, stable preference) via reactivation/repetition, and **salient** (`0.90`-band: Sev1/2, security, exec/architectural decision, big business value, core identity/role, hard deadline) ONLY via the nightly salience judge. The harness `category` (decision/fact/context/preference) is retained as a display label but no longer sets the class.
 
 **Decay** (once/run, active facts): `S ← S·2^(−Δdays/H_eff)`; base `H` = 365 / 180 / 3. Edges decay too (`related_to`/`similar_to` faster); edges with `weight<0.10` are pruned.
 
@@ -128,7 +128,7 @@ Cold storage. A demoted fact keeps its raw text with `notes='archive'` but loses
 
 **Schema-accelerated consolidation:** facts attached to established, specific entity schemas consolidate faster and decay slower. Ubiquitous connectors do not carry discriminating schema signal.
 
-**Promotion ≠ importance.** Repetition can make a fact durable; it does not make it salient. Salience comes from `category: decision` or caller judgment over genuinely high-stakes content.
+**Promotion ≠ importance.** Repetition can make a fact durable (episodic→semantic); it does not make it salient. Salience comes ONLY from caller judgment (the nightly salience surface) over genuinely high-stakes content — never from the harness `category`.
 
 **Evaporation/demotion:** legacy single-tier mode (retention=prune, `MEMORY_TIER2_MAX=0`) can tombstone faded/over-cap facts via decay. In tiered retention mode (`MEMORY_TIER2_MAX>0`), destructive eviction is replaced by demotion to Tier 3. Merge itself is **always** non-destructive regardless of mode.
 

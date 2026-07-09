@@ -160,7 +160,9 @@ Run these in order (the **`dream`** skill orchestrates them with the host's memo
 
 ```bash
 # 1. WAKE: dump your agent's memories to snapshot.json  →  [{ id, fact, category }]
-#    category ∈ decision (salient) | fact (semantic) | context (episodic) | preference
+#    category ∈ decision | fact | context | preference  (a DISPLAY label only)
+#    NB: category no longer sets the memory class — every ingested memory enters EPISODIC;
+#    the nightly dream EARNS semantic (repetition) and salient (its salience judgment).
 
 # 2. INGEST + verify (lossless, memory_id-keyed)
 node src/dream.js ingest-harness --file snapshot.json
