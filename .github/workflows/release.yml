@@ -1,0 +1,117 @@
+name: Release package
+
+# Builds a downloadable, source-only install zip that a user can unzip and
+# hand to their OpenClaw/Scout agent ("import this") — the agent follows
+# INSTALL.md, runs `npm install && npm run setup`, and wires up the skills.
+#
+# The zip is intentionally source-only: the native deps (better-sqlite3,
+# sqlite-vec) are platform/arch/Node-version specific and are built by the
+# user's `npm install`, exactly as INSTALL.md documents.
+#
+#   * Push a tag `vX.Y.Z`  -> builds the zip AND publishes a GitHub Release.
+#   * Run manually         -> builds the zip and uploads it as a workflow
+#                             artifact (no release), for a dry run / preview.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the zip (e.g. v0.1.0). Defaults to package.json version."
+        required: false
+        type: string
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Smoke test (native build + engine)
+        run: npm test
+
+      - name: Resolve version + package name
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            VER="v$(node -p "require('./package.json').version")"
+          fi
+          echo "version=${VER}"        >> "$GITHUB_OUTPUT"
+          echo "name=dreamweave-${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build install zip
+        run: |
+          NAME="${{ steps.ver.outputs.name }}"
+          # git archive honors the `export-ignore` rules in .gitattributes, so
+          # dev-only paths (bench/, .github/, dotfiles) are dropped, and only
+          # committed files are ever included (no scratch/db/log leakage).
+          git archive --format=zip --prefix="${NAME}/" -o "${NAME}.zip" HEAD
+          echo "ZIP=${NAME}.zip" >> "$GITHUB_ENV"
+
+      - name: Verify zip contents
+        run: |
+          NAME="${{ steps.ver.outputs.name }}"
+          echo "--- package contents ---"
+          unzip -l "${NAME}.zip"
+          # Required files that make the package installable/runnable.
+          for f in \
+            "${NAME}/INSTALL.md" \
+            "${NAME}/README.md" \
+            "${NAME}/LICENSE" \
+            "${NAME}/package.json" \
+            "${NAME}/package-lock.json" \
+            "${NAME}/setup.js" \
+            "${NAME}/config.js" \
+            "${NAME}/src/dream.js" \
+            "${NAME}/skills/dream/SKILL.md" \
+            "${NAME}/skills/graph-recall/SKILL.md"; do
+            if ! unzip -l "${NAME}.zip" | grep -qE " ${f}\$"; then
+              echo "::error::missing required file in package: ${f}"
+              exit 1
+            fi
+          done
+          # Guard against dev-only paths leaking into the package.
+          if unzip -l "${NAME}.zip" | grep -qE " ${NAME}/(bench|\.github)/"; then
+            echo "::error::dev-only path leaked into package"
+            exit 1
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.name }}
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "${{ env.ZIP }}" \
+            --title "dreamweave ${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --notes "Download **${{ env.ZIP }}** below, unzip it, and tell your OpenClaw/Scout (Clawpilot) agent to *import this* — it will detect \`INSTALL.md\` and set everything up (\`npm install && npm run setup\`, install the \`dream\` + \`graph-recall\` skills, then interview you on the five behavioral knobs).
+
+          **Prerequisites:** Node >= 18, and a toolchain that can build \`better-sqlite3\` (prebuilt binaries cover most platforms). First run downloads a small embedding model once, then works offline.
+
+          Source-only by design: native deps are built by your \`npm install\`."

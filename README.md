@@ -100,8 +100,27 @@ degrades gracefully — no key, no problem; the mechanical path still runs.
 Requirements: **Node ≥ 18** and a toolchain that can build `better-sqlite3` (prebuilt binaries cover
 most platforms; otherwise you need Python + a C++ compiler).
 
+### Option A — download a release zip (recommended for users)
+
+Grab the latest `dreamweave-vX.Y.Z.zip` from the [**Releases**](https://github.com/spqian/dreamweave/releases)
+page, unzip it, and tell your OpenClaw/Scout agent to *"import this"* — it detects
+[`INSTALL.md`](INSTALL.md) and runs the whole setup (install deps, create the store, install the
+`dream` + `graph-recall` skills, then interview you on the five behavioral knobs). Or do it by hand:
+
 ```bash
-cd agent-memory
+cd dreamweave-vX.Y.Z
+npm install
+npm run setup
+```
+
+> Release zips are built and published automatically by [`.github/workflows/release.yml`](.github/workflows/release.yml)
+> whenever a `vX.Y.Z` tag is pushed. They are **source-only** — the native deps are built by your
+> `npm install`. Maintainers can build the same zip locally with `npm run pack`.
+
+### Option B — clone the repo (for development)
+
+```bash
+cd dreamweave
 npm install
 npm run setup
 ```

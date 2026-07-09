@@ -1,0 +1,8 @@
+# Paths excluded from the downloadable release zip (`git archive`).
+# These are development-only and not needed to install or run the engine.
+# Everything else (src/, skills/, viz/, docs/, test/, config.js, setup.js,
+# package*.json, INSTALL.md, README.md, LICENSE) ships in the package.
+/.github        export-ignore
+/.gitattributes export-ignore
+/.gitignore     export-ignore
+/bench          export-ignore

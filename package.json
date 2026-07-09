@@ -18,6 +18,7 @@
     "stats": "node src/dream.js stats",
     "budget": "node src/dream.js budget",
     "viz": "node src/dream.js export-viz",
+    "pack": "git archive --format=zip --prefix=dreamweave/ -o dreamweave.zip HEAD",
     "test": "node test/run.js"
   },
   "keywords": [
