@@ -1397,36 +1397,18 @@ function emitCandidates(db, opts = {}) {
   const parent = new Map(facts.map((f) => [f.id, f.id]));
   const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
   const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
-  const knnEdges = (id) => {
-    const blob = storedVecBlob(db, id); if (!blob) return [];
-    return db.prepare(`SELECT n.id id, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND ${ACTIVE_FACT}`).all(blob, o.k + 1, id);
-  };
-  // INCREMENTAL SEED GATE. Running one KNN per active fact every night is O(N^2) and became the
-  // dominant ingest cost as the store grew toward the tier-2 cap. A tight, dormant family only
-  // becomes NEWLY synthesis-eligible when its most-recent member crosses the quietFor maturity
-  // boundary (newestAgeAll >= quietFor); that member — and any brand-new fact that just JOINED an
-  // existing family — necessarily has first_seen within the last (quietFor + slack) days. So we
-  // seed KNN only from that recent cohort and BFS-expand through the (tight, hence dense) cluster,
-  // which reaches every member of every family that could emit this run. Families whose
-  // eligibility did not change were already evaluated on a prior night (mirrors reportSalience /
-  // reportMerges, which likewise only surface new material). Non-incremental (thorough) mode, or a
-  // run without asOf, seeds from ALL facts to preserve exact legacy behavior.
-  const seedWindowMs = (o.quietFor + 45) * 86400000;
-  const seedCutoff = (T.incrementalWeave && opts.asOf) ? (Date.parse(opts.asOf) - seedWindowMs) : null;
-  const seeds = seedCutoff == null ? facts : facts.filter((f) => Date.parse(f.first_seen || 0) > seedCutoff);
-  const visited = new Set();
-  const queue = [];
-  for (const s of seeds) if (!visited.has(s.id)) { visited.add(s.id); queue.push(s.id); }
-  let head = 0;
-  while (head < queue.length) {
-    const id = queue[head++];
-    for (const nb of knnEdges(id)) {
-      if (!byId.has(nb.id)) continue;
-      if (1 - nb.d >= o.tight) {
-        union(id, nb.id);
-        if (!visited.has(nb.id)) { visited.add(nb.id); queue.push(nb.id); } // expand within the tight component
-      }
-    }
+  // Seed from ALL active facts (full similarity scan). We deliberately do NOT gate the seed set by
+  // recency here. Synthesis eligibility is DECAY-triggered (a family becomes abstractable when its
+  // members' strength drifts below maxStrength), and strength decay is class-dependent and slow
+  // (semantic half-life 180d, salient 365d), so a family can first become eligible ~200 days after
+  // its newest member matured — long after any first_seen recency window. A recency seed gate would
+  // silently drop those families. The cost of the full scan is bounded in production by the Tier-2
+  // cap (TIER2_MAX), which demotes weak/old facts out of the active set; keeping the active set
+  // bounded is the right lever for cost, NOT narrowing which facts are eligible for synthesis.
+  for (const f of facts) {
+    const blob = storedVecBlob(db, f.id); if (!blob) continue;
+    const nbrs = db.prepare(`SELECT n.id id, v.distance d FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v JOIN nodes n ON n.id=v.rowid WHERE n.id<>? AND ${ACTIVE_FACT}`).all(blob, o.k + 1, f.id);
+    for (const nb of nbrs) { if (!byId.has(nb.id)) continue; if (1 - nb.d >= o.tight) union(f.id, nb.id); }
   }
   const groups = new Map();
   for (const f of facts) { const r = find(f.id); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(f); }
