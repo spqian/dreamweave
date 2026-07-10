@@ -111,7 +111,7 @@ html[data-theme="dark"] #graph { background:
     </div>
     <div>
       <label for="search">Deep search (title + content) <span id="hitCount" class="small"></span></label>
-      <input id="search" type="search" placeholder="person, topic, or any word in a fact..." />
+      <input id="search" type="search" placeholder="person, topic, or any word in a fact..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
     </div>
     <div>
       <label for="classFilter">Class</label>
@@ -433,7 +433,7 @@ const data = {"nodes":[],"links":[]};
 
   function refresh(){ if(!Graph)return; Graph.nodeColor(o=>nodeColor(byId.get(o.id))).nodeVal(o=>nodeSize(byId.get(o.id)))
     .nodeVisibility(o=>nodeVis(byId.get(o.id))).linkVisibility(linkVis).linkColor(linkColorOf).linkDirectionalParticles(Graph.linkDirectionalParticles()); }
-  function focusOn(id){ focusId=id; search.value=''; recomputeHops(); showDetail(id); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); }
+  function focusOn(id){ focusId=id; recomputeHops(); showDetail(id); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); }
 
   // ---- camera helpers ----
   function camTarget(){ const c=Graph&&Graph.controls(); return c&&c.target?c.target:{x:0,y:0,z:0}; }

@@ -25,3 +25,7 @@ Thumbs.db
 !.env.example
 
 _synthwork/
+
+# local scratch: underscore-prefixed working dirs/files & harness snapshots — never commit
+/_*
+snap-*.json
