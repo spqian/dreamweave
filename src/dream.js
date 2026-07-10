@@ -1778,7 +1778,7 @@ function recordProjection(db, file) {
 }
 
 function exportViz(db) {
-  const nodes = db.prepare("SELECT signature AS id, COALESCE(kind,'fact') kind, class, strength, reactivations, notes, memory_id, fact FROM nodes ORDER BY id").all();
+  const nodes = db.prepare("SELECT signature AS id, COALESCE(kind,'fact') kind, class, COALESCE(salience_score,0) salience_score, strength, reactivations, notes, memory_id, fact FROM nodes ORDER BY id").all();
   const proj = projectEmbeddings3D(db);
   for (const n of nodes) { const p = proj.get(n.id); if (p) { n.px = p[0]; n.py = p[1]; n.pz = p[2]; } }
   const ids = new Set(nodes.map((n) => n.id));

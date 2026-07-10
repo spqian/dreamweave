@@ -200,7 +200,7 @@ const data = {"nodes":[],"links":[]};
   const topList=document.getElementById('topList'), miniCanvas=document.getElementById('minimap'), mctx=miniCanvas.getContext('2d');
 
   // ---- data ----
-  const nodes=data.nodes.map((d,i)=>({ id:d.id, kind:d.kind||'fact', cls:d.class, strength:(d.strength==null?0.5:d.strength),
+  const nodes=data.nodes.map((d,i)=>({ id:d.id, kind:d.kind||'fact', cls:((d.salience_score==null?0:d.salience_score)>=0.5?'salient':d.class), salience_score:(d.salience_score==null?0:d.salience_score), strength:(d.strength==null?0.5:d.strength),
     reactivations:d.reactivations||0, notes:d.notes||'', fact:d.fact||'', memory_id:d.memory_id||'', px:(d.px==null?null:d.px), py:(d.py==null?null:d.py), pz:(d.pz==null?null:d.pz), idx:i }));
   const byId=new Map(nodes.map(n=>[n.id,n]));
   const rawLinks=data.links.map(l=>({source:l.source,target:l.target,rel:l.rel,weight:(l.weight==null?0.5:l.weight)})).filter(l=>byId.has(l.source)&&byId.has(l.target));
