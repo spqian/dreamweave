@@ -97,6 +97,35 @@ source of truth.
 ## Step 4 — Restart Scout
 Restart so it picks up the new `dream` and `graph-recall` skills.
 
+## Step 5 — (Recommended) Auto-approve the recall command
+The `graph-recall` skill works by running a single shell command,
+`node "<AGENT_MEMORY>/src/recall.js" …`. By default the host asks for shell
+approval every time it fires, which makes recall prompt on each use. To let it run
+friction-free, add a **scoped allow-list entry** that matches only the recall
+command — least privilege, and independent of any global shell toggle:
+
+```
+node "<AGENT_MEMORY>/src/recall.js" *
+```
+
+Add this to the host's command allow-list (in Copilot CLI / Scout this is the
+inline "Allow list — add" card, or the `permissions`/`autoApprove` allow patterns
+in the host config). Replace `<AGENT_MEMORY>` with this package's absolute path,
+and **match the exact form the skill emits** — the installed `graph-recall`
+SKILL.md always calls the engine with a *quoted, forward-slash* path
+(`node "Q:/src/dream-memory/src/recall.js" …`), so the allow pattern must use the
+same quoting and slashes. A backslash path (`Q:\src\…`) will not match.
+
+Notes:
+- If the host already has a blanket shell auto-approve (`servers.shell.autoApprove: true`),
+  recall is *already* auto-approved — but the scoped entry is safer: it keeps recall
+  friction-free even after you turn the broad toggle off.
+- The nightly `dream` skill runs several engine subcommands
+  (`ingest-harness`, `export-harness`, `dream`, `doctor`, …). If you also want the
+  nightly automation to run unattended, either rely on the automation runner's own
+  approval settings or add a broader scoped entry such as
+  `node "<AGENT_MEMORY>/src/dream.js" *`.
+
 ---
 
 ## Precedence & power-user overrides
