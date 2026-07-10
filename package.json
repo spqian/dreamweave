@@ -1,6 +1,6 @@
 {
   "name": "dreamweave",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Graph + vector long-term memory for AI agents with a nightly 'dream' consolidation pass (forgetting curve, merge, entity weave, supersede-aware corrections) over a local SQLite + sqlite-vec store. Includes a 3D semantic-nebula explorer and a Recall Bench harness.",
   "license": "MIT",
   "type": "commonjs",
