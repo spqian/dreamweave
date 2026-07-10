@@ -28,6 +28,7 @@ Required workflow:
    - `--max-hops N` — graph expansion depth, clamped to 1..3; default 2.
    - `--seed-limit N` — number of vector seed facts, clamped to 1..8; default 4.
    - `--k N` — KNN candidate count, clamped to seed limit..50; default 12.
+   - `--as-of <iso>` — anchors "now" for date-aware recall. Resolves natural-language and RELATIVE dates in the query ("last week", "yesterday", "past 3 days", "last month", "recently") into a concrete time window so temporal queries surface time-indexed facts. Pass the current/simulated date on any time query; defaults to system now.
 
    - `<AGENT_MEMORY>` is the install dir of this package (the folder containing `src/` and `config.js`).
    - Returns `seedDetails[].similarity` (cosine, higher = closer) plus `cluster.nodes`/`cluster.edges`.

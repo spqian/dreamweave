@@ -37,4 +37,18 @@ eq("Feb 30 2026", { lo: "2026-02-28", hi: "2026-02-28" });
 eq("PPVNET container DNS mitigation status", null);
 eq("what did the team decide about pricing", null);
 
+// relative phrases resolved against as-of (2026-06-30)
+eq("what happened to Germany West Central last week", { lo: "2026-06-23", hi: "2026-06-30" });
+eq("anything yesterday", { lo: "2026-06-29", hi: "2026-06-29" });
+eq("what shipped today", { lo: "2026-06-30", hi: "2026-06-30" });
+eq("incidents the day before yesterday", { lo: "2026-06-28", hi: "2026-06-28" });
+eq("changes in the past 3 days", { lo: "2026-06-27", hi: "2026-06-30" });
+eq("what happened in the last 2 weeks", { lo: "2026-06-16", hi: "2026-06-30" });
+eq("summary of the past few days", { lo: "2026-06-23", hi: "2026-06-30" });
+eq("what changed this past week", { lo: "2026-06-23", hi: "2026-06-30" });
+eq("deals closed last month", { lo: "2026-05-30", hi: "2026-06-30" });
+eq("what happened recently", { lo: "2026-06-20", hi: "2026-06-30" });
+// explicit dates still take precedence over relative phrasing
+eq("what happened on 2026-06-25 last week", { lo: "2026-06-25", hi: "2026-06-25" });
+
 console.log(`\nPASS \u2713 parseDateRange (${n} cases)`);

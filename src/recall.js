@@ -80,6 +80,31 @@ function parseDateRange(query, nowRef) {
     else if (/mid|middle/.test(qual)) { lo = 11; hi = 20; }
     return { lo: `${yr}-${pad2(mo)}-${pad2(lo)}`, hi: `${yr}-${pad2(mo)}-${pad2(hi)}` };
   }
+  // 4) RELATIVE phrases resolved against nowRef (the --as-of anchor, else system now). Explicit
+  // dates/months above take precedence; this fills natural temporal language so queries like
+  // "what happened last week", "yesterday", "in the past 3 days" reliably trigger the date-window
+  // (archive_time) scan instead of falling back to blind topical recall. Windows are rolling
+  // [nowRef-N, nowRef] inclusive; the DB compares on the date prefix so events on `hi` are included.
+  const base = (nowRef instanceof Date && !Number.isNaN(nowRef.getTime())) ? new Date(nowRef) : new Date();
+  const iso = (dt) => `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+  const back = (n) => { const d = new Date(base); d.setUTCDate(d.getUTCDate() - n); return d; };
+  const win = (n) => ({ lo: iso(back(n)), hi: iso(base) });
+  const clampN = (s, max) => Math.max(1, Math.min(max, parseInt(s, 10) || 1));
+  if (/\bday before yesterday\b/.test(q)) { const d = iso(back(2)); return { lo: d, hi: d }; }
+  if (/\byesterday\b/.test(q)) { const d = iso(back(1)); return { lo: d, hi: d }; }
+  if (/\btoday\b/.test(q)) { const d = iso(base); return { lo: d, hi: d }; }
+  // "last/past N day(s)|week(s)|month(s)"
+  m = q.match(/\b(?:last|past|previous|prior)\s+(\d{1,3})\s+(day|week|month)s?\b/);
+  if (m) { const unit = m[2], mult = unit === "day" ? 1 : unit === "week" ? 7 : 31; return win(clampN(m[1], unit === "day" ? 90 : unit === "week" ? 26 : 24) * mult); }
+  // "last/past few|several|couple days|weeks"
+  if (/\b(?:last|past|recent|these past)\s+(?:few|several|couple(?:\s+of)?)\s+days\b/.test(q)) return win(7);
+  if (/\b(?:last|past|recent|these past)\s+(?:few|several|couple(?:\s+of)?)\s+weeks\b/.test(q)) return win(21);
+  // singular period windows
+  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+week\b/.test(q)) return win(7);
+  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+month\b/.test(q)) return win(31);
+  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+quarter\b/.test(q)) return win(92);
+  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+year\b/.test(q)) return win(365);
+  if (/\b(?:recently|lately|of late|in recent days)\b/.test(q)) return win(10);
   return null;
 }
 
