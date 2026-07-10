@@ -22,7 +22,8 @@ function ensureSchema(db) {
       notes TEXT,
       text TEXT,
       fact TEXT,
-      kind TEXT
+      kind TEXT,
+      salience_score REAL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS edges (
@@ -99,7 +100,10 @@ function ensureSchema(db) {
   db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_archive USING vec0(embedding float[${cfg.EMBED_DIM}] distance_metric=cosine)`);
 
   // Guarded migrations for databases created before fact/kind columns existed.
-  for (const col of ["kind TEXT", "fact TEXT", "vagueness REAL"]) {
+  // salience_score (Layer 4): continuous [0,1] importance judged at dream time; modulates
+  // half-life. Defaults 0 so pre-existing facts decay purely on their durability class until
+  // the dream re-judges them (NULL is coalesced to 0 in the decay formula regardless).
+  for (const col of ["kind TEXT", "fact TEXT", "vagueness REAL", "salience_score REAL DEFAULT 0"]) {
     try { db.exec(`ALTER TABLE nodes ADD COLUMN ${col}`); } catch (e) { /* already present */ }
   }
 }

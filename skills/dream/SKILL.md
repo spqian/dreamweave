@@ -120,15 +120,17 @@ Cold storage. A demoted fact keeps its raw text with `notes='archive'` but loses
 - **Invariants** checked by `doctor`: every active FACT node has degree ≥ 1 (zero islands); every edge endpoint resolves to a node (no dangling). Tier 3 archive rows are intentionally edgeless and excluded from island checks.
 
 ## Strength model (forgetting curve) — active FACT nodes
-`S ∈ [0,1]`. **Every ingested memory enters as EPISODIC** (initial `S=0.30`) — the surface emits raw traces and may not assert importance. The engine EARNS the higher classes during dreaming: **semantic** (`0.70`-band: identity/role, how a system works, ownership, durable lesson, stable preference) via reactivation/repetition, and **salient** (`0.90`-band: Sev1/2, security, exec/architectural decision, big business value, core identity/role, hard deadline) ONLY via the nightly salience judge. The harness `category` (decision/fact/context/preference) is retained as a display label but no longer sets the class.
+`S ∈ [0,1]`. **Every ingested memory enters as EPISODIC** (initial `S=0.30`) — the surface emits raw traces and may not assert importance. Two INDEPENDENT axes evolve during dreaming:
+- **`class` = DURABILITY** ∈ `{episodic, semantic}`, EARNED by reactivation/repetition: **semantic** (`0.70`-band: identity/role, how a system works, ownership, durable lesson, stable preference). The harness `category` (decision/fact/context/preference) is a display label only and no longer sets the class.
+- **`salience_score ∈ [0,1]` = IMPORTANCE** (Layer 4 / P12), the ONLY importance axis, judged ONLY by the nightly salience surface (never by the harness). It is a continuous score, not a class — the engine no longer creates a `class='salient'` bucket. `salience_score ≥ 0.5` marks a fact *salient* for protection/display; the score continuously modulates the decay half-life.
 
-**Decay** (once/run, active facts): `S ← S·2^(−Δdays/H_eff)`; base `H` = 365 / 180 / 3. Edges decay too (`related_to`/`similar_to` faster); edges with `weight<0.10` are pruned.
+**Decay** (once/run, active facts): `S ← S·2^(−Δdays/H_eff)`. Base `H` = 180 (semantic) / 3 (episodic); `salience_score` continuously extends `H` up to 365 for a maximally-salient fact (`H = base + salience_score·(365−base)`), so a salient fact decays much slower than an identical non-salient one. Edges decay too (`related_to`/`similar_to` faster); edges with `weight<0.10` are pruned.
 
 **Reactivation is subject-propagated, once per run:** when a fact's subject reappears, the entity's other facts are re-cued via `mentions` edges. Strength increases and episodic facts may promote to semantic at a schema-accelerated threshold.
 
 **Schema-accelerated consolidation:** facts attached to established, specific entity schemas consolidate faster and decay slower. Ubiquitous connectors do not carry discriminating schema signal.
 
-**Promotion ≠ importance.** Repetition can make a fact durable (episodic→semantic); it does not make it salient. Salience comes ONLY from caller judgment (the nightly salience surface) over genuinely high-stakes content — never from the harness `category`.
+**Promotion ≠ importance.** These are orthogonal axes. Repetition can make a fact durable (episodic→semantic `class`); it does not make it important. Importance (`salience_score`) is EARNED only by the nightly salience surface judging genuinely high-stakes / novel content — never by repetition and never by the harness `category`. A fact can be durable-but-mundane, or important-but-not-yet-durable. Salience is also RE-EVALUABLE: a fact that was salient can be downgraded (score→0) when it goes stale or is superseded, non-destructively.
 
 **Evaporation/demotion:** legacy single-tier mode (retention=prune, `MEMORY_TIER2_MAX=0`) can tombstone faded/over-cap facts via decay. In tiered retention mode (`MEMORY_TIER2_MAX>0`), destructive eviction is replaced by demotion to Tier 3. Merge itself is **always** non-destructive regardless of mode.
 
@@ -178,10 +180,14 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
      judge: group first-name↔full-name, abbreviation↔expansion, spelling/case variants. **Be conservative** — distinct people who merely share a name are NOT the same. Use exact `sig` strings; only emit groups that actually merge.
      decision: `[{canonical:"<sig to keep>", aliases:["<sig to fold in>", ...]}]`
 
-   - **salience** — flag the rare critical facts (frequency ≠ importance).
-     report: `{surface:"salience", facts:[{sig,fact}]}`
-     judge: score each 0–2; **2** = firm decision/commitment, security/serious incident, exec/leadership or org-structure fact, core identity/role, or a hard deadline whose loss damages recall. Be strict — only a small minority are 2. Return the sigs you scored 2 (engine caps flagged share at ~20%).
-     decision: `{salientSigs:[...]}`
+   - **salience** — EARN importance for the rare high-stakes facts (Layer 4 / P12). Frequency ≠ importance; the harness may NOT assert it — it is judged ONLY here, at dream time.
+     report: `{surface:"salience", facts:[{sig, fact, nearest_prior:{fact,cosine}, supersedes:[...]}], review:[{sig, fact, salience_score, superseded_by_new, nearest_prior}]}`
+     judge each `facts[]` candidate on a CONTINUOUS `score ∈ [0,1]` from two signals (do NOT score affect/emotion — the surface can't observe it):
+       • **S2 material stakes** — does acting on / forgetting this fact carry real consequence? (firm decision/commitment, security or Sev1/2 incident, exec/leadership or org-structure change, core identity/role, big business value, hard deadline).
+       • **S3 novelty / contradiction** — is it genuinely new or a correction? Use the supplied context: a HIGH `nearest_prior.cosine` ⇒ a near-restatement (LOW novelty ⇒ lower score); a non-empty `supersedes` ⇒ it corrects/updates a prior fact (higher novelty/contradiction).
+       Most facts score LOW (mundane episodic). Emit only the facts you scored, with their score; the engine keeps a sparse top slice (~15% of active, ~20% of the batch) so over-scoring is safely capped.
+       Then review `review[]` (facts currently salient): if one is now stale, resolved, or `superseded_by_new`, list its `sig` under `downgrade` to REVOKE salience (non-destructive — the fact and its strength survive; it simply loses protection).
+     decision: `{salient:[{sig, score}], downgrade:[sig]}`  (legacy `{salientSigs:[sig]}` = score 1.0 still accepted)
 
    - **merges** (alias `consolidate`) — roll up each near-duplicate cluster into ONE richer fact.
      report: `{surface:"merges", clusters:[[{sig,fact}], ...]}`

@@ -446,9 +446,24 @@ function verifySync(db, file) {
 const SCHEMA_FULL = 6;            // entity mentioned by >=6 *specific* facts = fully-established schema
 const SCHEMA_UBIQUITOUS = 0.20;   // entities mentioned by > this fraction of facts are generic connectors
 const SCHEMA_HALFLIFE_BONUS = 0.6; // up to +60% half-life for a fully schema-embedded fact
-// NOTE: salient is an IMPORTANCE class (Sev1/2, security, exec decision), earned ONLY by the
-// dream's salience judgment (applySalience) — never asserted by the ingest surface and never
-// auto-earned by reactivation frequency. Repetition makes facts durable (semantic), not important.
+// SALIENCE = EARNED IMPORTANCE (Layer 4, FIRST-PRINCIPLES P12). It is a CONTINUOUS scalar
+// salience_score ∈ [0,1] judged ONLY by the dream's salience LLM (report → judge → apply) from
+// material stakes (S2) + novelty/contradiction-vs-graph (S3). It is NOT a durability class and
+// is NEVER asserted by the ingest surface, NEVER auto-earned by reactivation frequency
+// (repetition makes facts durable = semantic, not important). It modulates half-life
+// continuously: baseH (episodic|semantic) interpolates up to SALIENT_MAX_H at score=1.
+const SALIENT_MAX_H = HALFLIFE.salient;   // 365d ceiling a fully-salient fact reaches
+const SAL_PROTECT = 0.5;                  // score ≥ this = "salient" for display/demotion protection
+const SAL_GLOBAL_FRACTION = 0.15;         // ranked sparsity cap: ≤15% of the ACTIVE set may be salient
+const SAL_MIN_FLOOR = 3;                   // ...but allow a few salient on a small/young store (cold start)
+const SAL_BATCH_FRACTION = 0.20;          // and ≤20% of any single night's candidate batch
+const SPOTLIGHT_BOOST = 0.12;             // retroactive spotlight strength boost (STC/behavioral tagging)
+const SPOTLIGHT_MAX_STRENGTH = 0.45;      // boosted neighbor never exceeds this (bounds the blast radius)
+const SPOTLIGHT_WEAK = 0.35;              // only WEAK episodics are eligible for the spotlight
+const SPOTLIGHT_COS = 0.6;                // ...and only semantically-related neighbors (cosine ≥ this)
+const SPOTLIGHT_WINDOW_MS = 24 * 3600 * 1000; // ...within a ±24h temporal window of the elevated fact
+const SPOTLIGHT_MAX_NEIGHBORS = 5;        // ...capped per elevated fact (idempotent via 'spotlight' edge)
+const SAL_REVIEW_MAX = 20;                // ≤ this many existing salient facts re-surfaced for downgrade/night
 
 function computeSchemaFit(db) {
   const factCount = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c || 1;
@@ -489,7 +504,13 @@ function dreamCore(db, flags) {
   prof("dreamCore.decayFacts", () => {
   for (const n of facts) {
     const sf = schema.get(n.signature) || 0;
-    const H = (HALFLIFE[n.class] || HALFLIFE.episodic) * T.forgetMultiplier * (1 + SCHEMA_HALFLIFE_BONUS * sf) / bp.decayAccel;
+    // Durability base: episodic (fast) vs semantic (slow). Legacy class='salient' rows (pre-Layer-4)
+    // fall to the semantic base — their protection now comes from salience_score, not a 365d bucket.
+    const baseH = (n.class === "episodic") ? HALFLIFE.episodic : HALFLIFE.semantic;
+    // Salience protection: interpolate baseH → SALIENT_MAX_H continuously with the [0,1] score.
+    const sal = clamp01(Number(n.salience_score) || 0);
+    const salH = baseH + sal * (SALIENT_MAX_H - baseH);
+    const H = salH * T.forgetMultiplier * (1 + SCHEMA_HALFLIFE_BONUS * sf) / bp.decayAccel;
     const dDays = Math.max(0, (now.getTime() - Date.parse(n.last_decayed || n.first_seen || nowIso)) / 86400000);
     db.prepare("UPDATE nodes SET strength=?, last_decayed=? WHERE id=?").run(clamp01(n.strength * Math.pow(2, -dDays / H)), nowIso, n.id);
   }
@@ -593,11 +614,11 @@ function dreamCore(db, flags) {
     // protect them so the transition stays answerable (empty set when supersede is unused).
     const supTargets = new Set(db.prepare("SELECT dst FROM edges WHERE rel='supersedes'").all().map((r) => r.dst));
     const cands = db.prepare(
-      `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (class='salient') ASC, strength ASC, last_decayed ASC`
+      `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (COALESCE(salience_score,0)>=${SAL_PROTECT}) ASC, strength ASC, last_decayed ASC`
     ).all();
     const evict = [];
     // pass 1: evict weakest non-protected, non-salient, non-supersede-target
-    for (const n of cands) { if (evict.length >= over) break; if (protectedSigs.has(n.signature) || n.class === "salient" || supTargets.has(n.signature)) continue; evict.push(n); }
+    for (const n of cands) { if (evict.length >= over) break; if (protectedSigs.has(n.signature) || (Number(n.salience_score)||0) >= SAL_PROTECT || supTargets.has(n.signature)) continue; evict.push(n); }
     // pass 2 (rare): still over → drop protected/salient weakest, since the cap is physical
     if (evict.length < over) { for (const n of cands) { if (evict.length >= over) break; if (evict.includes(n)) continue; evict.push(n); } }
     for (const n of evict) {
@@ -631,14 +652,14 @@ function dreamCore(db, flags) {
       // supersede targets (needed for the current operation). This guarantees the cap holds
       // so nightly cost stays bounded — the C4 accumulation fix.
       const cands = db.prepare(
-        `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (notes='detail') DESC, (class='salient') ASC, (notes='gist') ASC, strength ASC, last_decayed ASC`
+        `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (notes='detail') DESC, (COALESCE(salience_score,0)>=${SAL_PROTECT}) ASC, (notes='gist') ASC, strength ASC, last_decayed ASC`
       ).all();
       const isHardProtected = (n) => protectedSigs.has(n.signature) || supTargets.has(n.signature);
       const demote = [];
       // pass 1: prefer to keep salient/gist — demote everything else first
       for (const n of cands) {
         if (demote.length >= over) break;
-        if (isHardProtected(n) || n.class === "salient" || n.notes === "gist") continue;
+        if (isHardProtected(n) || (Number(n.salience_score)||0) >= SAL_PROTECT || n.notes === "gist") continue;
         demote.push(n);
       }
       // pass 2: still over cap (salient/gist alone exceed it) — demote the weakest/oldest
@@ -1129,39 +1150,176 @@ async function applyAliases(db, raw, opts = {}) {
   return { surface: "aliases", groups: groups.length, aliases_merged: aliasesMerged, weave: weaveResult };
 }
 
+// KNN helper: k nearest ACTIVE facts to a node's stored embedding (excluding self), with cosine.
+function nearestFacts(db, node, k, extraWhere = "") {
+  const blob = storedVecBlob(db, node.id);
+  if (!blob) return [];
+  const rows = db.prepare(
+    `SELECT n.id id, n.signature sig, n.fact fact, n.first_seen first_seen, n.class class, n.strength strength, v.distance d
+       FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
+       JOIN nodes n ON n.id=v.rowid
+      WHERE n.id<>? AND ${ACTIVE_FACT}${extraWhere}`
+  ).all(blob, k + 1, node.id);
+  return rows.map((r) => ({ ...r, cos: 1 - r.d }));
+}
+
 function reportSalience(db) {
-  // Merge is always non-destructive: demoted 'detail' constituents always exist and
-  // must never be re-surfaced as salience candidates.
+  // Salience is EARNED at dream time (Layer 4 / P12): report NEW, not-yet-salient facts as
+  // ELEVATION candidates, plus a bounded set of already-salient facts for DOWNGRADE re-judgement.
+  // Merge is non-destructive, so demoted 'detail'/'archive' constituents are never candidates.
   const notColdSql = " AND (notes IS NULL OR notes NOT IN ('detail','archive'))";
   const incrementalR = T.incrementalWeave;
   const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
   const newOnlySql = incrementalR ? ` AND first_seen > '${lastReflect.replace(/'/g, "")}'` : "";
-  const facts = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND class!='salient'${notColdSql}${newOnlySql}`).all();
-  return { surface: "salience", facts };
+  const rawCands = db.prepare(
+    `SELECT id, signature AS sig, fact, first_seen FROM nodes WHERE kind='fact' AND COALESCE(salience_score,0) < ${SAL_PROTECT}${notColdSql}${newOnlySql}`
+  ).all();
+
+  // S3 context (mechanical only — the LLM does the judging, engine stays LLM-less, P5): the
+  // nearest existing fact (high cosine ⇒ NOT novel; low ⇒ novel) and any supersede relation
+  // (this fact CORRECTS/UPDATES another ⇒ novelty/contradiction).
+  const supRows = db.prepare("SELECT src, dst FROM edges WHERE rel='supersedes'").all();
+  const supBySrc = new Map();   // sig -> [sigs it supersedes]
+  const supTargetSet = new Set(); // sigs that are superseded BY something (dst)
+  for (const e of supRows) { (supBySrc.get(e.src) || supBySrc.set(e.src, []).get(e.src)).push(e.dst); supTargetSet.add(e.dst); }
+  const factText = (sig) => (db.prepare("SELECT fact FROM nodes WHERE signature=? AND kind='fact'").get(sig) || {}).fact || null;
+  const enrich = (n) => {
+    const nearest = nearestFacts(db, n, 1)[0];
+    const supersedes = (supBySrc.get(n.sig) || []).map(factText).filter(Boolean).slice(0, 3);
+    return {
+      sig: n.sig, fact: n.fact,
+      nearest_prior: nearest ? { fact: nearest.fact, cosine: Number(nearest.cos.toFixed(3)) } : null,
+      supersedes: supersedes.length ? supersedes : undefined,
+    };
+  };
+  const facts = rawCands.map(enrich);
+
+  // DOWNGRADE review channel (bounded): existing salient facts eligible for re-judgement —
+  // (a) any salient fact a NEW fact now SUPERSEDES (its importance may have been revoked), then
+  // (b) filled with the STALEST salient facts on a slow cadence. Never re-judge the whole set.
+  const newSigs = new Set(rawCands.map((c) => c.sig));
+  const newSupTargets = new Set();
+  for (const e of supRows) if (newSigs.has(e.src) && supTargetSet.has(e.dst)) newSupTargets.add(e.dst);
+  const salient = db.prepare(
+    `SELECT id, signature AS sig, fact, first_seen, last_reactivated, salience_score FROM nodes
+      WHERE kind='fact' AND COALESCE(salience_score,0) >= ${SAL_PROTECT}${notColdSql}
+      ORDER BY (last_reactivated) ASC`
+  ).all();
+  const reviewSet = [];
+  const seenR = new Set();
+  for (const s of salient) { if (newSupTargets.has(s.sig) && !seenR.has(s.sig)) { reviewSet.push(s); seenR.add(s.sig); } }
+  for (const s of salient) { if (reviewSet.length >= SAL_REVIEW_MAX) break; if (!seenR.has(s.sig)) { reviewSet.push(s); seenR.add(s.sig); } }
+  const review = reviewSet.slice(0, SAL_REVIEW_MAX).map((s) => {
+    const nearest = nearestFacts(db, s, 1)[0];
+    return {
+      sig: s.sig, fact: s.fact, salience_score: Number((s.salience_score || 0).toFixed(3)),
+      superseded_by_new: newSupTargets.has(s.sig) || undefined,
+      nearest_prior: nearest ? { fact: nearest.fact, cosine: Number(nearest.cos.toFixed(3)) } : null,
+    };
+  });
+
+  return { surface: "salience", facts, review };
 }
 
 function cleanSalienceDecision(db, raw) {
-  const candidates = reportSalience(db).facts;
-  const valid = new Set(candidates.map((f) => f.sig));
-  const sigs = raw && Array.isArray(raw.salientSigs) ? raw.salientSigs : [];
-  const cap = Math.max(1, Math.floor(candidates.length * 0.2));
-  return [...new Set(sigs.filter((s) => typeof s === "string" && valid.has(s)))].slice(0, cap);
+  const rep = reportSalience(db);
+  const validCand = new Set(rep.facts.map((f) => f.sig));
+  const validReview = new Set(rep.review.map((f) => f.sig));
+
+  // Parse BOTH the new scored shape { salient:[{sig,score}], downgrade:[sig] } and the legacy
+  // { salientSigs:[sig] } (score ⇒ 1.0), so no existing caller breaks.
+  const rawElev = [];
+  if (raw && Array.isArray(raw.salient)) {
+    for (const e of raw.salient) { if (e && typeof e.sig === "string") rawElev.push({ sig: e.sig, score: clamp01(Number(e.score)) || 0 }); }
+  }
+  if (raw && Array.isArray(raw.salientSigs)) {
+    for (const s of raw.salientSigs) if (typeof s === "string") rawElev.push({ sig: s, score: 1.0 });
+  }
+  // keep the max score per sig; only real elevation candidates from THIS report are valid
+  const bySig = new Map();
+  for (const e of rawElev) { if (!validCand.has(e.sig)) continue; if (!bySig.has(e.sig) || e.score > bySig.get(e.sig)) bySig.set(e.sig, e.score); }
+  let elevate = [...bySig.entries()].map(([sig, score]) => ({ sig, score })).sort((a, b) => b.score - a.score);
+
+  // RANKED SPARSITY CAP applies to STRONG (≥ SAL_PROTECT) elevations only — the ones that become
+  // "salient" for protection/display. Sub-threshold scores lightly extend half-life and are uncapped.
+  const activeCount = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c || 0;
+  const currentSalient = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT} AND COALESCE(salience_score,0) >= ${SAL_PROTECT}`).get().c || 0;
+  const perBatch = Math.max(Math.floor(rep.facts.length * SAL_BATCH_FRACTION), SAL_MIN_FLOOR);
+  const globalRemaining = Math.max(Math.floor(activeCount * SAL_GLOBAL_FRACTION), SAL_MIN_FLOOR) - currentSalient;
+  const strongCap = Math.max(0, Math.min(perBatch, globalRemaining));
+  const strong = elevate.filter((e) => e.score >= SAL_PROTECT).slice(0, strongCap);
+  const weak = elevate.filter((e) => e.score < SAL_PROTECT);
+  elevate = [...strong, ...weak];
+
+  const downgrade = [...new Set(
+    (raw && Array.isArray(raw.downgrade) ? raw.downgrade : [])
+      .filter((s) => typeof s === "string" && (validCand.has(s) || validReview.has(s)))
+  )];
+
+  return { elevate, downgrade };
 }
 
 function applySalience(db, raw, opts = {}) {
   const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
-  const sigs = cleanSalienceDecision(db, raw);
-  let salientTagged = 0;
+  const { elevate, downgrade } = cleanSalienceDecision(db, raw);
+  const runId = `sal-${Date.now()}`;
+  const jrnl = db.prepare("INSERT INTO dream_journal(dreamed_at,run_id,op,memory_id,signature,category,original_fact,result_fact,reason) VALUES (?,?,?,?,?,?,?,?,?)");
+  const J = (op, sig, reason) => { try { jrnl.run(now, runId, op, "", sig, "salience", null, null, reason); } catch (e) {} };
+  let elevatedStrong = 0, elevatedWeak = 0, downgraded = 0, spotlighted = 0;
+
   const tx = db.transaction(() => {
-    for (const sig of sigs) {
-      db.prepare("UPDATE nodes SET class='salient', salience='decision', strength=? , last_reactivated=? WHERE signature=? AND kind='fact'")
-        .run(clamp01((db.prepare("SELECT strength FROM nodes WHERE signature=?").get(sig) || {}).strength + 0.05 || 0.9), now, sig);
-      salientTagged += 1;
+    // 1) DOWNGRADE (flashbulb re-evaluation): revoke importance without destroying the fact,
+    //    its lineage, or its strength — future decay handles reduced protection (P6).
+    const getNode = db.prepare("SELECT id, strength, first_seen, salience_score FROM nodes WHERE signature=? AND kind='fact'");
+    for (const sig of downgrade) {
+      const n = getNode.get(sig); if (!n || (Number(n.salience_score) || 0) < SAL_PROTECT) continue;
+      db.prepare("UPDATE nodes SET salience_score=0, salience=NULL WHERE signature=? AND kind='fact'").run(sig);
+      J("keep", sig, `salience downgraded ${(n.salience_score || 0).toFixed(2)}->0 (re-evaluated)`);
+      downgraded += 1;
+    }
+
+    // 2) ELEVATE (earned importance): store the continuous score; a small strength nudge so a
+    //    just-elevated episodic isn't demoted before its longer half-life protects it.
+    const elevatedNew = [];
+    for (const { sig, score } of elevate) {
+      const n = getNode.get(sig); if (!n) continue;
+      const strong = score >= SAL_PROTECT;
+      const newStrength = clamp01((n.strength || 0) + 0.05 * score);
+      db.prepare("UPDATE nodes SET salience_score=?, salience=?, strength=?, last_reactivated=? WHERE signature=? AND kind='fact'")
+        .run(score, strong ? "decision" : null, newStrength, now, sig);
+      J("reinforce", sig, `salience ${strong ? "elevated" : "scored"} ${score.toFixed(2)}`);
+      if (strong) { elevatedStrong += 1; elevatedNew.push({ ...n, sig }); } else { elevatedWeak += 1; }
+    }
+
+    // 3) RETROACTIVE SPOTLIGHT (synaptic tagging & capture / behavioral tagging): a strong
+    //    elevation stabilizes WEAK episodics encoded in an adjacent ±24h window that are
+    //    semantically related. Bounded (≤N neighbors, ceiling strength) and IDEMPOTENT across
+    //    nights via a 'spotlight' marker edge — the principled replacement for unbounded hub
+    //    reactivation that pinned open loops.
+    const hasSpot = db.prepare("SELECT 1 FROM edges WHERE src=? AND dst=? AND rel='spotlight'");
+    const insEdge = db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)");
+    for (const s of elevatedNew) {
+      const st = Date.parse(s.first_seen || "");
+      const nbrs = nearestFacts(db, s, SPOTLIGHT_MAX_NEIGHBORS * 4, " AND n.class='episodic'");
+      let boosted = 0;
+      for (const nb of nbrs) {
+        if (boosted >= SPOTLIGHT_MAX_NEIGHBORS) break;
+        if (nb.cos < SPOTLIGHT_COS) continue;
+        if ((nb.strength || 0) > SPOTLIGHT_WEAK) continue;
+        const nt = Date.parse(nb.first_seen || "");
+        if (!st || !nt || Math.abs(nt - st) > SPOTLIGHT_WINDOW_MS) continue;
+        if (hasSpot.get(s.sig, nb.sig)) continue; // idempotent: never re-boost the same neighbor
+        const boostedStrength = Math.min((nb.strength || 0) + SPOTLIGHT_BOOST, SPOTLIGHT_MAX_STRENGTH);
+        db.prepare("UPDATE nodes SET strength=? WHERE signature=? AND kind='fact'").run(boostedStrength, nb.sig);
+        insEdge.run(s.sig, "spotlight", nb.sig, 0.5, now, now);
+        J("reinforce", nb.sig, `spotlight boost from salient ${s.sig}`);
+        boosted += 1; spotlighted += 1;
+      }
     }
   });
   tx();
   repairGraph(db);
-  return { surface: "salience", salient_tagged: salientTagged };
+  return { surface: "salience", salient_tagged: elevatedStrong, scored: elevatedWeak, downgraded, spotlighted };
 }
 
 async function reportMerges(db, opts = {}) {
@@ -1223,28 +1381,34 @@ async function applyMerges(db, raw, opts = {}) {
       const members = dec.memberSigs.map((sig) => db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(sig)).filter(Boolean);
       if (members.length < 2) continue;
       const maxStrength = Math.max(...members.map((m) => m.strength || 0));
-      const anySalient = members.some((m) => m.class === "salient");
+      // Importance propagates through consolidation as a SCORE (P12), not a class: the gist
+      // inherits the max salience_score of its members. Durability (class) stays episodic/semantic.
+      const maxSal = Math.max(0, ...members.map((m) => Number(m.salience_score) || 0));
+      const salient = maxSal >= SAL_PROTECT;
       const maxReacts = Math.max(...members.map((m) => m.reactivations || 0));
       const minFirstSeen = members.reduce((m, n) => {
         const t = Date.parse(n.first_seen || "");
         return (Number.isFinite(t) && (m == null || t < m.t)) ? { t, s: n.first_seen } : m;
       }, null);
       const survFirstSeen = (minFirstSeen && minFirstSeen.s) || survivor.first_seen;
+      // Durability base for the gist: never 'salient' (that's importance, carried separately);
+      // a consolidated gist is at least semantic. Legacy class='salient' rows map to semantic.
+      const survClass = (survivor.class === "episodic" || survivor.class === "salient") ? "semantic" : (survivor.class || "semantic");
       // NON-DESTRUCTIVE MERGE. The survivor node is rewritten into the Tier-1 gist,
       // but its ORIGINAL verbatim is NEVER lost: we clone it into a Tier-2 'detail'
       // (exactly like every other member) so completed-action / state-transition
       // facts (e.g. "I sent X" vs "do not send X until approved") stay recoverable.
-      const survOrig = { fact: survivor.fact, text: survivor.text || survivor.fact, class: survivor.class || "semantic", salience: survivor.salience || "", strength: survivor.strength || 0, reactivations: survivor.reactivations || 0, first_seen: survivor.first_seen };
-      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist' WHERE id=?")
-        .run(dec.fact, dec.fact, anySalient ? "salient" : (survivor.class === "episodic" ? "semantic" : survivor.class),
-          anySalient ? "decision" : (survivor.salience || ""), clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, survivor.id);
+      const survOrig = { fact: survivor.fact, text: survivor.text || survivor.fact, class: (survivor.class === "salient" ? "semantic" : (survivor.class || "semantic")), salience: survivor.salience || "", salience_score: Number(survivor.salience_score) || 0, strength: survivor.strength || 0, reactivations: survivor.reactivations || 0, first_seen: survivor.first_seen };
+      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, salience_score=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist' WHERE id=?")
+        .run(dec.fact, dec.fact, survClass,
+          salient ? "decision" : (survivor.salience || ""), maxSal, clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, survivor.id);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
       // Preserve the survivor's own pre-merge verbatim as a detail of the new gist
       // (memory_id='' — details are archival, not projected to the flat harness).
       const survCloneSig = uniqueSig(db, `fact:${deriveSlug(survOrig.fact || survivor.signature)}`);
-      db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.strength, survOrig.reactivations, survOrig.first_seen, now, now, "detail", survOrig.fact, survOrig.text);
+      db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,salience_score,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.salience_score, survOrig.strength, survOrig.reactivations, survOrig.first_seen, now, now, "detail", survOrig.fact, survOrig.text);
       db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", survCloneSig, 0.6, now, now);
       db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(survCloneSig, survivor.signature, survOrig.first_seen);
       retained += 1;
@@ -1579,7 +1743,8 @@ function exportHarness(db, asOf) {
   const nowRef = asOf ? new Date(asOf) : (latest ? new Date(latest) : new Date());
 
   const isGist = (n) => n.notes && /\bgist\b/.test(n.notes);
-  const rank = (n) => ({ salient: 2, semantic: 1, episodic: 0 }[n.class] || 0);
+  // Salience (importance) ranks a gist above plain semantic/episodic; durability class breaks ties below.
+  const rank = (n) => ((Number(n.salience_score) || 0) >= SAL_PROTECT ? 2 : ({ semantic: 1, episodic: 0 }[n.class] || 0));
 
   const gist = facts.filter(isGist)
     .sort((a, b) => rank(b) - rank(a) || (b.strength || 0) - (a.strength || 0) || a.signature.localeCompare(b.signature));
@@ -1591,7 +1756,7 @@ function exportHarness(db, asOf) {
     const tag = tier === "episodic" ? ageTag(d) : null;
     return {
       memory_id: n.memory_id, signature: n.signature,
-      category: n.salience || CLASS2CAT[n.class] || "fact",
+      category: n.salience || ((Number(n.salience_score) || 0) >= SAL_PROTECT ? "decision" : CLASS2CAT[n.class]) || "fact",
       tier, strength: Number((n.strength || 0).toFixed(3)),
       first_seen: n.first_seen || null, age: tag,
       fact: (n.fact || "").trim(),
@@ -1755,4 +1920,4 @@ if (require.main === module) {
   main().catch((e) => { console.error("ERROR:", e); process.exit(1); });
 }
 
-module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph };
+module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph, dreamCore };

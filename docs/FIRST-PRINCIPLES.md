@@ -163,3 +163,57 @@ makes STRENGTH a first-class term in SEED SELECTION only, which principle 6 alre
 relevance. It uses activation, NOT a clock — explicit-date queries still route through the time-window
 path, so old-dated-fact recall is unaffected by decay. Bound λ so a strong OFF-topic fact can never
 outrank a strongly on-topic one; validate across factual/temporal/contradiction, not just synthesis.
+
+---
+
+## Layer 4 — SALIENCE = EARNED IMPORTANCE, JUDGED ONLY BY THE DREAM (2026-07-09)
+
+Layers 1–3 govern the atom, the tiers, and read-time ranking. They are silent on the LONGEVITY question:
+of the facts in the store, which ones matter enough to be PROTECTED from forgetting? The old answer was a
+crude one: the ingest surface stamped a `category` ("decision"/"incident"/"deadline") and `applySalience`
+turned that into a binary `class='salient'` with a 365-day half-life. That is wrong on two counts — it let
+the SURFACE assert importance, and it modelled importance as a one-bit category test. Layer 4 replaces it.
+
+### P12. SALIENCE IS IMPORTANCE, NOT FREQUENCY, NOT AFFECT — and it is EARNED ONLY AT DREAM TIME.
+Neuroscience frames three DISTINCT axes; the engine must not conflate them:
+- **Durability** (how well-learned): built by repetition/reactivation. This is ACT-R base-level activation
+  and the episodic→semantic promotion path (dream.js reactivation loop). *Frequency ≠ importance* — a fact
+  re-cued every night is well-LEARNED, not necessarily IMPORTANT. Reactivation therefore MUST NOT feed the
+  salience score (folding it back in re-creates the hub-entity pinning bug that kept open loops alive).
+- **Importance** (how much it matters): the salience-network relevance filter — anterior insula + dACC gate
+  which events get consolidation resources (Seeley et al. 2007, PMID 17329432; Menon & Uddin 2010,
+  PMID 20512370). It is driven by **material stakes/consequence** (S2) and **novelty/contradiction/update**
+  vs. what is already known (S3; hippocampal novelty–dopamine gating, Lisman & Grace 2005, PMID 15450156).
+- **Affect** (emotional arousal): the amygdalar β-adrenergic enhancement (McGaugh 2004; Cahill et al. 1994,
+  PMID 7935815). **DELIBERATELY EXCLUDED.** Our ingest is a neutral, third-person distilled summary — affect
+  is stripped at encoding (garbage in), and the factual eval carries no emotional ground truth (unfalsifiable).
+  Modelling it would add unvalidatable complexity. Door left open ONLY if ingestion is later enriched to carry
+  affect AND the eval grows an emotional dimension.
+
+**The LLM harness cannot form salience at ingest.** It has no neurons, no autonomic surge, no fear/reward
+chemistry to mark a memory as it lands. So the SURFACE may only ever assert `episodic`. Importance is a
+JUDGEMENT that requires reasoning over content and over the existing graph — exactly what the nightly dream
+LLM does. Salience is therefore earned during the dream, never claimed on the way in.
+
+**Salience is CONTINUOUS, not a category.** The dream judges a score `salience_score ∈ [0,1]` from S2+S3 and
+it MODULATES the half-life continuously (the same lever `SCHEMA_HALFLIFE_BONUS` already pulls), rather than
+snapping class to a 365-day bucket. High stakes/novelty ⇒ longer half-life ⇒ protected; ordinary episodic
+life (the "decisions that hardly matter" — daily logistics) simply decays on the short episodic clock and is
+merged into gists. A ranked **sparsity cap** (~15–20%) keeps salience scarce, as the biological filter is.
+
+**Salience is RE-EVALUABLE (flashbulb correction).** Flashbulb memories feel permanent but their CONFIDENCE
+and detail decay and can be revised (Talarico & Rubin; Hirst et al.). So `applySalience` must have a
+DOWNGRADE path — importance can be revoked on a later night — not only ever ADD. Salience ≠ permanence.
+
+**Retroactive spotlight (synaptic tagging & capture / behavioral tagging).** A strongly-salient event
+stabilizes WEAK memories encoded in an adjacent temporal window (Frey & Morris 1997 STC; Dunsmoor et al.
+2015, Nature, PMID 25607357). When the dream elevates a fact, it applies a BOUNDED strength boost (+0.10–0.15)
+to temporally-adjacent, semantically-related (cosine > ~0.6) weak episodics. This is the principled,
+*bounded* replacement for the old unbounded hub-entity reactivation that pinned open loops: a real memory
+mechanism with a hard ceiling, not an ever-growing feedback loop.
+
+**Contract (keeps the engine LLM-less, P5).** `report-salience` emits candidates enriched with the graph
+context needed for S3 (nearest prior fact / supersede relation). The external LLM judge scores stakes+novelty
+and returns `{ salient: [{sig, score}], downgrade: [sig] }`. `apply-salience` stores the score, modulates
+half-life, enforces the ranked cap, runs the spotlight pass, and applies downgrades — all mechanical. Legacy
+`{ salientSigs: [...] }` decisions remain accepted (treated as max score) so no caller breaks.
