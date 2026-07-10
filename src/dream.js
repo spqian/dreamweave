@@ -315,6 +315,26 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       const mid = m.id || m.memory_id; if (!mid) continue;
       const fact = String(m.fact || "").replace(UNTRUSTED, "").trim();
       const category = m.category || "fact";
+      // ENGINE-OWNED ANCHOR (channel E) is re-emitted by export-harness, never stored as a node.
+      // If the harness still carries a copy (it was m_remember'd as the projected anchor, or was
+      // ingested as a normal fact before this guard existed), capture its id in `meta` so the
+      // anchor round-trips to THAT id (projection-sync KEEPs it, no duplicate) and drop any lingering
+      // node so the reminder text doesn't pollute the graph/recall as an ordinary fact.
+      if (fact.startsWith("[memory-usage]")) {
+        setMeta(db, "anchor_memory_id", mid);
+        const exA = exByMem.get(mid);
+        if (exA) {
+          const sig = (db.prepare("SELECT signature FROM nodes WHERE id=?").get(exA.id) || {}).signature;
+          try { delVec.run(BigInt(exA.id)); } catch (_) { /* no vec row */ }
+          db.prepare("DELETE FROM nodes WHERE id=?").run(exA.id);
+          if (sig) {
+            db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(sig, sig);
+            db.prepare("DELETE FROM detail_of WHERE detail_sig=? OR gist_sig=?").run(sig, sig);
+          }
+          exByMem.delete(mid);
+        }
+        res.refreshed += 1; continue;
+      }
       // first_seen must be EVENT-anchored, not ingest-anchored: the harness carries the
       // memory's real creation date (createdAt). Honor it for new nodes so age tags,
       // episodic ordering, and date-window (archive_time) recall reflect when the event
@@ -393,7 +413,9 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   // by the nightly pass (weave embeds any node missing a vec row, incrementally), so
   // ingest stays O(new) instead of re-embedding the whole store on every memory write.
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
-  res.missing = mems.map((m) => m.id || m.memory_id).filter((x) => x && !dbIds.has(x));
+  // The engine anchor (channel E) is tracked in meta, not as a node, so it is legitimately
+  // absent from dbIds — exclude it from the completeness check (else ingest/verify gate falsely).
+  res.missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !String(m.fact || "").trim().startsWith("[memory-usage]"); }).map((m) => m.id || m.memory_id);
   res.complete = res.missing.length === 0;
   return res;
 }
@@ -433,7 +455,7 @@ function verifySync(db, file) {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
   const mems = Array.isArray(raw) ? raw : (raw.memories || []);
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
-  const missing = mems.map((m) => m.id || m.memory_id).filter((x) => x && !dbIds.has(x));
+  const missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !String(m.fact || "").trim().startsWith("[memory-usage]"); }).map((m) => m.id || m.memory_id);
   return { harness_count: mems.length, memory_ids_in_db: dbIds.size, missing, complete: missing.length === 0 };
 }
 

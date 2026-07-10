@@ -56,6 +56,32 @@ console.log("ok: anchor leads export-harness with blank id on fresh store");
 console.log("ok: record-projection persists anchor harness id to meta");
 console.log("ok: anchor round-trips with its real id (KEEP, not FORGET)");
 console.log("ok: anchor is synthesized, not a nodes row");
+
+// ---- ingest recognition: the anchor text in the harness must NOT become a node, and its
+// harness id must be captured into meta so it round-trips to that id (KEEP, no duplicate). ----
+const ANCHOR_FACT = p[0].fact; // the exact engine anchor text
+const snap = [
+  { id: "u-1", fact: "Peter prefers concise summaries.", category: "preference" },
+  { id: "anchor-harness-id", fact: ANCHOR_FACT, category: "context" },
+];
+const snapPath = path.join(dataDir, "snap.json");
+fs.writeFileSync(snapPath, JSON.stringify(snap));
+run("ingest-harness", "--file", snapPath);
+
+const db2 = new Database(path.join(dataDir, "memory.db"), { readonly: true });
+const anchorNodes = db2.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND fact LIKE '[memory-usage]%'").get();
+const userNodes = db2.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND fact LIKE 'Peter prefers%'").get();
+db2.close();
+if (anchorNodes.c !== 0) fail("anchor text must not be ingested as a node (found " + anchorNodes.c + ")");
+if (userNodes.c !== 1) fail("normal memory should ingest as a node (found " + userNodes.c + ")");
+
+// export-harness now emits the anchor with the captured harness id -> projection-sync KEEPs it.
+p = exportHarness();
+if (p[0].signature !== "memory-usage-anchor") fail("anchor no longer leads after ingest");
+if (p[0].memory_id !== "anchor-harness-id") fail("ingest did not capture anchor harness id into meta; got " + JSON.stringify(p[0].memory_id));
+
+console.log("ok: anchor text in harness is recognized on ingest (no node created)");
+console.log("ok: ingest captures the anchor's harness id -> round-trips to it (KEEP)");
 console.log("PASS \u2713 anchor projection round-trip");
 
 fs.rmSync(dataDir, { recursive: true, force: true });
