@@ -251,6 +251,11 @@ const data = {"nodes":[],"links":[]};
 
   // ---- search/hop ----
   let hop=null, hits=new Set(), focusId=null;
+  // Golden highlight for the focused node's connections: focusPulse ramps 0->1 (grow-in).
+  let focusPulse=0, focusPulseStart=0; const GOLD=hexToRgb(css('--cp-warning'));
+  function linkIncidentFocus(l){ if(focusId==null) return false; const [s,t]=endIds(l); return s===focusId||t===focusId; }
+  function linkWidthOf(l){ let w=0.6+l.weight*1.2;
+    if(focusPulse>0 && linkIncidentFocus(l)) w = w*0.5 + 0.4 + 3.4*focusPulse; return w; }
   function recomputeHops(){
     const q=search.value.trim().toLowerCase(); hits=new Set();
     if(!q && focusId==null){ hop=null; hitCountEl.textContent=''; refresh(); return; }
@@ -297,6 +302,7 @@ const data = {"nodes":[],"links":[]};
   function linkColorOf(l){ if(!linkActive(l)) return 'rgba(0,0,0,0)';
     const [sid,tid]=endIds(l); const a=byId.get(sid), b=byId.get(tid);
     if(!a||!b) return mix(PAL.entity,0.7); if(!nodeVis(a)||!nodeVis(b)) return 'rgba(0,0,0,0)';
+    if(focusPulse>0 && linkIncidentFocus(l)) return 'rgba('+GOLD[0]+','+GOLD[1]+','+GOLD[2]+','+(0.5+0.45*focusPulse).toFixed(3)+')';
     if(linkMode==='temporal'){ const base=l.rel==='supersedes'?PAL.salient:PAL.episodic;
       if(hop!==null){ const hit=hop[a.idx]===0||hop[b.idx]===0; return mix(base, hit?0.0:0.4); }
       return mix(base,0.12); }
@@ -329,9 +335,15 @@ const data = {"nodes":[],"links":[]};
   let Graph=null, labelMode='auto', autoRotate=true, rotateAngle=0, lastInteract=0, hoverId=null;
   function importance(n){ const base = n.kind==='entity' ? activeDeg(n)*1.1 : (n.strength*3 + activeDeg(n)*0.18);
     return base + (hop!==null&&hop[n.idx]===0?1000:0); }
-  function flyTo(o){ if(!Graph||o==null||o.x==null) return; const dist=70;
-    const r=Math.hypot(o.x,o.y,o.z)||1; const k=(r+dist)/r;
-    Graph.cameraPosition({x:o.x*k, y:o.y*k, z:o.z*k}, o, 900); lastInteract=Date.now(); }
+  // Pan/tilt a node into view WITHOUT zooming: keep the current camera->target offset
+  // (same distance + same viewing angle) and just translate so the node becomes the new
+  // orbit center. This also sets controls.target=o, so auto-rotation now orbits the node.
+  function flyTo(o){ if(!Graph||o==null||o.x==null) return;
+    const cam=Graph.camera(), t=camTarget();
+    let ox=cam.position.x-t.x, oy=cam.position.y-t.y, oz=cam.position.z-t.z;
+    let r=Math.hypot(ox,oy,oz);
+    if(!(r>1)){ ox=0; oy=0; oz=140; r=140; }           // degenerate: back off along +z
+    Graph.cameraPosition({x:o.x+ox, y:o.y+oy, z:o.z+oz}, o, 700); lastInteract=Date.now(); }
   function semanticForce(strength){ let ns=[];
     function f(alpha){ let fc=null;
       if(focusId!=null){ const ff=ns.find(n=>n.id===focusId); if(ff&&ff.ax!=null) fc=ff; }
@@ -409,7 +421,7 @@ const data = {"nodes":[],"links":[]};
       .nodeVisibility(o=>nodeVis(byId.get(o.id)))
       .nodeLabel(o=>{ const n=byId.get(o.id); return '<div style="max-width:300px;font:13px Segoe UI;background:var(--cp-panel-strong);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:10px;padding:8px 10px;white-space:normal;"><strong>'+escapeHtml(n.id)+'</strong><div style="color:var(--cp-text-muted)">'+(n.kind==='entity'?'entity hub':(n.cls||'fact'))+(n.kind==='fact'?' \u2022 '+n.strength.toFixed(2):'')+' \u2022 '+degree[n.idx]+' links</div>'+(n.fact?'<div style="margin-top:4px;">'+escapeHtml(n.fact)+'</div>':'')+'</div>'; })
       .linkColor(linkColorOf)
-      .linkWidth(l=>0.6+l.weight*1.2)
+      .linkWidth(linkWidthOf)
       .linkOpacity(0.5)
       .linkVisibility(linkVis)
       .linkDirectionalParticles(l=>{ if(hop===null||!linkActive(l))return 0; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t); return (a&&b&&(hop[a.idx]===0||hop[b.idx]===0))?2:0; })
@@ -432,8 +444,8 @@ const data = {"nodes":[],"links":[]};
   } catch(e){ elErr.style.display='flex'; console.error(e); }
 
   function refresh(){ if(!Graph)return; Graph.nodeColor(o=>nodeColor(byId.get(o.id))).nodeVal(o=>nodeSize(byId.get(o.id)))
-    .nodeVisibility(o=>nodeVis(byId.get(o.id))).linkVisibility(linkVis).linkColor(linkColorOf).linkDirectionalParticles(Graph.linkDirectionalParticles()); }
-  function focusOn(id){ focusId=id; recomputeHops(); showDetail(id); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); }
+    .nodeVisibility(o=>nodeVis(byId.get(o.id))).linkVisibility(linkVis).linkColor(linkColorOf).linkWidth(linkWidthOf).linkDirectionalParticles(Graph.linkDirectionalParticles()); }
+  function focusOn(id){ focusId=id; focusPulse=0; focusPulseStart=Date.now(); recomputeHops(); showDetail(id); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); }
 
   // ---- camera helpers ----
   function camTarget(){ const c=Graph&&Graph.controls(); return c&&c.target?c.target:{x:0,y:0,z:0}; }
@@ -507,6 +519,11 @@ const data = {"nodes":[],"links":[]};
   function camForward(cam){ const V=cam.position.constructor; const f=new V(); cam.getWorldDirection(f); return f; }
   function tick(){
     if(Graph){
+      // focus golden-line grow-in: ramp focusPulse 0->1 over 700ms (ease-out), forcing a
+      // re-render of link accessors each frame so the gold connections visibly grow in.
+      if(focusPulseStart){ const p=Math.min(1,(Date.now()-focusPulseStart)/700); const eased=1-Math.pow(1-p,3);
+        focusPulse=eased; if(Graph.linkWidth) Graph.linkWidth(linkWidthOf).linkColor(linkColorOf);
+        if(p>=1) focusPulseStart=0; }
       // resume auto-rotate after 4s idle
       if(autoRotate){ const c=Graph.controls(); if(c && !c.autoRotate && Date.now()-lastInteract>4000) c.autoRotate=true; }
       // AUTO LABELS: score nodes that are visible, in front of camera, and on-screen; label the most important.
