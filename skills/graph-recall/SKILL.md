@@ -1,13 +1,14 @@
 ---
 name: "graph-recall"
-description: "Memory expansion over injected Tier 1 memory entries with semantic vector seeds, graph-neighbor expansion through the Tier 2 store, and keyword fallback into the Tier 3 archive."
+description: "Use INSTEAD OF m_recall for ANY query that may touch stored memory — people, systems, incidents, releases, regions, dates, prior decisions/threads, or ambiguous follow-ups. Expands injected Tier-1 entries via semantic vector seeds + graph-neighbor recall through the Tier 2 store, with keyword fallback into the Tier 3 archive. Always expand on a hit; never stop at the first matching line. Skip only for a trivial, non-cross-linked fact (a single stored preference or contact detail)."
 ---
 
-Use this skill as memory expansion on top of injected memory entries.
+Use this skill INSTEAD OF the host's flat memory lookup (`m_recall`) as the default path for memory-touching queries. `recall.js` already starts from the injected Tier-1 entries and runs its own vector seeding, so it is a superset of a flat lookup — running the flat tool first is redundant latency.
 
 Triggering and usage policy:
-- Invoke this skill whenever a user query may map to existing memory entries (people, systems, incidents, releases, topics, prior decisions, prior threads), including ambiguous follow-ups.
-- If there is a memory hit, ALWAYS expand it with graph context. Never stop at the first matching memory line.
+- ALWAYS run graph-recall when the query references a person, system, incident, release, region, date, or prior decision/thread, OR is an ambiguous follow-up to a prior memory-grounded answer.
+- On any memory hit, ALWAYS expand it with graph context. Never stop at the first matching memory line.
+- SKIP (a plain lookup is fine) only for a trivial, non-cross-linked fact with no expansion value (e.g., a single stored preference or "what's my manager's email").
 - Compressed / generalized summaries: if a matched entry is marked as a generalized summary or says a value was compressed/omitted (a "vagueness" hint on a gist), do NOT answer an exact figure/date or enumerate a list from it directly — run recall for the specific value first, and only report "not found" after that specific recall returns nothing. Exact numbers and dates are retained in the store even when the summary omits them.
 
 Matching policy (semantic/fuzzy):

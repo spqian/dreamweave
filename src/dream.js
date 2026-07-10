@@ -1718,9 +1718,16 @@ const ANCHOR_MEMORY_FACT =
   "for the specific value first. Exact numbers and dates are kept in the detailed store even " +
   "when the summary omits them; never enumerate a list or cite a precise figure from a summary " +
   "without confirming it against a specific recall.";
-function anchorRecord() {
+// The anchor's harness id is tracked in the `meta` kv (key `anchor_memory_id`) so it
+// ROUND-TRIPS like any projected survivor: it emits memory_id="" until first projected
+// (host ADD -> record-projection stores the assigned id here), then emits that real id so
+// projection-sync KEEPs it (it's in exportedIds) instead of FORGETting it. Before this the
+// anchor emitted a synthetic id that never matched its real harness id, so the nightly
+// FORGET step deleted it and ADD never re-added it — the reminder silently dropped off.
+function anchorRecord(db) {
+  const mid = (db && getMeta(db, "anchor_memory_id")) || "";
   return {
-    memory_id: "memory-usage-anchor", signature: "memory-usage-anchor",
+    memory_id: mid, signature: "memory-usage-anchor",
     category: "instruction", tier: "gist", strength: 1,
     first_seen: null, age: null,
     fact: ANCHOR_MEMORY_FACT, display: ANCHOR_MEMORY_FACT,
@@ -1768,12 +1775,17 @@ function exportHarness(db, asOf) {
 
   // Gist first (primacy for standing facts), then the episodic timeline in order.
   // The engine-owned anchor memory always leads (channel E).
-  return [anchorRecord(), ...gist.map((n) => rec(n, "gist")), ...episodic.map((n) => rec(n, "episodic"))];
+  return [anchorRecord(db), ...gist.map((n) => rec(n, "gist")), ...episodic.map((n) => rec(n, "episodic"))];
 }
 
 function recordProjection(db, file) {
   const pairs = JSON.parse(fs.readFileSync(file, "utf8"));
-  db.transaction(() => pairs.forEach((p) => db.prepare("UPDATE nodes SET memory_id=? WHERE signature=?").run(p.memory_id, p.signature)))();
+  db.transaction(() => pairs.forEach((p) => {
+    // The anchor is synthesized (not a `nodes` row); persist its assigned harness id in
+    // `meta` so it round-trips instead of being FORGOTten by the nightly projection sync.
+    if (p.signature === "memory-usage-anchor") { setMeta(db, "anchor_memory_id", p.memory_id || ""); return; }
+    db.prepare("UPDATE nodes SET memory_id=? WHERE signature=?").run(p.memory_id, p.signature);
+  }))();
   return { recorded: pairs.length };
 }
 

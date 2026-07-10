@@ -35,6 +35,10 @@ consolidation is routed through `apply-*` (see `SKILL.md` stage 5).
     "fact": "<raw text>", "display": "<inject-ready line; episodic is age-prefixed>" }
   ```
   - `P[0]` is the engine **anchor record** (channel E) — always present; treat like any other record.
+    Its id round-trips via the engine's `meta` kv: on a fresh store it emits `memory_id === ""` (so
+    the ADD path below m_remembers it and `record-projection` persists the assigned id); afterwards it
+    emits that real id so it lands in `exportedIds` and is **KEPT, never FORGOTten**. Always include the
+    anchor's `{signature:"memory-usage-anchor", memory_id:<assignedId>}` pair when you ADD it.
   - **`memory_id === ""`** → a **db-native survivor not yet in the harness** → needs a NEW harness memory.
   - **`memory_id === "<id>"`** → already projected → reconcile its text.
 - **Current harness** — `m_list_memories` → `H` = `[{ id, fact, category, source, ... }]`.
