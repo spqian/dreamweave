@@ -75,6 +75,28 @@ function dot(a, b) {
   return s;
 }
 
+function loadSupersededBy(db, signatures) {
+  const sigs = [...new Set(signatures)].filter(Boolean);
+  const out = new Map();
+  if (!sigs.length) return out;
+  const json = JSON.stringify(sigs);
+  const rows = db.prepare(`
+    SELECT src, dst, first_seen
+    FROM edges
+    WHERE rel='supersedes'
+      AND (
+        src IN (SELECT value FROM json_each(?))
+        OR dst IN (SELECT value FROM json_each(?))
+      )
+  `).all(json, json);
+  for (const e of rows) {
+    const prev = out.get(e.dst);
+    const t = Date.parse(e.first_seen || "") || 0;
+    if (!prev || t >= prev.t) out.set(e.dst, { survivor: e.src, t });
+  }
+  return out;
+}
+
 function parseArgs(argv) {
   const args = { query: "", maxHops: 2, seedLimit: 4, k: 12, nodeLimit: 80, asOf: "" };
   for (let i = 2; i < argv.length; i += 1) {
@@ -281,19 +303,6 @@ async function main() {
   const db = new Database(DB_PATH, { readonly: true });
   sqliteVec.load(db);
 
-  // Supersede awareness. A correction is stored as an edge (newer)--supersedes-->(older),
-  // so the edge's `dst` is the STALE "from" value. The dream design deliberately PRESERVES
-  // that stale node (so the transition stays answerable for contradiction-resolution), which
-  // means recall must DEMOTE — never drop — it. supersededBy maps stale -> surviving signature.
-  const supersededBy = new Map();
-  for (const e of db.prepare("SELECT src, dst, first_seen FROM edges WHERE rel='supersedes'").all()) {
-    const prev = supersededBy.get(e.dst);
-    // If a node was corrected more than once, keep the NEWEST surviving correction.
-    if (!prev || (Date.parse(e.first_seen || "") || 0) >= (prev.t || 0)) {
-      supersededBy.set(e.dst, { survivor: e.src, t: Date.parse(e.first_seen || "") || 0 });
-    }
-  }
-
   const qFloat = await embedOne(args.query);
   const qvec = toVecBlob(qFloat);
   const seedNowRef = args.asOf ? new Date(args.asOf) : new Date();
@@ -314,6 +323,12 @@ async function main() {
     ORDER BY v.distance
   `).all(qvec, Math.max(args.k * 8, 64));
 
+  // A correction is stored as (newer)--supersedes-->(older). Load only edges
+  // touching the bounded candidate pool instead of scanning every correction in
+  // the store; stale candidates remain available but rank below a co-retrieved
+  // survivor.
+  const seedSupersededBy = loadSupersededBy(db, knn.map((r) => r.signature));
+
   // Seed selection with supersede demotion: when BOTH a stale version and its surviving
   // correction are vector-retrieved, we are choosing between two versions of the SAME fact —
   // sink the stale one below its survivor so the current value seeds the cluster (and lands
@@ -324,7 +339,7 @@ async function main() {
     dateIntent: seedDateIntent,
     histIntent,
     dateRange: seedDateRange,
-    survivors: new Map([...supersededBy].map(([stale, v]) => [stale, v.survivor])),
+    survivors: new Map([...seedSupersededBy].map(([stale, v]) => [stale, v.survivor])),
   });
 
   const seedRows = rankedKnn.slice(0, args.seedLimit);
@@ -402,45 +417,39 @@ async function main() {
   };
   let chainIdBySig = new Map();
   if (clusterRows.length) {
-    const seqAdj = new Map();
-    for (const e of db.prepare("SELECT src, dst FROM edges WHERE rel='sequence'").all()) {
-      if (!seqAdj.has(e.src)) seqAdj.set(e.src, new Set());
-      if (!seqAdj.has(e.dst)) seqAdj.set(e.dst, new Set());
-      seqAdj.get(e.src).add(e.dst);
-      seqAdj.get(e.dst).add(e.src);
+    const PER_CHAIN_MAX = 40; // bound ONE episode (collapses to a few distinct in 1c)
+    const TOUCHED_MAX = 400;  // global guard across all touched chains
+    const inCluster = new Set(clusterRows.map((r) => r.signature));
+    const chainSigs = new Set();
+    const component = db.prepare(`
+      WITH RECURSIVE walk(sig) AS (
+        SELECT ?
+        UNION
+        SELECT e.dst FROM walk JOIN edges e ON e.src=walk.sig WHERE e.rel='sequence'
+        UNION
+        SELECT e.src FROM walk JOIN edges e ON e.dst=walk.sig WHERE e.rel='sequence'
+      )
+      SELECT sig FROM walk LIMIT ?
+    `);
+    let nextChain = 0;
+    for (const seed of inCluster) {
+      if (chainIdBySig.has(seed)) continue; // component already expanded via another seed
+      if (chainSigs.size >= TOUCHED_MAX) break;
+      const members = component.all(seed, PER_CHAIN_MAX).map((r) => r.sig);
+      if (members.length <= 1) continue;
+      const id = nextChain++;
+      for (const sig of members) {
+        chainIdBySig.set(sig, id);
+        if (!inCluster.has(sig)) chainSigs.add(sig);
+      }
     }
-    if (seqAdj.size) {
-      const PER_CHAIN_MAX = 40; // bound ONE episode (collapses to a few distinct in 1c)
-      const TOUCHED_MAX = 400;  // global guard across all touched chains
-      const inCluster = new Set(clusterRows.map((r) => r.signature));
-      const seedsOnChain = clusterRows.map((r) => r.signature).filter((s) => seqAdj.has(s));
-      const chainSigs = new Set();
-      let nextChain = 0;
-      for (const seed of seedsOnChain) {
-        if (chainIdBySig.has(seed)) continue; // component already expanded via another seed
-        if (chainSigs.size >= TOUCHED_MAX) break;
-        const id = nextChain++;
-        const lseen = new Set();
-        const stack = [seed];
-        let count = 0;
-        while (stack.length && count < PER_CHAIN_MAX) {
-          const cur = stack.pop();
-          if (lseen.has(cur)) continue;
-          lseen.add(cur);
-          chainIdBySig.set(cur, id);
-          count += 1;
-          if (!inCluster.has(cur)) chainSigs.add(cur);
-          for (const nb of (seqAdj.get(cur) || [])) if (!lseen.has(nb)) stack.push(nb);
-        }
-      }
-      if (chainSigs.size) {
-        const ph = [...chainSigs].map(() => "?").join(",");
-        const rows = db.prepare(
-          `SELECT signature, COALESCE(strength,0) AS strength, class, fact, kind, first_seen, notes, vagueness
-           FROM nodes WHERE kind='fact' AND signature IN (${ph})`
-        ).all(...chainSigs);
-        for (const r of rows) if (sharesQueryTopic(r.fact)) clusterRows.push({ ...r, hops: 1, via: "sequence" });
-      }
+    if (chainSigs.size) {
+      const ph = [...chainSigs].map(() => "?").join(",");
+      const rows = db.prepare(
+        `SELECT signature, COALESCE(strength,0) AS strength, class, fact, kind, first_seen, notes, vagueness
+         FROM nodes WHERE kind='fact' AND signature IN (${ph})`
+      ).all(...chainSigs);
+      for (const r of rows) if (sharesQueryTopic(r.fact)) clusterRows.push({ ...r, hops: 1, via: "sequence" });
     }
   }
 
@@ -731,9 +740,13 @@ async function main() {
   }
 
   // 3) Edges fully inside the cluster.
-  const allEdges = db.prepare(`SELECT src, rel, dst, weight FROM edges`).all();
-  const clusterEdges = allEdges
-    .filter((e) => clusterSet.has(e.src) && clusterSet.has(e.dst))
+  const clusterJson = JSON.stringify([...clusterSet]);
+  const clusterEdges = (clusterSet.size ? db.prepare(`
+    SELECT src, rel, dst, weight
+    FROM edges
+    WHERE src IN (SELECT value FROM json_each(?))
+      AND dst IN (SELECT value FROM json_each(?))
+  `).all(clusterJson, clusterJson) : [])
     .sort((a, b) => b.weight - a.weight || a.src.localeCompare(b.src) || a.dst.localeCompare(b.dst));
 
   // Real per-node cosine for ACTIVE cluster nodes (A2 activation ranking). The bounded seed
@@ -850,6 +863,16 @@ async function main() {
       }
     }
   }
+
+  const supersededBy = loadSupersededBy(db, [
+    ...clusterRows,
+    ...detailRows,
+    ...archiveRows,
+    ...archiveVecRows,
+    ...archiveTimeRows,
+    ...activeTimeRows,
+    ...anchorDayRows,
+  ].map((r) => r.signature));
 
   db.close();
 

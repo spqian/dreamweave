@@ -150,8 +150,9 @@ Stage cursors advance only after that stage completes successfully.
   legacy duplicates; operator resolution of legacy duplicates remains).
 - [ ] Phase 3 recall correctness (pre-truncation activation, historical target-date
   ranking, active date coverage, numeric/cross-month parsing, and ambiguous-May guard
-  complete; scoped edge retrieval and remaining dedup policy work remain).
-- [ ] Phase 4 performance.
+  complete; remaining archive/scope dedup policy work remains).
+- [ ] Phase 4 performance (recall graph, supersession, sequence, and returned-edge
+  queries are seed/cluster scoped and index-driven; nightly scan and batching work remain).
 - [ ] Phase 5 documentation and operational hardening (strict atomic config and exact
   anchor recognition complete; public documentation reconciliation remains).
 - [ ] Local validation.
