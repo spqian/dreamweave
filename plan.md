@@ -161,6 +161,8 @@ Stage cursors advance only after that stage completes successfully.
   anchor recognition, and public contract/configuration reconciliation complete).
 - [x] Local validation (26/26 unit files, migration/doctor on a live-store copy,
   report/apply/projection/recall/viz checks, embedding and projection probes).
-- [ ] Live harness validation.
+- [x] Live harness validation (Scout invoked graph-recall for a Germany West
+  Central timeline, separated calendar week from release-train lineage, and
+  ranked the superseding false-alarm correction over the original SLA alert).
 - [ ] Full 180-day evaluation.
 - [ ] Push/release.
