@@ -179,5 +179,8 @@ Stage cursors advance only after that stage completes successfully.
   systematic merge-contract failure. That run exposed a pre-existing parser gap:
   q310's "Monday through Friday" did not activate date-window retrieval and scored
   4/6. Weekday-range parsing is now implemented and must restore temporal reasoning
-  to 6/6 in the next current-head evaluation before this gate closes.
+  to 6/6 in the next current-head evaluation before this gate closes. A targeted
+  180-day rerun passed q310 at 6/6 after the benchmark adapter also forwarded its
+  simulated checkpoint date as recall's `--as-of`; retrieval then surfaced the
+  June 22, 23, 25, and 26 records directly.
 - [ ] Push/release.
