@@ -225,7 +225,12 @@ async function reembed(db, onlyIds) {
     ? db.prepare(`SELECT id, signature, fact FROM nodes WHERE id IN (${onlyIds.map(() => "?").join(",")})`).all(...onlyIds)
     : db.prepare("SELECT id, signature, fact FROM nodes").all();
   if (!rows.length) return;
-  const edges = db.prepare("SELECT src, rel, dst FROM edges").all();
+  const sigJson = JSON.stringify(rows.map((r) => r.signature));
+  const edges = db.prepare(`
+    SELECT src, rel, dst FROM edges
+    WHERE src IN (SELECT value FROM json_each(?))
+       OR dst IN (SELECT value FROM json_each(?))
+  `).all(sigJson, sigJson);
   const eb = new Map();
   rows.forEach((r) => eb.set(r.signature, []));
   edges.forEach((e) => { if (eb.has(e.src)) eb.get(e.src).push(e); if (eb.has(e.dst)) eb.get(e.dst).push(e); });

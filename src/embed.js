@@ -35,11 +35,20 @@ async function getExtractor() {
 
 // Embed an array of strings -> array of Float32Array(DIMS).
 async function embedTexts(texts) {
+  if (!texts.length) return [];
   const ex = await getExtractor();
   const out = [];
-  for (const t of texts) {
-    const res = await ex([t || ""], { pooling: "mean", normalize: true });
-    out.push(Float32Array.from(res.data));
+  const batchSize = 32;
+  for (let start = 0; start < texts.length; start += batchSize) {
+    const batch = texts.slice(start, start + batchSize).map((t) => t || "");
+    const res = await ex(batch, { pooling: "mean", normalize: true });
+    const data = res.data;
+    if (!data || data.length !== batch.length * DIMS) {
+      throw new Error(`embedding shape mismatch: expected ${batch.length}x${DIMS}, got ${res.dims || (data && data.length) || "unknown"}`);
+    }
+    for (let i = 0; i < batch.length; i += 1) {
+      out.push(Float32Array.from(data.subarray(i * DIMS, (i + 1) * DIMS)));
+    }
   }
   return out;
 }
