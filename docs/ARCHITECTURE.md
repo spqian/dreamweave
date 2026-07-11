@@ -1,7 +1,7 @@
 # Architecture & Design Principles
 
 > **Reading order:** [FIRST-PRINCIPLES](./FIRST-PRINCIPLES.md) (*why the system is shaped this
-> way — the evidence-derived foundation, P0–P11*) → **ARCHITECTURE** (this doc — *the design that
+> way — the evidence-derived foundation, P0–P12*) → **ARCHITECTURE** (this doc — *the design that
 > follows*) → [JOURNEY](./JOURNEY.md) (*the chronological path of decisions and their evidence*).
 > The numbered principles below are the operational form of the first principles; each cross-refers
 > to its Layer-1/2/3 origin.
@@ -28,9 +28,9 @@ activation and increasing capacity, and we mirror it with three tiers.
   │                           ┃          Bounded, embed-once. The associative   │
   │                           ┃          recall layer.                          │
   ├───────────────────────────╋──────────────────────────────────────────────┤
-  │ TIER 3  "the bookshelf"   ┃  ∞       raw fact dump. No embedding, no edges, │
-  │  (the archive)            ┃          no nightly processing. KEYWORD search  │
-  │                           ┃          only. "I know I read this somewhere —  │
+  │ TIER 3  "the bookshelf"   ┃  ∞       raw fact dump + cold vector sidecar;   │
+  │  (the archive)            ┃          no nightly graph processing. Bounded  │
+  │                           ┃          vector/keyword/time lookup. "I read it"│
   │                           ┃          let me dig." Slow but complete.        │
   └───────────────────────────┸──────────────────────────────────────────────┘
 ```
@@ -46,15 +46,15 @@ REMEMBER.** Produced by `export-harness` (gist + unmerged; never `detail`/`archi
 The bounded associative store that `recall` searches: vector KNN seeds → recursive
 graph walk that **returns the seed's neighbors** (the whole point of a graph layer —
 recall a fact and you recall what it connects to). Capped via `MEMORY_TIER2_MAX`
-(default off; benchmark uses 2500). Over the cap, the weakest/oldest embedded facts are
-**DEMOTED to Tier 3 — never deleted.** Salient and gist nodes are protected.
+(default 2500 in the standard profile). Over the cap, the weakest/oldest embedded facts are
+**DEMOTED to Tier 3 — never deleted.** Gists and high-salience-score facts are protected.
 
 ### Tier 3 — the bookshelf (the archive, uncapped)
-Cold storage. A demoted fact keeps its raw text (`notes='archive'`) but **loses its
-vector and its edges**, so it costs **zero** nightly work and is invisible to
-vector/graph recall. It is reachable only by **brute-force keyword scan** in `recall`.
-This is the "best-effort total knowledge base": inefficient, but nothing is ever truly
-forgotten. When a specific question names a cold fact, the keyword tier surfaces it.
+Cold storage. A demoted fact keeps its raw text (`notes='archive'`) and moves its
+embedding from `vec_nodes` to `vec_archive`; graph edges are removed, so it costs zero
+nightly graph work. Recall reaches it through bounded cold-vector, keyword, explicit-date,
+or gist→detail lookup. This is the "best-effort total knowledge base": slower than the
+active graph, but nothing is truly forgotten.
 
 ## Non-negotiable principles
 
@@ -147,6 +147,17 @@ forgotten. When a specific question names a cold fact, the keyword tier surfaces
     Combined with the cold-bookshelf time-window tier, this is how "I've seen this on that date"
     recall works without a calendar subsystem.
 
+11. **Event time and processing time are different clocks.** `first_seen` records when the
+    remembered event occurred and must remain stable for timeline recall. Incremental eligibility
+    uses engine-owned monotonic revisions (`change_seq`, `ingested_seq`, `dirty_seq`) and stage
+    cursors (`last_*_seq`). A backdated fact ingested today is old in the timeline but new work for
+    every maintenance stage. Never use `first_seen` as a processing watermark.
+
+12. **Salience is continuous importance, not a durability class.** Every harness fact enters
+    `class='episodic'`; reactivation may earn `class='semantic'`. Only the nightly caller-judged
+    salience surface sets `salience_score ∈ [0,1]`, which continuously extends half-life and marks
+    scores ≥0.5 for protection/display. The engine never creates `class='salient'`.
+
 Single optimal path: recall features are unconditional — no env feature-flags gate real
 behavior (they are wired on, tuned by validated in-code constants). Only the durable
 capacity/retention knobs in the table below are configurable.
@@ -171,8 +182,6 @@ capacity/retention knobs in the table below are configurable.
 | `MEMORY_ENTRY_TARGET` | Tier-1 projection target (~250–500).                   |
 | `MEMORY_ENTRY_MAX`    | Tier-1 hard cap (legacy single-tier eviction).         |
 | `MEMORY_TIER2_MAX`    | Tier-2 (RAG) cap; overflow → Tier-3 archive. 0 = off.  |
-| `DREAM_LLM`           | Model spec for the judgment layer (typed extract,      |
-|                       | canonicalization, salience, merge). Empty = mechanical.|
 | `MEMORY_SUPERSEDE=1`  | Supersede-aware consolidation (corrections).           |
 
 When adding features, state which tier they touch and which principle(s) they uphold.

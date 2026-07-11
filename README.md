@@ -12,9 +12,10 @@ What makes it different from other "dream"/memory skills:
 - **Bounded nightly cost** — incremental weave + embed-once, so it's genuinely runnable *every* night, forever.
 - **Benchmarked** — measured on the [Recall Bench](https://github.com/Stevenic/recall), not vibes.
 
-Everything runs **locally and free**: SQLite (`better-sqlite3`) + `sqlite-vec` for the vector index,
-and `@huggingface/transformers` for on-device embeddings (`all-MiniLM-L6-v2`, 384-dim). No API keys,
-no network after the one-time model download. Ships with a 3D **semantic nebula explorer** to inspect the store.
+The engine runtime is **local and free**: SQLite (`better-sqlite3`) + `sqlite-vec` for the vector index,
+and `@huggingface/transformers` for on-device embeddings (`all-MiniLM-L6-v2`, 384-dim). It has no
+provider client or API-key requirement; nightly judgment is supplied by the host agent. Ships with
+a 3D **semantic nebula explorer** to inspect the store.
 
 > **Not affiliated with, authorized, or endorsed by Microsoft.** This is an independent, community
 > project. "Microsoft Scout" and related names are trademarks of their respective owners and are
@@ -34,7 +35,8 @@ package fixes both:
 - **WEAVE** — every surviving fact is connected into one graph via shared entities, so recall can
   traverse and attention can bind related facts.
 
-The result is a small (~250-entry target), atomic, mostly-semantic, **fully connected** memory.
+The result is a bounded projection (~250-entry standard target) backed by a larger tiered,
+atomic, **fully connected** memory store.
 
 > **Design guideline:** the engine follows a **three-tier memory model** (instincts /
 > RAG / bookshelf) with a few non-negotiable principles (embed-once, bounded nightly
@@ -43,30 +45,17 @@ The result is a small (~250-entry target), atomic, mostly-semantic, **fully conn
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the design) and
 > [`docs/JOURNEY.md`](docs/JOURNEY.md) (how we got here) before making engine changes.
 
-### Optional: LLM judgment layer
+### Host judgment layer
 
-The engine runs fully on **local embeddings with zero API keys** — entity extraction is
-self-bootstrapping (recurrence + case evidence, no seed/deny lists), and the bank stays bounded by
-decay + deterministic eviction. That is the default, and it is portable and free.
+The engine is **local-only and has no external-LLM client**. It performs embeddings, decay,
+graph maintenance, candidate generation, and decision application locally. For judgments a
+regex cannot make, it emits bounded `report-*` JSON; the host agent reads that report and returns
+decision JSON to the matching `apply-*` command.
 
-Set **`DREAM_LLM`** to a small/cheap model spec to add a *judgment* layer a regex can't do — the same
-role a person's sleeping brain plays, deciding what matters and what to fold together:
-
-```
-export DREAM_LLM=azure:gpt-5.4-mini     # or openai:gpt-4o-mini, anthropic:claude-...
-```
-
-- **Typed extraction + canonicalization** (`weave --llm`) — reads the real subjects of each fact,
-  types them correctly (person/org/place/project/system), catches single-name principals, and folds
-  aliases ("Jamie" → `person:jamie-chen`, "SF" → `place:san-francisco`) into one hub.
-- **`reflect`** — the nightly judgment pass: **salience** (score each fact 0–2; only the rare critical
-  ones are tagged to survive eviction and decay slowly — importance, not frequency) and **semantic
-  merge** (roll up near-duplicate clusters into one richer fact, so the bank stays under cap by
-  *consolidating* rather than blindly evicting).
-
-The model is a **judge, not an author**: it never invents facts, only decides types, aliases, merges,
-and importance over content the engine already holds. A mini model is the right tool. Every stage
-degrades gracefully — no key, no problem; the mechanical path still runs.
+The caller judges five surfaces in order: entities, aliases, salience, merges, and synthesis.
+The model is a **judge, not an author**: decisions may only type, group, score, or consolidate
+content present in the report. This keeps provider credentials and model choice outside the
+engine and gives the live harness and evaluation harness one shared execution path.
 
 ---
 
@@ -105,7 +94,7 @@ most platforms; otherwise you need Python + a C++ compiler).
 Grab the latest `dreamweave-vX.Y.Z.zip` from the [**Releases**](https://github.com/spqian/dreamweave/releases)
 page, unzip it, and tell your OpenClaw/Scout agent to *"import this"* — it detects
 [`INSTALL.md`](INSTALL.md) and runs the whole setup (install deps, create the store, install the
-`dream` + `graph-recall` skills, then interview you on the five behavioral knobs). Or do it by hand:
+`dream` + `graph-recall` skills, then interview you on the four behavioral knobs). Or do it by hand:
 
 ```bash
 cd dreamweave-vX.Y.Z
@@ -148,7 +137,7 @@ To co-locate with a host agent's data dir, set `AGENT_MEMORY_DIR` to it (e.g. `~
 ### Recall (read path)
 
 ```bash
-node lib/recall.js --query "who owns the gateway release" --max-hops 2
+node src/recall.js --query "who owns the gateway release" --max-hops 2
 ```
 
 Returns semantic seeds (cosine similarity) plus a connected cluster (nodes + typed edges) for the
@@ -162,27 +151,30 @@ Run these in order (the **`dream`** skill orchestrates them with the host's memo
 # 1. WAKE: dump your agent's memories to snapshot.json  →  [{ id, fact, category }]
 #    category ∈ decision | fact | context | preference  (a DISPLAY label only)
 #    NB: category no longer sets the memory class — every ingested memory enters EPISODIC;
-#    the nightly dream EARNS semantic (repetition) and salient (its salience judgment).
+#    the nightly dream EARNS semantic durability through reactivation and assigns
+#    continuous salience_score importance only through the salience judgment surface.
 
 # 2. INGEST + verify (lossless, memory_id-keyed)
 node src/dream.js ingest-harness --file snapshot.json
 node src/dream.js verify-sync   --file snapshot.json   # exit 3 if any memory is missing
 
-# 3. CONSOLIDATE: decay, reactivate, evaporate, housekeeping
+# 3. DREAM: pre-weave, decay, reactivate, evaporate, housekeeping
 node src/dream.js dream
-node src/dream.js consolidate         # reports merge candidates (agent confirms)
 
-# 4. WEAVE: connect every fact (guarantees zero islands)
-node src/dream.js weave               # add --llm for typed extraction + alias canonicalization
-node src/dream.js doctor              # health gate: exit 3 on islands/dangling edges
+# 4. REPORT → HOST JUDGES → APPLY, in this order:
+#    entities, aliases, salience, merges, synthesis
+node src/dream.js report-entities --as-of <iso>
+node src/dream.js apply-entities --file decisions.json --as-of <iso>
+#    ...repeat for aliases, salience, merges, synthesis
 
-# 4b. REFLECT (optional, needs DREAM_LLM): salience tagging + semantic merge
-node src/dream.js reflect
+# 5. HEALTH: connect post-judgment changes and verify invariants
+node src/dream.js weave --as-of <iso>
+node src/dream.js doctor              # exit 3 on islands/dangling/vector defects
 
-# 5. PROJECT: export the curated facts back to the agent's bank (apply the diff)
+# 6. PROJECT: export the curated facts back to the agent's bank (apply the diff)
 node src/dream.js export-harness
 
-# 6. VIZ
+# 7. VIZ
 node src/dream.js export-viz          # renders $MEMORY_VIZ
 ```
 
@@ -190,7 +182,7 @@ Helpers: `node src/dream.js stats` · `budget` (entry-count pressure + forecast)
 the db).
 
 See **`skills/dream/SKILL.md`** for the full algorithm (strength model, schema-accelerated
-consolidation, the ≤250-entry budget, salience rules) and **`skills/graph-recall/SKILL.md`** for the
+consolidation, the projection budget, salience rules) and **`skills/graph-recall/SKILL.md`** for the
 recall contract. Those two files are the agent-facing instructions.
 
 ---
@@ -198,9 +190,9 @@ recall contract. Those two files are the agent-facing instructions.
 ## The 3D explorer
 
 `export-viz` renders a self-contained HTML explorer (`$MEMORY_VIZ`) plus its vendored engine next to
-it. Open the file in any browser. Features: nodes laid out by **meaning** (PCA of the embeddings, so
-the cloud fills space and semantically-similar memories cluster), color = fact class
-(salient / semantic / episodic) with white balls for entity hubs, deep search over title+content,
+it. Open the file in any browser. Features: a hub-anchored graph layout with a linear semantic
+projection fallback, color = episodic/semantic durability plus continuous salience highlighting,
+white balls for entity hubs, deep search over title+content,
 click-to-focus with 2-hop pruning and a 3D "auto-dodge" that pushes irrelevant nodes out of view,
 minimap, orbit controls, and smart auto-labeling. Append `?scoutTheme=dark` or `?scoutTheme=light`
 to force a theme.
@@ -214,7 +206,7 @@ To wire it into an agent:
 
 1. **Install the two skills.** Point your agent at `skills/dream/` and `skills/graph-recall/`
    (copy or symlink into wherever it loads skills from). They reference the engine as
-   `node <AGENT_MEMORY>/lib/dream.js` / `lib/recall.js`.
+   `node <AGENT_MEMORY>/src/dream.js` / `src/recall.js`.
 2. **Map the memory tools.** The dream algorithm uses three host operations — *list all memories*,
    *add a memory*, *remove a memory*. Substitute your agent's equivalents (the SKILL.md uses Microsoft
    Scout's `m_list_memories` / `m_remember` / `m_forget` as the reference).
@@ -230,7 +222,7 @@ agent-memory/
   config.js                 # env-overridable paths + model config
   setup.js                  # one-command bootstrap
   package.json
-  lib/
+  src/
     dream.js                # the consolidation engine (all subcommands)
     recall.js               # vector + graph recall (read path)
     embed.js                # local embeddings (transformers.js)

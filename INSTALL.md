@@ -3,7 +3,7 @@
 > **This file is written for the AI assistant doing the install.** The expected flow is:
 > the user unzips this package and says *"import this / set this up."* You (the assistant)
 > detect this `INSTALL.md`, run the bootstrap, import the two skills into the harness, then
-> **interview the user about the five behavioral knobs and persist their choices** before
+> **interview the user about the four behavioral knobs and persist their choices** before
 > finishing. Do not skip the interview — shipping defaults silently is the exact failure this
 > design fixes.
 
@@ -47,8 +47,8 @@ Copy-Item -Recurse -Force ".\skills\graph-recall" "$skills\graph-recall"
 
 ## Step 2 — INTERVIEW THE USER ABOUT THE KNOBS (required)
 
-dreamweave exposes exactly **five behavioral knobs**. Setup wrote sensible defaults, but you
-**must** walk the user through all five and let them choose. For each knob, present the options
+dreamweave exposes exactly **four behavioral knobs**. Setup wrote sensible defaults, but you
+**must** walk the user through all four and let them choose. For each knob, present the options
 with the recommended default highlighted (use the host's structured choice UI if available, e.g.
 Scout's `m_ask_user`), then persist their answer:
 
@@ -60,21 +60,20 @@ node <AGENT_MEMORY>/src/dream.js config set <knob> <value>
 Run `node src/dream.js config list` to print the live spec, and `config show` to see the
 resolved low-level effect of the current choices.
 
-### The five knobs
+### The four knobs
 
 | # | Knob | Options (recommended in **bold**) | What it controls |
 |---|------|-----------------------------------|------------------|
 | 1 | `retention` | **preserve** / prune | **preserve** = tiered: faded/overflow memories are *demoted to a Tier-3 archive, never deleted* — the long tail stays recoverable by recall. `prune` = legacy single-tier: faded + over-cap facts are deleted. **Recommend preserve** for a personal assistant that should never lose an insight. |
 | 2 | `capacity` | compact / **standard** / expansive | Memory size: Tier-1 inject target / hard cap / Tier-2 recall cap. compact 150/300/1500, **standard 250/500/2500**, expansive 400/800/5000. Bigger = more recall, more injected context. |
 | 3 | `forgetting` | slow / **natural** / fast | How fast ephemeral (episodic) memories fade. slow = half-lives ×2 (hold longer), **natural** = as designed, fast = ×0.5 (forget sooner). |
-| 4 | `judgment` | **off** / `<provider>:<model>` | Optional engine-internal LLM judge for **headless** runs. **off** = the host LLM running the nightly skill is the judge (via `consolidate` + confirm), zero API keys. Set a spec (e.g. `azure:gpt-5.4-mini`) only for cron/no-agent deployments; needs the matching API-key env vars. |
-| 5 | `connections` | **incremental** / thorough | Nightly weave scope. **incremental** = weave only new/changed facts (bounded cost, right for nightly runs). thorough = re-weave the whole graph each run. |
+| 4 | `connections` | **incremental** / thorough | Nightly weave scope. **incremental** = weave only new/changed facts (bounded cost, right for nightly runs). thorough = re-weave the whole graph each run. |
 
 > Correction lineage (`supersedes` edges) is **always on** — it is not a knob, because a memory
 > store that lets contradicting facts coexist untracked is simply broken. (`MEMORY_SUPERSEDE`
 > remains a bench-only env override.)
 
-> **Defaults already deliver the intended experience** (preserve + standard + natural + off +
+> **Defaults already deliver the intended experience** (preserve + standard + natural +
 > incremental). If the user just wants "the recommended setup," confirm the defaults and move
 > on — but still show them what they're getting.
 
@@ -82,8 +81,7 @@ resolved low-level effect of the current choices.
 1. "How should I handle old/faded memories — **never delete (archive them)** or prune to stay lean?" → `retention`
 2. "How large should your memory be — compact, **standard**, or expansive?" → `capacity`
 3. "How quickly should day-to-day details fade — slow, **natural**, or fast?" → `forgetting`
-4. "An optional LLM judge only matters for headless/cron runs — since I run your nightly dream, I'm the judge. Leave **off**?" → `judgment`
-5. "Nightly maintenance: **incremental** (fast) or thorough (slower, exhaustive)?" → `connections`
+4. "Nightly maintenance: **incremental** (fast) or thorough (slower, exhaustive)?" → `connections`
 
 Persist each answer with `config set`, then run `config show` and read back the resolved
 behavior to confirm.
@@ -131,8 +129,8 @@ Notes:
 ## Precedence & power-user overrides
 Resolution order is **env override → persisted `memory.config.json` → built-in default**. Every
 knob still has a raw env escape hatch (`MEMORY_TIER2_MAX`, `MEMORY_ENTRY_TARGET/MAX`,
-`MEMORY_FORGET_MULT`, `MEMORY_INCREMENTAL_WEAVE`, `MEMORY_SUPERSEDE`,
-`DREAM_LLM`) so benches / CI can pin exact low-level values without touching the config file.
+`MEMORY_FORGET_MULT`, `MEMORY_INCREMENTAL_WEAVE`). `MEMORY_SUPERSEDE` is a bench/CI
+escape hatch for the always-on correction-lineage invariant, not a user-facing knob.
 
 ## Uninstall
 Delete the two skill folders from your skills dir, delete the unzipped package, and remove the

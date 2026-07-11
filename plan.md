@@ -155,8 +155,8 @@ Stage cursors advance only after that stage completes successfully.
   queries are seed/cluster scoped and index-driven; reembedding reads only touched
   edges and runs real 32-item model batches; visualization projection is linear;
   repeated weave and remaining nightly maintenance work remain).
-- [ ] Phase 5 documentation and operational hardening (strict atomic config and exact
-  anchor recognition complete; public documentation reconciliation remains).
+- [x] Phase 5 documentation and operational hardening (strict atomic config, exact
+  anchor recognition, and public contract/configuration reconciliation complete).
 - [ ] Local validation.
 - [ ] Live harness validation.
 - [ ] Full 180-day evaluation.

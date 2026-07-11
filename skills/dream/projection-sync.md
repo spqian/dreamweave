@@ -15,8 +15,8 @@ consolidation is routed through `apply-*` (see `SKILL.md` stage 5).
 - A **merge/synthesis survivor is born inside the db**, signature-first, with **`memory_id = ""`** — it has
   never existed in the harness. Projecting it (m_remember → capture id → record-projection) is what creates
   the diff. Its merged constituents are demoted to **`notes='detail'`** (kept for recall, **not** injected).
-- Historically the live harness produced **zero diff every night** because consolidation ran with judgment
-  off: no survivor was ever born in the db, so `export-harness` only re-emitted ids the harness already had.
+- Historically the live harness produced **zero diff every night** because caller judgment/apply was
+  skipped: no survivor was ever born in the db, so `export-harness` only re-emitted ids the harness already had.
   With stage 5 now routing through `apply-merges`/`apply-synthesis`, survivors exist — this runbook ships them.
 
 ## Preconditions (must already hold when you reach this stage)
