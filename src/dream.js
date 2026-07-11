@@ -253,6 +253,18 @@ async function reembed(db, onlyIds) {
 function repairGraph(db) {
   const now = new Date().toISOString();
   db.prepare("UPDATE nodes SET memory_id='' WHERE memory_id='live'").run();
+  // Vector rows share the nodes.id identity space. Legacy delete paths could
+  // leave vectors behind, and revived active nodes could remain duplicated in
+  // the cold sidecar. Both states distort KNN and can collide with future ids.
+  db.prepare("DELETE FROM vec_nodes WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id=vec_nodes.rowid)").run();
+  db.prepare("DELETE FROM vec_archive WHERE NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id=vec_archive.rowid)").run();
+  db.prepare(`
+    DELETE FROM vec_archive
+    WHERE EXISTS (
+      SELECT 1 FROM nodes n
+      WHERE n.id=vec_archive.rowid AND (n.notes IS NULL OR n.notes<>'archive')
+    )
+  `).run();
   // Self-heal prior pollution: blank `fact:`-sig 'scaffolding' stubs are illegitimate (a fact
   // signature was wrongly resurrected as a content-less entity by the old repairGraph). Delete
   // them here; the dangling-edge scan below then drops any edges that pointed at them.
@@ -1031,6 +1043,22 @@ async function weave(db, opts) {
   // facts (the prior value is found among ALL active via subjBySig/KNN).
   const subjSource = incremental ? subjFull.filter(isToWeave) : subjFull;
 
+  // Self-heal legacy cross-aspect corrections. The old specific-entity shortcut
+  // could let a narrow correction supersede an entire multi-aspect project gist.
+  // Every currently-valid creation path requires at least this lexical floor.
+  let supersedeEdgesPruned = 0;
+  for (const e of db.prepare(`
+    SELECT e.rowid, s.fact src_fact, d.fact dst_fact
+    FROM edges e
+    JOIN nodes s ON s.signature=e.src AND s.kind='fact'
+    JOIN nodes d ON d.signature=e.dst AND d.kind='fact'
+    WHERE e.rel='supersedes'
+  `).all()) {
+    if (jaccard(toks(e.src_fact), toks(e.dst_fact)) < 0.12) {
+      supersedeEdgesPruned += db.prepare("DELETE FROM edges WHERE rowid=?").run(e.rowid).changes;
+    }
+  }
+
   let supersedeEdges = 0;
   const SUP = (opts && opts.supersede) || T.supersede;
   if (SUP) await profA("weave.supersede", async () => {
@@ -1059,7 +1087,7 @@ async function weave(db, opts) {
         const ojac = jaccard(ft, toks(o.fact));
         const sharedSpecificEnt = fe.size && [...mentionsOf(nb.s)].some((x) => fe.has(x) && (entFreq.get(x) || 0) <= SPECIFIC_MAX);
         const sharedSpecificScope = fScopeSpecific && scopeOf(o.fact) === fScope && ojac >= 0.12;
-        if (ojac >= 0.34 || sharedSpecificEnt || sharedSpecificScope) { target = o; bestSim = sim; }
+        if (ojac >= 0.34 || (sharedSpecificEnt && ojac >= 0.12) || sharedSpecificScope) { target = o; bestSim = sim; }
       }
       if (!target || hasEdge.get(f.signature, target.signature, "supersedes")) continue;
       addEdge(f.signature, "supersedes", target.signature, 0.9);
@@ -1167,7 +1195,7 @@ async function weave(db, opts) {
   prof("weave.repairGraph", () => repairGraph(db));
   const degFinal = degreeMap(db);
   const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !degFinal.get(s));
-  return { new_entity_hubs: newHubs, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, sequence_edges: sequenceEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
+  return { new_entity_hubs: newHubs, aliases_merged: aliasesMerged, mention_edges: mentionEdges, related_edges: relatedEdges, similar_edges: similarEdges, supersede_edges: supersedeEdges, supersede_edges_pruned: supersedeEdgesPruned, sequence_edges: sequenceEdges, rescued_islands: rescued, remaining_islands: islands.length, incremental: !!incremental, weaved: factRows.length };
 }
 
 // ---- REPORT/APPLY: caller-driven judgment contract ---------------------------

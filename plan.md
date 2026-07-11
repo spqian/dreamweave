@@ -150,11 +150,12 @@ Stage cursors advance only after that stage completes successfully.
   legacy duplicates; operator resolution of legacy duplicates remains).
 - [x] Phase 3 recall correctness (pre-truncation activation, historical target-date
   ranking, active date coverage, numeric/cross-month parsing, and ambiguous-May guard
-  complete; archive dedup now preserves distinct assertions sharing a broad scope).
+  complete; archive dedup preserves distinct scoped assertions and supersede lineage
+  requires same-aspect overlap).
 - [ ] Phase 4 performance (recall graph, supersession, sequence, and returned-edge
   queries are seed/cluster scoped and index-driven; reembedding reads only touched
-  edges and runs real 32-item model batches; visualization projection is linear;
-  repeated weave and remaining nightly maintenance work remain).
+  edges and runs real 32-item model batches; vector identity self-heals and visualization
+  projection is linear; repeated weave and remaining nightly maintenance work remain).
 - [x] Phase 5 documentation and operational hardening (strict atomic config, exact
   anchor recognition, and public contract/configuration reconciliation complete).
 - [ ] Local validation.
