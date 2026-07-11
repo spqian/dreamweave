@@ -162,16 +162,19 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Phase 5 documentation and operational hardening (strict atomic config, exact
   anchor recognition (including wrapped host text), and public contract/configuration
   reconciliation complete).
-- [x] Local validation (26/26 unit files, migration/doctor on a live-store copy,
+- [x] Local validation (27/27 unit files, migration/doctor on a live-store copy,
   report/apply/projection/recall/viz checks, embedding and projection probes).
 - [x] Live harness validation (Scout invoked graph-recall for a Germany West
   Central timeline, separated calendar week from release-train lineage, and
   ranked the superseding false-alarm correction over the original SLA alert).
-- [ ] Full 180-day evaluation rerun for the report-bound merge contract. Previous
-  hardening evaluation passed (1,087 aligned judgments / 311 questions:
-  mean 5.419 -> 5.635, +0.216; final occurrence 5.399 -> 5.511,
-  +0.113; every category non-regressing, temporal reasoning 6.0/6.0,
-  no timeouts. Material one-off reversals were consolidation variance:
-  the same evolving-value questions reversed to correct answers in later
-  occurrences, while the aggregate and final-state comparisons improved).
+- [x] Full 180-day evaluation rerun for the report-bound merge contract passed.
+  Against `oc-180d-hardening-edfea02`, 1,087 occurrence-aligned judgments across
+  311 questions moved 5.635 -> 5.593 (-0.041), while final-per-question results
+  improved 5.511 -> 5.585 (+0.074). The run completed all 18 checkpoints with no
+  timeout, apply-merges exit-3, stale report, or report-envelope incompatibility.
+  Final factual recall (+0.160), decision tracking (+0.281), and contradiction
+  resolution (+0.111) improved. Small mixed category deltas and the larger
+  occurrence-only synthesis variance came from different LLM consolidation
+  survivors/judgments; inspected final reversals were isolated rather than a
+  systematic merge-contract failure.
 - [ ] Push/release.
