@@ -82,6 +82,16 @@ if (p[0].memory_id !== "anchor-harness-id") fail("ingest did not capture anchor 
 
 console.log("ok: anchor text in harness is recognized on ingest (no node created)");
 console.log("ok: ingest captures the anchor's harness id -> round-trips to it (KEEP)");
+
+// A user-authored memory that merely uses the reserved-looking prefix is still data.
+const prefixedSnap = [{ id: "user-prefixed", fact: "[memory-usage] The user documented a custom memory-usage policy.", category: "context" }];
+fs.writeFileSync(snapPath, JSON.stringify(prefixedSnap));
+run("ingest-harness", "--file", snapPath);
+const db3 = new Database(path.join(dataDir, "memory.db"), { readonly: true });
+const prefixed = db3.prepare("SELECT count(*) c FROM nodes WHERE memory_id='user-prefixed'").get().c;
+db3.close();
+if (prefixed !== 1) fail("non-anchor [memory-usage] user memory was silently consumed");
+
 console.log("PASS \u2713 anchor projection round-trip");
 
 fs.rmSync(dataDir, { recursive: true, force: true });

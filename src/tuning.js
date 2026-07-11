@@ -53,7 +53,14 @@ function defaultKnobs() {
 
 function normalizeKnobs(raw = {}) {
   const k = defaultKnobs();
-  for (const name of Object.keys(KNOBS)) if (raw[name] != null) k[name] = raw[name];
+  for (const name of Object.keys(KNOBS)) {
+    if (raw[name] == null) continue;
+    const value = String(raw[name]).trim().toLowerCase();
+    if (!KNOBS[name].values.includes(value)) {
+      throw new Error(`invalid persisted value "${raw[name]}" for ${name}. Allowed: ${KNOBS[name].values.join(" | ")}`);
+    }
+    k[name] = value;
+  }
   return k;
 }
 
@@ -62,15 +69,22 @@ function loadConfigFile() {
     const raw = fs.readFileSync(CONFIG_PATH, "utf8");
     const j = JSON.parse(raw);
     return j && typeof j === "object" ? j : {};
-  } catch {
-    return {}; // missing/unreadable → defaults
+  } catch (e) {
+    if (e && e.code === "ENOENT") return {};
+    throw new Error(`cannot load memory config ${CONFIG_PATH}: ${e.message}`);
   }
 }
 
 function saveConfig(knobs) {
   const out = { version: CONFIG_VERSION, knobs };
   fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2) + "\n", "utf8");
+  const tmp = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(out, null, 2) + "\n", { encoding: "utf8", flag: "wx" });
+    fs.renameSync(tmp, CONFIG_PATH);
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+  }
   return out;
 }
 

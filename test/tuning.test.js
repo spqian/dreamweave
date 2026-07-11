@@ -58,6 +58,17 @@ chk(r.entryTarget === 999, "env MEMORY_ENTRY_TARGET overrides capacity profile")
 chk(r.forgetMultiplier === 0.25, "env MEMORY_FORGET_MULT overrides forgetting knob");
 chk(r.tiered === false, "env can force single-tier (TIER2_MAX=0)");
 
+// 6) Malformed/invalid persisted config must fail clearly instead of silently
+// resetting user behavior to defaults.
+fs.writeFileSync(process.env.MEMORY_CONFIG, "{not-json", "utf8");
+let malformedFailed = false;
+try { T.resolve({}); } catch (e) { malformedFailed = /cannot load memory config/.test(e.message); }
+chk(malformedFailed, "malformed config fails clearly");
+fs.writeFileSync(process.env.MEMORY_CONFIG, JSON.stringify({ version: 1, knobs: { retention: "surprise" } }), "utf8");
+let invalidFailed = false;
+try { T.resolve({}); } catch (e) { invalidFailed = /invalid persisted value/.test(e.message); }
+chk(invalidFailed, "invalid persisted knob fails clearly");
+
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
 console.log(ok ? "\nPASS ✓ tuning resolver" : "\nFAILED ✗");
 process.exit(ok ? 0 : 1);

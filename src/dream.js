@@ -150,6 +150,11 @@ function deriveSlug(fact) {
   return (w || "fact").slice(0, 48);
 }
 
+function isAnchorFact(fact) {
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  return norm(fact) === norm(ANCHOR_MEMORY_FACT);
+}
+
 function openDb() {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   const db = new Database(DB_PATH);
@@ -339,7 +344,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       // ingested as a normal fact before this guard existed), capture its id in `meta` so the
       // anchor round-trips to THAT id (projection-sync KEEPs it, no duplicate) and drop any lingering
       // node so the reminder text doesn't pollute the graph/recall as an ordinary fact.
-      if (fact.startsWith("[memory-usage]")) {
+      if (isAnchorFact(fact)) {
         setMeta(db, "anchor_memory_id", mid);
         const exA = exByMem.get(mid);
         if (exA) {
@@ -435,7 +440,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
   // The engine anchor (channel E) is tracked in meta, not as a node, so it is legitimately
   // absent from dbIds — exclude it from the completeness check (else ingest/verify gate falsely).
-  res.missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !String(m.fact || "").trim().startsWith("[memory-usage]"); }).map((m) => m.id || m.memory_id);
+  res.missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(m.fact); }).map((m) => m.id || m.memory_id);
   res.complete = res.missing.length === 0;
   return res;
 }
@@ -475,7 +480,7 @@ function verifySync(db, file) {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
   const mems = Array.isArray(raw) ? raw : (raw.memories || []);
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
-  const missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !String(m.fact || "").trim().startsWith("[memory-usage]"); }).map((m) => m.id || m.memory_id);
+  const missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(m.fact); }).map((m) => m.id || m.memory_id);
   return { harness_count: mems.length, memory_ids_in_db: dbIds.size, missing, complete: missing.length === 0 };
 }
 
@@ -814,11 +819,28 @@ function dreamCore(db, flags = {}) {
 // and alias folding), so abbreviations and first-name aliases still match.
 function vocabWithForms(db) {
   const rows = db.prepare("SELECT signature, text FROM nodes WHERE kind='entity'").all();
-  return rows.map((r) => {
+  const vocab = rows.map((r) => {
     const base = ent.formsFor(r.signature);
     const extra = (r.text || "").split("|").map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 3);
     return { sig: r.signature, type: ent.typeOf(r.signature), forms: [...new Set([...base, ...extra])] };
   });
+  // Bare first/last names are useful only while unambiguous. If two person hubs
+  // own the same short form ("Peter"), attaching a bare mention to both creates a
+  // false graph bridge and contaminates recall. Full names remain available.
+  const shortOwners = new Map();
+  for (const v of vocab) {
+    if (v.type !== "person") continue;
+    for (const f of v.forms) {
+      if (f.includes(" ")) continue;
+      if (!shortOwners.has(f)) shortOwners.set(f, new Set());
+      shortOwners.get(f).add(v.sig);
+    }
+  }
+  for (const v of vocab) {
+    if (v.type !== "person") continue;
+    v.forms = v.forms.filter((f) => f.includes(" ") || (shortOwners.get(f) || new Set()).size <= 1);
+  }
+  return vocab;
 }
 
 // Fold an alias entity hub into a canonical one: move its surface forms onto the
