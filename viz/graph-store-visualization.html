@@ -149,6 +149,11 @@ html[data-theme="dark"] #graph { background:
       <button class="tbtn on" id="modeSem" title="Semantic axis: meaning links (related_to / similar_to / mentions). Hides year-reference hubs.">◆ Semantic</button>
       <button class="tbtn" id="modeTmp" title="Temporal axis: only sequence + supersedes — the lineages of how events evolved over time.">◷ Temporal</button>
       <span style="width:1px;align-self:stretch;background:var(--cp-border);margin:0 3px;"></span>
+      <span class="small" style="align-self:center;margin-left:2px;">Edges:</span>
+      <button class="tbtn" id="edgeAlways" title="Render every edge in the selected semantic or temporal axis">Always On</button>
+      <button class="tbtn" id="edgeClick" title="Reveal direct edges for the selected node">Click</button>
+      <button class="tbtn" id="edgeHover" title="Reveal direct edges while the pointer is over a node">Hover</button>
+      <span style="width:1px;align-self:stretch;background:var(--cp-border);margin:0 3px;"></span>
       <button class="tbtn" id="homeBtn" title="Fit all nodes in view">⌂ Fit</button>
       <button class="tbtn on" id="rotateBtn" title="Toggle idle auto-rotation">↻ Auto</button>
       <button class="tbtn" id="focusBtn" title="Zoom to current selection">⊙ Focus</button>
@@ -221,7 +226,7 @@ const data = {"nodes":[],"links":[]};
   const TEMPORAL_RELS=new Set(['sequence','supersedes']);
   const isTemporalRel=r=>TEMPORAL_RELS.has(r);
   const isTimeRefHub=n=>n.kind==='entity'&&/^ref:(?:19|20)\d{2}(?:[-:]\d{1,2}){0,2}$/.test(n.id);
-  let linkMode='semantic';
+  let linkMode='semantic', edgeMode=rawLinks.length>1000?'hover':'always';
   const refHub=new Uint8Array(nodes.length);
   nodes.forEach(n=>{ if(isTimeRefHub(n)) refHub[n.idx]=1; });
   const adjSem=nodes.map(()=>[]), adjTmp=nodes.map(()=>[]);
@@ -253,8 +258,10 @@ const data = {"nodes":[],"links":[]};
   let hop=null, hits=new Set(), focusId=null;
   // Golden highlight for the focused node's connections: focusPulse ramps 0->1 (grow-in).
   let focusPulse=0, focusPulseStart=0; const GOLD=hexToRgb(css('--cp-warning'));
-  function linkIncidentFocus(l){ if(focusId==null) return false; const [s,t]=endIds(l); return s===focusId||t===focusId; }
+  function activeEdgeNode(){ return edgeMode==='hover'?hoverId:focusId; }
+  function linkIncidentFocus(l){ const id=activeEdgeNode(); if(id==null) return false; const [s,t]=endIds(l); return s===id||t===id; }
   function linkWidthOf(l){ let w=0.6+l.weight*1.2;
+    if(edgeMode==='hover'&&hoverId!=null&&linkIncidentFocus(l)) return w*0.5+3.2;
     if(focusPulse>0 && linkIncidentFocus(l)) w = w*0.5 + 0.4 + 3.4*focusPulse; return w; }
   function recomputeHops(){
     const q=search.value.trim().toLowerCase(); hits=new Set();
@@ -275,7 +282,7 @@ const data = {"nodes":[],"links":[]};
   function dimT(n){ if(hop===null)return 0; const h=hop[n.idx]; if(h===0)return 0; if(h===1)return 0.42; if(h===2)return 0.68; return 0.88; }
   function nodeVis(n){ if(!passesFilter(n)) return false;
     if(linkMode==='semantic' && refHub[n.idx]) return false;
-    if(focusId!=null && hop && hop[n.idx]===-1) return false; return true; }
+    return true; }
   const avgCol=(a,b)=>{ const ca=baseColor(a),cb=baseColor(b); return [(ca[0]+cb[0])>>1,(ca[1]+cb[1])>>1,(ca[2]+cb[2])>>1]; };
   // In temporal mode a node with no sequence/supersedes edge is kept as faint background
   // context (the nebula shape stays legible) while the lineages render bright on top.
@@ -298,17 +305,24 @@ const data = {"nodes":[],"links":[]};
       base=Math.max(_avgFact*Math.max(1.1,H*0.42), Math.min(base, _avgFact*H*2.7)); }
     else base=0.9+n.strength*2.8;
     let s=base*(hop!==null&&hop[n.idx]===0?1.8:1); if(tmpBg(n)) s*=0.5; return s; }
-  function linkVis(l){ if(!linkActive(l)) return false; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t); return !!a&&!!b&&nodeVis(a)&&nodeVis(b); }
+  function signalOf(l,a,b){ return l.weight/Math.sqrt(Math.max(1,degree[a.idx]*degree[b.idx])); }
+  function linkVis(l){ if(!linkActive(l)) return false; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t);
+    if(!a||!b||!nodeVis(a)||!nodeVis(b)) return false;
+    if(edgeMode==='always') return true;
+    const id=activeEdgeNode(); return id!=null&&(s===id||t===id);
+  }
   function linkColorOf(l){ if(!linkActive(l)) return 'rgba(0,0,0,0)';
     const [sid,tid]=endIds(l); const a=byId.get(sid), b=byId.get(tid);
     if(!a||!b) return mix(PAL.entity,0.7); if(!nodeVis(a)||!nodeVis(b)) return 'rgba(0,0,0,0)';
+    if(edgeMode==='hover'&&hoverId!=null&&linkIncidentFocus(l)) return 'rgba('+GOLD[0]+','+GOLD[1]+','+GOLD[2]+',0.92)';
     if(focusPulse>0 && linkIncidentFocus(l)) return 'rgba('+GOLD[0]+','+GOLD[1]+','+GOLD[2]+','+(0.5+0.45*focusPulse).toFixed(3)+')';
     if(linkMode==='temporal'){ const base=l.rel==='supersedes'?PAL.salient:PAL.episodic;
       if(hop!==null){ const hit=hop[a.idx]===0||hop[b.idx]===0; return mix(base, hit?0.0:0.4); }
       return mix(base,0.12); }
     const col=avgCol(a,b);
     if(hop!==null){ const ha=hop[a.idx],hb=hop[b.idx],hit=ha===0||hb===0; return mix(col, hit?0.0:Math.max(dimT(a),dimT(b),0.5)); }
-    return mix(col,0.28); }
+    const alpha=Math.max(0.10,Math.min(0.92,0.08+signalOf(l,a,b)*12));
+    return 'rgba('+col[0]+','+col[1]+','+col[2]+','+alpha.toFixed(3)+')'; }
 
   function updateTop(){ const pool=nodes.filter(n=>n.kind==='fact').sort((a,b)=>b.strength-a.strength);
     topList.innerHTML=pool.slice(0,12).map(n=>'<div class="item" data-id="'+escapeHtml(n.id)+'"><strong>'+escapeHtml(n.id)+'</strong>'+(n.cls||'fact')+' \u2022 strength '+n.strength.toFixed(2)+'</div>').join('');
@@ -422,13 +436,13 @@ const data = {"nodes":[],"links":[]};
       .nodeLabel(o=>{ const n=byId.get(o.id); return '<div style="max-width:300px;font:13px Segoe UI;background:var(--cp-panel-strong);color:var(--cp-text);border:1px solid var(--cp-border);border-radius:10px;padding:8px 10px;white-space:normal;"><strong>'+escapeHtml(n.id)+'</strong><div style="color:var(--cp-text-muted)">'+(n.kind==='entity'?'entity hub':(n.cls||'fact'))+(n.kind==='fact'?' \u2022 '+n.strength.toFixed(2):'')+' \u2022 '+degree[n.idx]+' links</div>'+(n.fact?'<div style="margin-top:4px;">'+escapeHtml(n.fact)+'</div>':'')+'</div>'; })
       .linkColor(linkColorOf)
       .linkWidth(linkWidthOf)
-      .linkOpacity(0.5)
+      .linkOpacity(1)
       .linkVisibility(linkVis)
       .linkDirectionalParticles(l=>{ if(hop===null||!linkActive(l))return 0; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t); return (a&&b&&(hop[a.idx]===0||hop[b.idx]===0))?2:0; })
       .linkDirectionalParticleWidth(1.4).linkDirectionalParticleSpeed(0.006)
       .onNodeClick(o=>{ focusOn(o.id); flyTo(o); })
       .onBackgroundClick(()=>{ focusId=null; hideDetail(); recomputeHops(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); })
-      .onNodeHover(o=>{ elGraph.style.cursor=o?'pointer':null; hoverId=o?o.id:null; });
+      .onNodeHover(o=>{ elGraph.style.cursor=o?'pointer':null; hoverId=o?o.id:null; if(edgeMode==='hover') refresh(); });
     Graph.d3Force('charge').strength(-LAYOUT.charge);
     if(Graph.d3Force('link')) Graph.d3Force('link').distance(LAYOUT.linkDist).strength(0.22);
     Graph.d3Force('semantic', semanticForce(0.62));
@@ -458,6 +472,38 @@ const data = {"nodes":[],"links":[]};
     cam.lookAt(t); const c=Graph.controls(); c&&c.update&&c.update(); lastInteract=Date.now(); pauseRotate(); }
   function pauseRotate(){ const c=Graph&&Graph.controls(); if(c) c.autoRotate=false; }
   function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
+  // OrbitControls dollies toward controls.target, which makes wheel zoom feel pinned to the
+  // previously focused node. Scale both camera and target around the world-space point under
+  // the pointer instead: that point remains under the cursor while zoom also becomes a natural
+  // semantic LOD control. The anchor is the mouse ray intersecting the camera-facing plane
+  // through the current orbit target, so this works over empty space as well as nodes.
+  function pointerDolly(ev){
+    if(!Graph) return;
+    ev.preventDefault(); ev.stopImmediatePropagation();
+    const cam=Graph.camera(), ctl=Graph.controls(), t=camTarget(), r=elGraph.getBoundingClientRect();
+    const nx=((ev.clientX-r.left)/Math.max(1,r.width))*2-1;
+    const ny=1-((ev.clientY-r.top)/Math.max(1,r.height))*2;
+    const tan=Math.tan(((cam.fov||50)*Math.PI/180)/2), aspect=cam.aspect||(r.width/Math.max(1,r.height));
+    let vx=nx*aspect*tan, vy=ny*tan, vz=-1;
+    const vl=Math.hypot(vx,vy,vz)||1; vx/=vl; vy/=vl; vz/=vl;
+    // Rotate camera-space ray by the camera quaternion without depending on a global THREE.
+    const q=cam.quaternion, ux=q.y*vz-q.z*vy, uy=q.z*vx-q.x*vz, uz=q.x*vy-q.y*vx;
+    const uux=q.y*uz-q.z*uy, uuy=q.z*ux-q.x*uz, uuz=q.x*uy-q.y*ux;
+    const rx=vx+2*(q.w*ux+uux), ry=vy+2*(q.w*uy+uuy), rz=vz+2*(q.w*uz+uuz);
+    const fwd=camForward(cam), px=cam.position.x, py=cam.position.y, pz=cam.position.z;
+    const denom=rx*fwd.x+ry*fwd.y+rz*fwd.z;
+    const along=Math.abs(denom)>1e-6?((t.x-px)*fwd.x+(t.y-py)*fwd.y+(t.z-pz)*fwd.z)/denom:0;
+    const a=along>0?{x:px+rx*along,y:py+ry*along,z:pz+rz*along}:{x:t.x,y:t.y,z:t.z};
+    const rawDelta=ev.deltaY*(ev.deltaMode===1?16:(ev.deltaMode===2?r.height:1));
+    let factor=Math.exp(Math.max(-600,Math.min(600,rawDelta))*0.00125);
+    const dist=Math.hypot(px-t.x,py-t.y,pz-t.z)||1;
+    factor=Math.max(8/dist,Math.min(4000/dist,factor));
+    const np={x:a.x+(px-a.x)*factor,y:a.y+(py-a.y)*factor,z:a.z+(pz-a.z)*factor};
+    const nt={x:a.x+(t.x-a.x)*factor,y:a.y+(t.y-a.y)*factor,z:a.z+(t.z-a.z)*factor};
+    cam.position.set(np.x,np.y,np.z); if(ctl&&ctl.target&&ctl.target.set) ctl.target.set(nt.x,nt.y,nt.z);
+    cam.lookAt(nt.x,nt.y,nt.z); if(ctl&&ctl.update) ctl.update();
+    lastInteract=Date.now(); pauseRotate();
+  }
 
   // ---- buttons ----
   // Live layout panel: rescale semantic anchors (spread) + tune forces / rotation without a reload.
@@ -499,6 +545,16 @@ const data = {"nodes":[],"links":[]};
     recomputeHops(); refreshStats(); if(Graph){ Graph.zoomToFit(700,40); if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); } }
   document.getElementById('modeSem').onclick=()=>setLinkMode('semantic');
   document.getElementById('modeTmp').onclick=()=>setLinkMode('temporal');
+  function setEdgeMode(mode){ edgeMode=mode;
+    document.getElementById('edgeAlways').classList.toggle('on',mode==='always');
+    document.getElementById('edgeClick').classList.toggle('on',mode==='click');
+    document.getElementById('edgeHover').classList.toggle('on',mode==='hover');
+    refresh();
+  }
+  document.getElementById('edgeAlways').onclick=()=>setEdgeMode('always');
+  document.getElementById('edgeClick').onclick=()=>setEdgeMode('click');
+  document.getElementById('edgeHover').onclick=()=>setEdgeMode('hover');
+  setEdgeMode(edgeMode);
   document.getElementById('homeBtn').onclick=()=>{ if(Graph){ focusId=null; hideDetail(); recomputeHops(); Graph.zoomToFit(800,50); lastInteract=Date.now(); } };
   document.getElementById('rotateBtn').onclick=()=>setRotate(!autoRotate);
   document.getElementById('focusBtn').onclick=()=>{ if(focusId){ const o=Graph.graphData().nodes.find(n=>n.id===focusId); if(o) flyTo(o); } else if(Graph){ Graph.zoomToFit(700,50); } };
@@ -510,7 +566,7 @@ const data = {"nodes":[],"links":[]};
   document.getElementById('orbUp').onclick=()=>orbit(0,0.28);
   document.getElementById('orbDown').onclick=()=>orbit(0,-0.28);
   elGraph.addEventListener('pointerdown',()=>{ lastInteract=Date.now(); pauseRotate(); });
-  elGraph.addEventListener('wheel',()=>{ lastInteract=Date.now(); pauseRotate(); },{passive:true});
+  elGraph.addEventListener('wheel',pointerDolly,{passive:false,capture:true});
 
   // ---- label overlay + minimap + idle-resume loop ----
   const labelPool=[];
