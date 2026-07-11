@@ -50,5 +50,11 @@ eq("deals closed last month", { lo: "2026-05-30", hi: "2026-06-30" });
 eq("what happened recently", { lo: "2026-06-20", hi: "2026-06-30" });
 // explicit dates still take precedence over relative phrasing
 eq("what happened on 2026-06-25 last week", { lo: "2026-06-25", hi: "2026-06-25" });
+// numeric and cross-month ranges
+eq("what happened on 2/27", { lo: "2026-02-27", hi: "2026-02-27" });
+eq("what happened on 2/27/2025", { lo: "2025-02-27", hi: "2025-02-27" });
+eq("May 27 to June 2", { lo: "2026-05-27", hi: "2026-06-02" });
+// "may" as an auxiliary verb is not a date.
+eq("what may have caused the outage", null);
 
 console.log(`\nPASS \u2713 parseDateRange (${n} cases)`);

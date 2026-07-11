@@ -144,9 +144,12 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Phase 1.2 nightly ordering.
 - [ ] Phase 1.3 dirty entity propagation (approved hub/form backfill complete;
   cross-night mechanical evidence and ambiguous short-name handling remain).
-- [ ] Phase 2 mutation integrity (atomic/idempotent dream complete; merge and schema
-  integrity remain).
-- [ ] Phase 3 recall correctness.
+- [ ] Phase 2 mutation integrity (atomic/idempotent dream, report-bound merges,
+  committed merge vectors, edge uniqueness, and expanded doctor checks complete;
+  non-empty memory-id enforcement remains).
+- [ ] Phase 3 recall correctness (pre-truncation activation, historical target-date
+  ranking, active date coverage, numeric/cross-month parsing, and ambiguous-May guard
+  complete; scoped edge retrieval and remaining dedup policy work remain).
 - [ ] Phase 4 performance.
 - [ ] Phase 5 documentation and operational hardening.
 - [ ] Local validation.

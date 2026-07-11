@@ -39,6 +39,8 @@ function ensureSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src);
     CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst);
     CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(rel);
+    CREATE INDEX IF NOT EXISTS idx_edges_rel_src ON edges(rel, src);
+    CREATE INDEX IF NOT EXISTS idx_edges_rel_dst ON edges(rel, dst);
 
     CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 
@@ -116,6 +118,25 @@ function ensureSchema(db) {
     try { db.exec(`ALTER TABLE nodes ADD COLUMN ${col}`); } catch (e) { /* already present */ }
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_dirty_seq ON nodes(dirty_seq)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_memory_id ON nodes(memory_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_kind_notes_first_seen ON nodes(kind, notes, first_seen)");
+
+  // Many mutation paths intentionally use INSERT OR IGNORE for graph edges. That is
+  // only meaningful when the schema enforces edge identity. Old stores may already
+  // contain duplicates, so collapse them once before creating the unique index.
+  try {
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(src, ifnull(rel,''), dst)");
+  } catch (e) {
+    db.transaction(() => {
+      db.exec(`
+        DELETE FROM edges
+        WHERE rowid NOT IN (
+          SELECT MIN(rowid) FROM edges GROUP BY src, ifnull(rel,''), dst
+        )
+      `);
+      db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(src, ifnull(rel,''), dst)");
+    })();
+  }
 }
 
 module.exports = { ensureSchema };

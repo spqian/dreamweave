@@ -47,6 +47,10 @@ function runRecall(query, asOf) {
   const conceptFact = "Recurring PPVNET container DNS Sev4 incidents across ppvnet regions (generalized pattern).";
   const cInfo = insNode.run(conceptSig, "semantic", 0.8, "2026-06-30", conceptFact, "gist");
   insVecN.run(BigInt(cInfo.lastInsertRowid), toVecBlob(await embedOne(conceptFact)));
+  const activeNullSig = "fact:board-june-27";
+  const activeNullFact = "The board approved the migration plan.";
+  const activeInfo = insNode.run(activeNullSig, "semantic", 0.6, "2026-06-27", activeNullFact, null);
+  insVecN.run(BigInt(activeInfo.lastInsertRowid), toVecBlob(await embedOne(activeNullFact)));
 
   // Demoted members — notes='archive', vectors in vec_archive (NOT vec_nodes), detail_of lineage.
   // m5 sits OUTSIDE the "late June" window (May) to prove the time tier bounds its window.
@@ -87,6 +91,12 @@ function runRecall(query, asOf) {
   console.log(`(B) topical query -> archived rows: ${bArchived.length} via [${bVias.join(",")}], archive_time rows: ${bTime.length}`);
   if (bArchived.length === 0) fail("(B) no archived member reached by detail_of/archive_vec/keyword on a topical query");
   if (bTime.length !== 0) fail("(B) time tier fired on a query with NO date (parseDateRange should be null)");
+
+  // ---- (C) ACTIVE date-only lookup: notes=NULL is a valid active state and a pure
+  // date query has no topical terms. It must still surface through active_time. ----
+  const c = runRecall("what happened on 2026-06-27", "2026-06-30");
+  const cNode = c.cluster.nodes.find((n) => n.id === activeNullSig);
+  if (!cNode) fail("(C) date-only lookup omitted an active notes=NULL fact");
 
   console.log(ok ? "\nPASS \u2713 bookshelf recalled both with and without a time window" : "\nFAILED \u2717");
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* leave tmp */ }

@@ -50,6 +50,9 @@ process.env.MEMORY_MERGE_KEEP = "false";
     const info = ins.run(f.sig, "semantic", f.strength, f.first_seen, f.fact);
     insVec.run(BigInt(info.lastInsertRowid), toVecBlob(await embedOne(f.fact)));
   }
+  db.prepare("INSERT INTO nodes (signature, memory_id, kind, class, strength, first_seen, fact) VALUES ('person:theresa-caldwell','','entity','semantic',0.5,'2026-06-20','')").run();
+  const edge = db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,'mentions','person:theresa-caldwell',0.8,'2026-06-20','2026-06-20')");
+  for (const f of facts) edge.run(f.sig);
 
   // Worst-case LLM decision: it picks the ACTION fact as the survivor and writes
   // a PLAN-phrased gist (exactly the q313 collapse).
@@ -60,7 +63,7 @@ process.env.MEMORY_MERGE_KEEP = "false";
     memberSigs: ["fact:resched-sent", "fact:resched-rule", "fact:resched-hold", "fact:resched-alt"],
   }];
 
-  await applyMerges(db, decisions, {});
+  await applyMerges(db, decisions, { sim: 0.3 });
 
   let ok = true;
   const fail = (m) => { console.error("FAIL:", m); ok = false; };

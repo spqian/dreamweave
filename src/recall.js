@@ -13,6 +13,51 @@ const { ageDays, ageTag } = require("./timeline");
 const cfg = require("../config");
 
 const DB_PATH = cfg.DB_PATH;
+const ACT_LAMBDA = 0.2;
+const ACT_COS_FLOOR = 0.30;
+const ACT_SUPERSEDE_PENALTY = 0.15;
+const ACT_DETAIL_PENALTY = 0.12;
+
+function activationScore(cosine, strength, opts = {}) {
+  const gate = cosine >= ACT_COS_FLOOR ? 1 : 0;
+  let lambda = ACT_LAMBDA;
+  if (opts.dateIntent && !opts.histIntent) lambda *= 0.5;
+  let score = cosine + lambda * (strength || 0) * gate;
+  if (opts.superseded && !opts.histIntent) score -= ACT_SUPERSEDE_PENALTY;
+  if (opts.detail) score -= ACT_DETAIL_PENALTY;
+  score += opts.dateAdjustment || 0;
+  return score;
+}
+
+function dateActivationAdjustment(firstSeen, range) {
+  if (!range || !firstSeen) return 0;
+  const day = String(firstSeen).slice(0, 10);
+  if (day >= range.lo && day <= range.hi) return 0.2;
+  if (day > range.hi) return -0.2;
+  return 0;
+}
+
+function rankSeedCandidates(rows, opts = {}) {
+  const survivors = opts.survivors || new Map();
+  const pool = new Set(rows.map((r) => r.signature));
+  return rows
+    .map((r, index) => {
+      const successor = survivors.get(r.signature);
+      const superseded = !!(successor && pool.has(successor));
+      const cosine = 1 - r.distance;
+      return {
+        ...r,
+        seed_activation: activationScore(cosine, r.strength, {
+          dateIntent: !!opts.dateIntent,
+          histIntent: !!opts.histIntent,
+          superseded,
+          dateAdjustment: dateActivationAdjustment(r.first_seen, opts.dateRange),
+        }),
+        _seed_index: index,
+      };
+    })
+    .sort((a, b) => (b.seed_activation - a.seed_activation) || (a.distance - b.distance) || (a._seed_index - b._seed_index));
+}
 
 // Decode a sqlite-vec float32 blob into a Float32Array. Node Buffers can sit at any
 // byteOffset in a shared pool (not guaranteed 4-byte aligned), so read floats explicitly
@@ -65,9 +110,34 @@ function parseDateRange(query, nowRef) {
   // 2) ISO month  2026-06
   m = q.match(/(\d{4})-(\d{2})(?!\d)/);
   if (m) { const y = +m[1], mo = +m[2]; return { lo: `${m[1]}-${m[2]}-01`, hi: `${m[1]}-${m[2]}-${pad2(lastDay(y, mo))}` }; }
-  // 3) month name (+ optional qualifier / day / year)
+  // 3) numeric date (US host convention): 2/27 or 2/27/2026.
+  m = q.match(/\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])(?:\/(\d{4}))?\b/);
+  if (m) {
+    const mo = +m[1], yr = m[3] ? +m[3] : defYear, d = Math.min(+m[2], lastDay(yr, mo));
+    const iso = `${yr}-${pad2(mo)}-${pad2(d)}`;
+    return { lo: iso, hi: iso };
+  }
+  // 4) cross-month named range: May 27 to June 2 [2026].
+  const monthNames = Object.keys(MONTHS).join("|");
+  m = q.match(new RegExp(`\\b(${monthNames})\\s+(\\d{1,2})(?:,?\\s*(\\d{4}))?\\s*(?:-|–|to|through)\\s*(${monthNames})\\s+(\\d{1,2})(?:,?\\s*(\\d{4}))?\\b`, "i"));
+  if (m) {
+    const mo1 = MONTHS[m[1]], mo2 = MONTHS[m[4]];
+    let y1 = m[3] ? +m[3] : defYear;
+    let y2 = m[6] ? +m[6] : y1;
+    if (!m[6] && mo2 < mo1) y2 += 1;
+    const d1 = Math.min(+m[2], lastDay(y1, mo1));
+    const d2 = Math.min(+m[5], lastDay(y2, mo2));
+    return { lo: `${y1}-${pad2(mo1)}-${pad2(d1)}`, hi: `${y2}-${pad2(mo2)}-${pad2(d2)}` };
+  }
+  // 5) month name (+ optional qualifier / day / year)
   const monthRe = new RegExp(`(late|early|mid|middle|end of|beginning of)?\\s*(${Object.keys(MONTHS).join("|")})\\b(?:\\s+(\\d{1,2})(?!\\d))?(?:\\s*[-–to]{1,3}\\s*(\\d{1,2})(?!\\d))?(?:,?\\s*(\\d{4}))?`, "i");
   m = q.match(monthRe);
+  if (m) {
+    if (m[2].toLowerCase() === "may" && !m[1] && !m[3] && !m[5]) {
+      const temporalMay = /\b(?:in|during|from|since|through|throughout)\s+may\b|\bmay\s+(?:events?|incidents?|changes?|updates?|notes?|summary|timeline|records?)\b/i.test(q);
+      if (!temporalMay) m = null;
+    }
+  }
   if (m) {
     const qual = m[1] || "", mo = MONTHS[m[2]], d1 = m[3] ? +m[3] : null, d2 = m[4] ? +m[4] : null, yr = m[5] ? +m[5] : defYear;
     const ld = lastDay(yr, mo);
@@ -80,7 +150,7 @@ function parseDateRange(query, nowRef) {
     else if (/mid|middle/.test(qual)) { lo = 11; hi = 20; }
     return { lo: `${yr}-${pad2(mo)}-${pad2(lo)}`, hi: `${yr}-${pad2(mo)}-${pad2(hi)}` };
   }
-  // 4) RELATIVE phrases resolved against nowRef (the --as-of anchor, else system now). Explicit
+  // 6) RELATIVE phrases resolved against nowRef (the --as-of anchor, else system now). Explicit
   // dates/months above take precedence; this fills natural temporal language so queries like
   // "what happened last week", "yesterday", "in the past 3 days" reliably trigger the date-window
   // (archive_time) scan instead of falling back to blind topical recall. Windows are rolling
@@ -226,18 +296,23 @@ async function main() {
 
   const qFloat = await embedOne(args.query);
   const qvec = toVecBlob(qFloat);
+  const seedNowRef = args.asOf ? new Date(args.asOf) : new Date();
+  const seedDateRange = parseDateRange(args.query, seedNowRef);
+  const seedDateIntent = seedDateRange != null;
+  const histIntent = seedDateIntent
+    || /\b(as of|during|origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
 
   // 1) Vector KNN -> candidate seeds (cosine distance; lower = closer). Seeds are FACTS
   //    only: entity hubs are also embedded, but a hub seed consumes a limited seed slot
   //    and (being generic) starts the graph walk from a broad connector, diluting the
   //    cluster. Hubs still enter the cluster as walk frontier via fact co-mention edges.
   const knn = db.prepare(`
-    SELECT n.signature AS signature, n.strength AS strength, n.class AS class, v.distance AS distance
+    SELECT n.signature AS signature, n.strength AS strength, n.class AS class, n.first_seen AS first_seen, v.distance AS distance
     FROM (SELECT rowid, distance FROM vec_nodes WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
     JOIN nodes n ON n.id = v.rowid
     WHERE n.kind = 'fact'
     ORDER BY v.distance
-  `).all(qvec, args.k * 2);
+  `).all(qvec, Math.max(args.k * 8, 64));
 
   // Seed selection with supersede demotion: when BOTH a stale version and its surviving
   // correction are vector-retrieved, we are choosing between two versions of the SAME fact —
@@ -245,20 +320,12 @@ async function main() {
   // at the top of what the agent reads). When the survivor was not retrieved, the stale node
   // keeps its vector position (it may be the only answer we have). Pure distance order is
   // otherwise preserved.
-  const knnSigs = new Set(knn.map((r) => r.signature));
-  const supersededWithSurvivor = (sig) => {
-    const s = supersededBy.get(sig);
-    return !!(s && knnSigs.has(s.survivor));
-  };
-  const rankedKnn = knn
-    .map((r, i) => ({ r, i }))
-    .sort((a, b) => {
-      const da = supersededWithSurvivor(a.r.signature) ? 1 : 0;
-      const dbb = supersededWithSurvivor(b.r.signature) ? 1 : 0;
-      if (da !== dbb) return da - dbb;
-      return a.i - b.i;
-    })
-    .map((x) => x.r);
+  const rankedKnn = rankSeedCandidates(knn, {
+    dateIntent: seedDateIntent,
+    histIntent,
+    dateRange: seedDateRange,
+    survivors: new Map([...supersededBy].map(([stale, v]) => [stale, v.survivor])),
+  });
 
   const seedRows = rankedKnn.slice(0, args.seedLimit);
   const cosineSeeds = seedRows.map((r) => r.signature);
@@ -625,18 +692,24 @@ async function main() {
           SELECT n.id AS id, n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
                  n.strength AS strength, n.class AS class, n.notes AS notes
           FROM nodes n
-          WHERE n.kind='fact' AND n.notes IN ('detail','gist','harness-ingest')
+          WHERE n.kind='fact' AND (n.notes IS NULL OR n.notes<>'archive')
             AND substr(n.first_seen,1,10) BETWEEN ? AND ?
         `).all(range2.lo, range2.hi);
         // Dedup by TEXT only (enumerative=true skips the scope key): the whole point of a
         // date-window pull is to surface the specific dated record even when a scope-mate (e.g.
         // an abstract "family items stay private" gist) is already present in another tier.
         const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows, ...archiveTimeRows].flatMap((r) => collapseKeys(r.fact, true)));
+        const temporalWords = new Set([...Object.keys(MONTHS), "happened", "event", "events", "incident", "incidents", "change", "changed", "changes", "update", "updates", "summary", "timeline", "record", "records"]);
+        const topicTerms = terms.filter((t) =>
+          !temporalWords.has(t)
+          && !/^\d+$/.test(t)
+          && !/^\d{4}-\d{1,2}-\d{1,2}$/.test(t)
+        );
         const scored = rows.map((r) => {
           const hay = normalizeForMatch(r.fact || "");
-          const hits = terms.reduce((acc, t) => acc + (hay.includes(t) ? 1 : 0), 0);
+          const hits = topicTerms.reduce((acc, t) => acc + (hay.includes(t) ? 1 : 0), 0);
           return { ...r, hits };
-        }).filter((r) => r.hits >= 1)
+        }).filter((r) => topicTerms.length === 0 || r.hits >= 1)
           .sort((a, b) => (b.hits - a.hits) || String(b.first_seen).localeCompare(String(a.first_seen)));
         for (const r of scored) {
           if (clusterSet.has(r.signature) || detailSet.has(r.signature) || archiveSet.has(r.signature) || archiveVecSet.has(r.signature)) continue;
@@ -693,7 +766,8 @@ async function main() {
     return t && t > m ? t : m;
   }, 0);
   const nowRef = args.asOf ? new Date(args.asOf) : (latest ? new Date(latest) : new Date());
-  const dateIntent = parseDateRange(args.query, nowRef) != null;
+  const dateRange = parseDateRange(args.query, nowRef);
+  const dateIntent = dateRange != null;
 
   // 2f) ANCHOR-DAY active recall (DATELESS episode reconstruction). Tiers 2d/2e reconstruct a dated
   // window ONLY when the query NAMES a date. But a specifics/completeness question usually names only
@@ -786,9 +860,6 @@ async function main() {
   // and SEMANTICALLY GATED — the strength bonus applies only once a node clears a cosine floor,
   // so an off-topic strong fact is never promoted. This is seed/relevance SELECTION incl. strength,
   // NOT a global time-reorder of rendered context (ARCHITECTURE principle 6 caution).
-  const ACT_LAMBDA = 0.2;
-  const ACT_COS_FLOOR = 0.30;
-  const ACT_SUPERSEDE_PENALTY = 0.15;
   // Detail is the granular lookup-only tier (a merge's kept members / drilled corrections). When a
   // detail fact is pulled into the GENERAL semantic cluster (graph/sequence walk) it must not out-rank
   // co-retrieved gist/episodic facts of similar cosine: for a window/synthesis query ("how did X evolve
@@ -800,23 +871,21 @@ async function main() {
   // sets its own boosted activation and bypasses this, so intentional detail surfacing is unaffected.
   // A LEXICALLY-SEEDED detail is likewise an intentional surfacing (the query's discriminating terms
   // matched it directly), so it is exempted from this penalty upstream (see isDetail computation).
-  const ACT_DETAIL_PENALTY = 0.12;
-  const histIntent = /\b(origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
-  const activationOf = (c, s, superseded, detail) => {
-    const gate = c >= ACT_COS_FLOOR ? 1 : 0;
-    let lam = ACT_LAMBDA;
-    if (dateIntent && !histIntent) lam *= 0.5; // explicit-date lookup: favor cosine/date, damp strength
-    let a = c + lam * (s || 0) * gate;
-    if (superseded && !histIntent) a -= ACT_SUPERSEDE_PENALTY; // demote stale unless asked historically
-    if (detail) a -= ACT_DETAIL_PENALTY; // sink granular detail below same-topic gist/episodic in the general cluster
-    return a;
+  const activationOf = (c, s, superseded, detail, firstSeen) => {
+    return activationScore(c, s, {
+      dateIntent,
+      histIntent,
+      superseded,
+      detail,
+      dateAdjustment: dateActivationAdjustment(firstSeen, dateRange),
+    });
   };
   const activeNodes = clusterRows.map((r) => {
     const d = ageDays(r.first_seen, nowRef);
     const sup = supersededBy.get(r.signature);
     const cos = cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0;
     const isDetail = !!(r.notes && /\bdetail\b/.test(r.notes)) && !lexSeedSet.has(r.signature);
-    const activation = activationOf(cos, r.strength, !!sup, isDetail);
+    const activation = activationOf(cos, r.strength, !!sup, isDetail, r.first_seen);
     return {
       id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
       kind: r.kind, fact: (r.fact || "").trim(),
@@ -847,6 +916,7 @@ async function main() {
       similarity: Number((1 - r.distance).toFixed(4)),
       strength: Number(r.strength.toFixed(4)),
       class: r.class,
+      activation: Number((r.seed_activation != null ? r.seed_activation : activationScore(1 - r.distance, r.strength, { dateIntent, histIntent })).toFixed(4)),
     })),
     cluster: {
       nodeCount: clusterRows.length + detailRows.length + archiveRows.length + archiveVecRows.length + archiveTimeRows.length + activeTimeRows.length + anchorDayRows.length,
@@ -937,6 +1007,16 @@ async function main() {
     },
   };
 
+  // Active date/episode sidecars participate in the SAME relevance ordering as
+  // ordinary active graph nodes. Appending them after archive rows defeats their
+  // bounded date bonus and can make the exact on-date record invisible to consumers
+  // that preserve engine order.
+  const rankedActive = out.cluster.nodes
+    .filter((n) => Number.isFinite(n.activation))
+    .sort((a, b) => (b.activation - a.activation) || (a.hops - b.hops) || String(a.id).localeCompare(String(b.id)));
+  const unranked = out.cluster.nodes.filter((n) => !Number.isFinite(n.activation));
+  out.cluster.nodes = [...rankedActive, ...unranked];
+
   console.log(JSON.stringify(out, null, 2));
 }
 
@@ -944,4 +1024,4 @@ if (require.main === module) {
   main().catch((e) => { console.error("SEARCH ERROR:", e); process.exit(1); });
 }
 
-module.exports = { parseDateRange, selectLexicalSeeds, significantTerms };
+module.exports = { parseDateRange, selectLexicalSeeds, significantTerms, activationScore, rankSeedCandidates };

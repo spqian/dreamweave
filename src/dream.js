@@ -1414,9 +1414,13 @@ async function reportMerges(db, opts = {}) {
   return { surface: "merges", clusters: cons.clusters || [] };
 }
 
-function cleanMergeDecisions(db, raw) {
+function cleanMergeDecisions(db, raw, reportedClusters = null) {
   if (!Array.isArray(raw)) return [];
   const exists = db.prepare("SELECT 1 FROM nodes WHERE signature=? AND kind='fact'");
+  const allowed = Array.isArray(reportedClusters)
+    ? reportedClusters.map((cluster) => new Set(cluster.map((m) => m.sig)))
+    : null;
+  const claimed = new Set();
   const out = [];
   for (const dec of raw) {
     if (!dec || typeof dec.fact !== "string" || dec.fact.trim().length < 8 || typeof dec.survivorSig !== "string" || !Array.isArray(dec.memberSigs)) continue;
@@ -1425,6 +1429,9 @@ function cleanMergeDecisions(db, raw) {
     if (!memberSigs.includes(survivorSig)) memberSigs.unshift(survivorSig);
     const live = memberSigs.filter((s) => exists.get(s));
     if (live.length < 2 || !exists.get(survivorSig)) continue;
+    if (live.some((s) => claimed.has(s))) continue;
+    if (allowed && !allowed.some((cluster) => live.every((s) => cluster.has(s)))) continue;
+    live.forEach((s) => claimed.add(s));
     out.push({ fact: dec.fact.trim(), survivorSig, memberSigs: live });
   }
   return out;
@@ -1432,11 +1439,19 @@ function cleanMergeDecisions(db, raw) {
 
 async function applyMerges(db, raw, opts = {}) {
   const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
-  const decisions = cleanMergeDecisions(db, raw);
+  // Recompute the deterministic candidate report against the current store. This
+  // binds apply to fresh, engine-reported clusters: stale/arbitrary/overlapping
+  // caller decisions cannot merge unrelated live facts.
+  const currentReport = await reportMerges(db, opts);
+  const decisions = cleanMergeDecisions(db, raw, currentReport.clusters);
   let clustersMerged = 0, retained = 0;
   const dispBySurvivor = new Map();
   const lossBySurvivor = new Map();
+  const gistVecBySurvivor = new Map();
+  const originalVecBySurvivor = new Map();
   for (const dec of decisions) {
+    const survivor = db.prepare("SELECT id, fact FROM nodes WHERE signature=? AND kind='fact'").get(dec.survivorSig);
+    if (!survivor) continue;
     const memFacts = dec.memberSigs
       .map((sig) => (db.prepare("SELECT fact FROM nodes WHERE signature=? AND kind='fact'").get(sig) || {}).fact)
       .filter(Boolean);
@@ -1458,6 +1473,11 @@ async function applyMerges(db, raw, opts = {}) {
       const disp = vecs.reduce((a, v) => a + (1 - dot(v, cu)), 0) / vecs.length;
       dispBySurvivor.set(dec.survivorSig, disp);
     } catch (e) { process.stderr.write(`[apply-merges] vagueness embed failed: ${e.message}\n`); }
+    gistVecBySurvivor.set(dec.survivorSig, toVecBlob(await embedOne(dec.fact)));
+    originalVecBySurvivor.set(
+      dec.survivorSig,
+      storedVecBlob(db, survivor.id) || toVecBlob(await embedOne(survivor.fact || dec.survivorSig))
+    );
   }
   const mergeSeq = decisions.length ? nextChangeSeq(db) : currentChangeSeq(db);
   const txM = db.transaction(() => {
@@ -1489,12 +1509,15 @@ async function applyMerges(db, raw, opts = {}) {
         .run(dec.fact, dec.fact, survClass,
           salient ? "decision" : (survivor.salience || ""), maxSal, clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, mergeSeq, survivor.id);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
+      db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(survivor.id), gistVecBySurvivor.get(dec.survivorSig));
       // Preserve the survivor's own pre-merge verbatim as a detail of the new gist
       // (memory_id='' — details are archival, not projected to the flat harness).
       const survCloneSig = uniqueSig(db, `fact:${deriveSlug(survOrig.fact || survivor.signature)}`);
       db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,salience_score,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.salience_score, survOrig.strength, survOrig.reactivations, survOrig.first_seen, now, now, "detail", survOrig.fact, survOrig.text, mergeSeq, mergeSeq);
+      const cloneId = db.prepare("SELECT id FROM nodes WHERE signature=?").get(survCloneSig).id;
+      db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(cloneId), originalVecBySurvivor.get(dec.survivorSig));
       db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", survCloneSig, 0.6, now, now);
       db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(survCloneSig, survivor.signature, survOrig.first_seen);
       retained += 1;
@@ -1791,7 +1814,54 @@ function doctor(db) {
   // Tier-3 archive nodes are intentionally edgeless (keyword-only) — not islands.
   const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !deg.get(s));
   const degsum = [...deg.values()].reduce((a, b) => a + b, 0);
-  return { facts, tier3_archived: archived, entities, edges, fact_islands: islands.length, islands: islands.slice(0, 20), dangling_edges: dangling, avg_degree: edges ? Number((degsum / (facts + entities)).toFixed(2)) : 0, healthy: islands.length === 0 && dangling === 0 };
+  const activeMissingVectors = db.prepare(`
+    SELECT count(*) c FROM nodes n
+    LEFT JOIN vec_nodes v ON v.rowid=n.id
+    WHERE n.kind='fact' AND (n.notes IS NULL OR n.notes<>'archive') AND v.rowid IS NULL
+  `).get().c;
+  const activeInArchive = db.prepare(`
+    SELECT count(*) c FROM nodes n JOIN vec_archive v ON v.rowid=n.id
+    WHERE n.kind='fact' AND (n.notes IS NULL OR n.notes<>'archive')
+  `).get().c;
+  const orphanActiveVectors = db.prepare("SELECT count(*) c FROM vec_nodes v LEFT JOIN nodes n ON n.id=v.rowid WHERE n.id IS NULL").get().c;
+  const orphanArchiveVectors = db.prepare("SELECT count(*) c FROM vec_archive v LEFT JOIN nodes n ON n.id=v.rowid WHERE n.id IS NULL").get().c;
+  const badVectorDimensions = db.prepare("SELECT count(*) c FROM vec_nodes WHERE length(embedding)<>?").get(cfg.EMBED_DIM * 4).c
+    + db.prepare("SELECT count(*) c FROM vec_archive WHERE length(embedding)<>?").get(cfg.EMBED_DIM * 4).c;
+  const duplicateEdges = db.prepare(`
+    SELECT COALESCE(SUM(c - 1),0) c FROM (
+      SELECT count(*) c FROM edges GROUP BY src, ifnull(rel,''), dst HAVING count(*) > 1
+    )
+  `).get().c;
+  const duplicateMemoryIds = db.prepare(`
+    SELECT COALESCE(SUM(c - 1),0) c FROM (
+      SELECT count(*) c FROM nodes
+      WHERE memory_id IS NOT NULL AND memory_id<>''
+      GROUP BY memory_id HAVING count(*) > 1
+    )
+  `).get().c;
+  const healthy = islands.length === 0
+    && dangling === 0
+    && activeMissingVectors === 0
+    && activeInArchive === 0
+    && orphanActiveVectors === 0
+    && orphanArchiveVectors === 0
+    && badVectorDimensions === 0
+    && duplicateEdges === 0
+    && duplicateMemoryIds === 0;
+  return {
+    facts, tier3_archived: archived, entities, edges,
+    fact_islands: islands.length, islands: islands.slice(0, 20),
+    dangling_edges: dangling,
+    active_missing_vectors: activeMissingVectors,
+    active_in_archive_vectors: activeInArchive,
+    orphan_active_vectors: orphanActiveVectors,
+    orphan_archive_vectors: orphanArchiveVectors,
+    bad_vector_dimensions: badVectorDimensions,
+    duplicate_edges: duplicateEdges,
+    duplicate_memory_ids: duplicateMemoryIds,
+    avg_degree: edges ? Number((degsum / (facts + entities)).toFixed(2)) : 0,
+    healthy,
+  };
 }
 
 // ---- PROJECT helpers --------------------------------------------------------
@@ -2028,4 +2098,4 @@ if (require.main === module) {
   main().catch((e) => { console.error("ERROR:", e); process.exit(1); });
 }
 
-module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph, dreamCore };
+module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph, dreamCore, doctor };

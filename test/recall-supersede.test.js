@@ -38,11 +38,11 @@ process.env.AGENT_MEMORY_DIR = dataDir;
     .run("fact:condor-new", "supersedes", "fact:condor-old", 0.9, "2026-01-22");
   db.close();
 
-  const out = execFileSync(process.execPath, [
+  const runRecall = (query) => JSON.parse(execFileSync(process.execPath, [
     path.join(__dirname, "..", "src", "recall.js"),
-    "--query", "What was the working purchase-price range for Project Condor?",
-  ], { env: { ...process.env, AGENT_MEMORY_DIR: dataDir }, encoding: "utf8" });
-  const res = JSON.parse(out);
+    "--query", query, "--as-of", "2026-01-22",
+  ], { env: { ...process.env, AGENT_MEMORY_DIR: dataDir }, encoding: "utf8" }));
+  const res = runRecall("What was the working purchase-price range for Project Condor?");
 
   const seed0 = res.seeds[0];
   const oldNode = res.cluster.nodes.find((n) => n.id === "fact:condor-old");
@@ -56,6 +56,13 @@ process.env.AGENT_MEMORY_DIR = dataDir;
   if (seed0 !== "fact:condor-new") { console.error("FAIL: survivor (condor-new) should seed first, got", seed0); ok = false; }
   if (!(oldNode && oldNode.superseded === true && oldNode.superseded_by === "fact:condor-new")) { console.error("FAIL: condor-old should be flagged superseded_by condor-new"); ok = false; }
   if (newNode && newNode.superseded) { console.error("FAIL: condor-new should NOT be superseded"); ok = false; }
+  const historical = runRecall("What was the Project Condor purchase-price range as of January 3 2026?");
+  const oldRank = historical.cluster.nodes.findIndex((n) => n.id === "fact:condor-old");
+  const newRank = historical.cluster.nodes.findIndex((n) => n.id === "fact:condor-new");
+  if (!(oldRank >= 0 && newRank >= 0 && oldRank < newRank)) {
+    console.error("FAIL: historical as-of query should rank the old value before its later correction", { oldRank, newRank });
+    ok = false;
+  }
   console.log(ok ? "\nPASS ✓ recall fix works" : "\nFAILED ✗");
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* tmp left behind, fine */ }
   process.exit(ok ? 0 : 1);
