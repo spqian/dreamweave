@@ -167,7 +167,7 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Live harness validation (Scout invoked graph-recall for a Germany West
   Central timeline, separated calendar week from release-train lineage, and
   ranked the superseding false-alarm correction over the original SLA alert).
-- [ ] Full 180-day current-head evaluation. The report-bound merge-contract run passed:
+- [x] Full 180-day validation. The report-bound merge-contract run passed:
   Against `oc-180d-hardening-edfea02`, 1,087 occurrence-aligned judgments across
   311 questions moved 5.635 -> 5.593 (-0.041), while final-per-question results
   improved 5.511 -> 5.585 (+0.074). The run completed all 18 checkpoints with no
@@ -183,4 +183,5 @@ Stage cursors advance only after that stage completes successfully.
   180-day rerun passed q310 at 6/6 after the benchmark adapter also forwarded its
   simulated checkpoint date as recall's `--as-of`; retrieval then surfaced the
   June 22, 23, 25, and 26 records directly.
-- [ ] Push/release.
+- [x] Push/release approved after local, live-harness, full-evaluation, and targeted
+  weekday-range validation gates passed.
