@@ -6,6 +6,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "dw-merge-validation-"));
 process.env.AGENT_MEMORY_DIR = dataDir;
@@ -15,7 +16,7 @@ process.env.AGENT_MEMORY_DIR = dataDir;
   const sqliteVec = require("sqlite-vec");
   const { ensureSchema } = require("../src/schema");
   const { embedOne, toVecBlob } = require("../src/embed");
-  const { applyMerges, doctor } = require("../src/dream");
+  const { reportMerges, applyMerges, doctor } = require("../src/dream");
 
   const db = new Database(path.join(dataDir, "memory.db"));
   sqliteVec.load(db);
@@ -33,19 +34,56 @@ process.env.AGENT_MEMORY_DIR = dataDir;
   db.prepare("INSERT INTO edges(src,rel,dst,weight) VALUES ('fact:alpha-1','mentions','person:alice-example',0.8)").run();
   db.prepare("INSERT INTO edges(src,rel,dst,weight) VALUES ('fact:alpha-2','mentions','person:alice-example',0.8)").run();
 
-  const rejected = await applyMerges(db, [{
+  const validDecision = {
+    fact: "Alice Example owns and maintains the migration rollout checklist.",
+    survivorSig: "fact:alpha-1",
+    memberSigs: ["fact:alpha-1", "fact:alpha-2"],
+  };
+  const rejected = await applyMerges(db, [validDecision, {
     fact: "Alice owns the migration checklist and the cafeteria serves lunch at noon.",
     survivorSig: "fact:alpha-1",
     memberSigs: ["fact:alpha-1", "fact:unrelated"],
   }], { sim: 0.3 });
-  if (rejected.decisions !== 0 || rejected.clusters_merged !== 0) throw new Error("unreported arbitrary merge was accepted");
-  db.prepare("DELETE FROM meta WHERE key='last_reflect_seq'").run();
+  if (rejected.complete !== false || rejected.decisions !== 0 || rejected.clusters_merged !== 0) {
+    throw new Error("mixed valid/invalid batch partially applied");
+  }
+  if (!rejected.rejected.some((r) => r.index === 1 && r.reason === "cross_cluster")) {
+    throw new Error("cross-cluster rejection was not reported");
+  }
+  if (db.prepare("SELECT fact FROM nodes WHERE signature='fact:alpha-1'").get().fact !== "Alice Example owns the migration rollout checklist.") {
+    throw new Error("rejected batch mutated the valid survivor");
+  }
+  if (db.prepare("SELECT value FROM meta WHERE key='last_reflect_seq'").get()) {
+    throw new Error("rejected batch advanced the reflect cursor");
+  }
 
-  const accepted = await applyMerges(db, [{
-    fact: "Alice Example owns and maintains the migration rollout checklist.",
+  const cliFile = path.join(dataDir, "invalid-merges.json");
+  fs.writeFileSync(cliFile, JSON.stringify([{
+    fact: "Alice owns the migration checklist and the cafeteria serves lunch at noon.",
     survivorSig: "fact:alpha-1",
-    memberSigs: ["fact:alpha-1", "fact:alpha-2"],
-  }], { sim: 0.3 });
+    memberSigs: ["fact:alpha-1", "fact:unrelated"],
+  }]));
+  const cli = spawnSync(process.execPath, [path.join(__dirname, "..", "src", "dream.js"), "apply-merges", "--file", cliFile, "--sim", "0.3"], {
+    env: process.env,
+    encoding: "utf8",
+  });
+  if (cli.status !== 3 || JSON.parse(cli.stdout).complete !== false) {
+    throw new Error("CLI did not return structured exit-3 merge rejection");
+  }
+
+  const staleReport = await reportMerges(db, { sim: 0.3 });
+  db.prepare("UPDATE nodes SET dirty_seq=1 WHERE signature='fact:unrelated'").run();
+  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES ('change_seq','1')").run();
+  const stale = await applyMerges(db, { report_id: staleReport.report_id, decisions: [validDecision] }, { sim: 0.3 });
+  if (stale.complete !== false || !stale.rejected.some((r) => r.reason === "report_stale")) {
+    throw new Error("stale report was not rejected explicitly");
+  }
+  if (db.prepare("SELECT value FROM meta WHERE key='last_reflect_seq'").get()) {
+    throw new Error("stale report advanced the reflect cursor");
+  }
+
+  const freshReport = await reportMerges(db, { sim: 0.3 });
+  const accepted = await applyMerges(db, { report_id: freshReport.report_id, decisions: [validDecision] }, { sim: 0.3 });
   if (accepted.decisions !== 1 || accepted.clusters_merged !== 1) throw new Error("reported merge was rejected");
 
   const health = doctor(db);

@@ -83,6 +83,23 @@ if (p[0].memory_id !== "anchor-harness-id") fail("ingest did not capture anchor 
 console.log("ok: anchor text in harness is recognized on ingest (no node created)");
 console.log("ok: ingest captures the anchor's harness id -> round-trips to it (KEEP)");
 
+// Hosts wrap recalled memory text as untrusted data. Ingest and both sync gates must
+// normalize that wrapper identically or the intentionally node-less anchor looks missing.
+const wrappedAnchorId = "wrapped-anchor-harness-id";
+fs.writeFileSync(snapPath, JSON.stringify([{
+  id: wrappedAnchorId,
+  fact: `<untrusted_memory>${ANCHOR_FACT}</untrusted_memory>`,
+  category: "context",
+}]));
+const wrappedIngest = JSON.parse(run("ingest-harness", "--file", snapPath));
+if (!wrappedIngest.complete || wrappedIngest.missing.length) fail("wrapped anchor failed ingest completeness");
+const wrappedVerify = JSON.parse(run("verify-sync", "--file", snapPath));
+if (!wrappedVerify.complete || wrappedVerify.missing.length) fail("wrapped anchor failed verify-sync");
+p = exportHarness();
+if (p[0].memory_id !== wrappedAnchorId) fail("wrapped anchor id did not round-trip through meta");
+
+console.log("ok: wrapped anchor passes ingest and verify completeness");
+
 // A user-authored memory that merely uses the reserved-looking prefix is still data.
 const prefixedSnap = [{ id: "user-prefixed", fact: "[memory-usage] The user documented a custom memory-usage policy.", category: "context" }];
 fs.writeFileSync(snapPath, JSON.stringify(prefixedSnap));

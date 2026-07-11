@@ -166,6 +166,11 @@ node src/dream.js dream
 node src/dream.js report-entities --as-of <iso>
 node src/dream.js apply-entities --file decisions.json --as-of <iso>
 #    ...repeat for aliases, salience, merges, synthesis
+#    For merges, preserve the report identity:
+#    report-merges -> { report_id, clusters }
+#    apply-merges file -> { report_id, decisions:[...] }
+#    Merge apply is all-or-nothing and exits 3 with structured rejections if
+#    any submitted decision is stale, overlapping, or spans report clusters.
 
 # 5. HEALTH: connect post-judgment changes and verify invariants
 node src/dream.js weave --as-of <iso>

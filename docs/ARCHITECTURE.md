@@ -97,7 +97,10 @@ active graph, but nothing is truly forgotten.
 
 7. **No fabrication.** Consolidation/canonicalization may only assert what existing
    memories entail. The LLM judge decides types/aliases/merges/importance — it is a
-   judge, not an author.
+   judge, not an author. Merge judgment is bound to the exact deterministic report via
+   `report_id`; every submitted merge stays within one reported cluster. Apply is
+   all-or-nothing: stale, overlapping, malformed, or cross-cluster decisions mutate
+   nothing and do not advance the processing cursor.
 
 8. **Merge with TEMPORAL SEQUENCING — the Tier-1 "instincts" are sequence-aware.** Two
    parts:

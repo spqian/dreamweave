@@ -196,9 +196,16 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
      decision: `{salient:[{sig, score}], downgrade:[sig]}`  (legacy `{salientSigs:[sig]}` = score 1.0 still accepted)
 
    - **merges** (alias `consolidate`) — roll up each near-duplicate cluster into ONE richer fact.
-     report: `{surface:"merges", clusters:[[{sig,fact}], ...]}`
+     report: `{surface:"merges", report_id, basis_seq, cursor_seq, clusters:[[{sig,fact}], ...]}`
      judge: per cluster, merge ONLY facts about the same subject that are redundant/incremental/a correction sequence; write one consolidated `fact` that preserves every distinct still-true detail and names all specifics; prefer the LATEST value on conflict but keep prior value as context if it aids recall. If a cluster mixes unrelated subjects, **do not merge it** (emit `null` / omit). `survivorSig` = the member whose identity to preserve; `memberSigs` = all members in the cluster (≥2 live).
-     decision: `[{fact, survivorSig, memberSigs:[...]} | null]`  (null/omitted cluster = no merge)
+     decision file: `{report_id:"<copy exactly from report>", decisions:[{fact, survivorSig, memberSigs:[...]} | null]}`
+     (null/omitted cluster = reviewed and declined). Every merge must stay inside ONE reported
+     cluster; never combine members from separate clusters. `apply-merges` is atomic: any stale,
+     overlapping, malformed, or cross-cluster submitted decision returns structured `rejected`
+     details and exits 3 with ZERO mutations, so correct the decisions or re-report and retry.
+     An empty report-bound `decisions:[]` means "reviewed and declined all" and advances the
+     incremental cursor. A legacy bare array remains accepted when non-empty, but bare `[]` is
+     intentionally inert and does not close the report window.
 
    - **synthesis** — generalize a dormant recurrence family into one concept.
      report: `{surface:"synthesis", pools:[{poolId, members:[{sig,fact,firstSeen}], hotSiblings:[{sig,fact}]}]}`

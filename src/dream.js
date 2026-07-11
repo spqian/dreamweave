@@ -26,6 +26,7 @@
 
 const Database = require("better-sqlite3");
 const sqliteVec = require("sqlite-vec");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { embedTexts, embedOne, toVecBlob } = require("./embed");
@@ -144,6 +145,10 @@ function extractHardSpecifics(text) {
   return out;
 }
 const UNTRUSTED = /<\/?untrusted_memory>/g;const STOPW = new Set("the a an is are was were of for to in on and or that with as at by from this its not be no into".split(" "));
+
+function normalizeHarnessFact(raw) {
+  return String(raw || "").replace(UNTRUSTED, "").trim();
+}
 
 function deriveSlug(fact) {
   const w = ent.normalize(fact).split(" ").filter((x) => !STOPW.has(x) && x.length > 2).slice(0, 5).join("-");
@@ -354,7 +359,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const tx = db.transaction(() => {
     for (const m of mems) {
       const mid = m.id || m.memory_id; if (!mid) continue;
-      const fact = String(m.fact || "").replace(UNTRUSTED, "").trim();
+      const fact = normalizeHarnessFact(m.fact);
       const category = m.category || "fact";
       // ENGINE-OWNED ANCHOR (channel E) is re-emitted by export-harness, never stored as a node.
       // If the harness still carries a copy (it was m_remember'd as the projected anchor, or was
@@ -457,7 +462,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
   // The engine anchor (channel E) is tracked in meta, not as a node, so it is legitimately
   // absent from dbIds — exclude it from the completeness check (else ingest/verify gate falsely).
-  res.missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(m.fact); }).map((m) => m.id || m.memory_id);
+  res.missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(normalizeHarnessFact(m.fact)); }).map((m) => m.id || m.memory_id);
   res.complete = res.missing.length === 0;
   return res;
 }
@@ -497,7 +502,7 @@ function verifySync(db, file) {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
   const mems = Array.isArray(raw) ? raw : (raw.memories || []);
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
-  const missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(m.fact); }).map((m) => m.id || m.memory_id);
+  const missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(normalizeHarnessFact(m.fact)); }).map((m) => m.id || m.memory_id);
   return { harness_count: mems.length, memory_ids_in_db: dbIds.size, missing, complete: missing.length === 0 };
 }
 
@@ -1483,39 +1488,155 @@ async function reportMerges(db, opts = {}) {
   const lastReflectSeqRaw = incrementalR ? getMeta(db, "last_reflect_seq") : null;
   const lastReflectSeq = incrementalR && lastReflectSeqRaw != null ? getMetaInt(db, "last_reflect_seq") : null;
   const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: true, seedAfterSeq: incrementalR ? lastReflectSeq : null });
-  return { surface: "merges", clusters: cons.clusters || [] };
+  const clusters = cons.clusters || [];
+  const basisSeq = maxDirtySeq(db);
+  const identity = {
+    basis_seq: basisSeq,
+    cursor_seq: lastReflectSeq,
+    clusters: clusters
+      .map((cluster) => cluster.map((m) => m.sig).sort())
+      .sort((a, b) => {
+        const ak = a.join("\0"), bk = b.join("\0");
+        return ak < bk ? -1 : ak > bk ? 1 : 0;
+      }),
+  };
+  const reportId = crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return { surface: "merges", report_id: reportId, basis_seq: basisSeq, cursor_seq: lastReflectSeq, clusters };
 }
 
-function cleanMergeDecisions(db, raw, reportedClusters = null) {
-  if (!Array.isArray(raw)) return [];
+function normalizeMergeInput(raw) {
+  if (Array.isArray(raw)) return { legacy: true, reportId: null, decisions: raw };
+  if (raw && typeof raw === "object" && Array.isArray(raw.decisions)) {
+    return { legacy: false, reportId: typeof raw.report_id === "string" ? raw.report_id : "", decisions: raw.decisions };
+  }
+  return { legacy: false, reportId: "", decisions: null };
+}
+
+function validateMergeDecisions(db, raw, reportedClusters = null) {
+  if (!Array.isArray(raw)) {
+    return { decisions: [], submitted: 0, rejected: [{ index: null, reason: "malformed_decision_file", memberSigs: [] }] };
+  }
   const exists = db.prepare("SELECT 1 FROM nodes WHERE signature=? AND kind='fact'");
   const allowed = Array.isArray(reportedClusters)
     ? reportedClusters.map((cluster) => new Set(cluster.map((m) => m.sig)))
     : null;
-  const claimed = new Set();
-  const out = [];
-  for (const dec of raw) {
-    if (!dec || typeof dec.fact !== "string" || dec.fact.trim().length < 8 || typeof dec.survivorSig !== "string" || !Array.isArray(dec.memberSigs)) continue;
+  const candidates = [];
+  const rejected = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const dec = raw[index];
+    if (dec == null) continue;
+    if (typeof dec !== "object" || typeof dec.fact !== "string" || dec.fact.trim().length < 8
+      || typeof dec.survivorSig !== "string" || !Array.isArray(dec.memberSigs)) {
+      rejected.push({ index, reason: "malformed_decision", memberSigs: Array.isArray(dec && dec.memberSigs) ? dec.memberSigs : [] });
+      continue;
+    }
     const survivorSig = dec.survivorSig;
     const memberSigs = [...new Set(dec.memberSigs.filter((s) => typeof s === "string"))];
     if (!memberSigs.includes(survivorSig)) memberSigs.unshift(survivorSig);
-    const live = memberSigs.filter((s) => exists.get(s));
-    if (live.length < 2 || !exists.get(survivorSig)) continue;
-    if (live.some((s) => claimed.has(s))) continue;
-    if (allowed && !allowed.some((cluster) => live.every((s) => cluster.has(s)))) continue;
-    live.forEach((s) => claimed.add(s));
-    out.push({ fact: dec.fact.trim(), survivorSig, memberSigs: live });
+    const missing = memberSigs.filter((s) => !exists.get(s));
+    if (missing.length) {
+      rejected.push({ index, reason: "stale_member", memberSigs, missing });
+      continue;
+    }
+    if (memberSigs.length < 2) {
+      rejected.push({ index, reason: "insufficient_members", memberSigs });
+      continue;
+    }
+    if (allowed && !allowed.some((cluster) => memberSigs.every((s) => cluster.has(s)))) {
+      rejected.push({ index, reason: "cross_cluster", memberSigs });
+      continue;
+    }
+    candidates.push({ index, fact: dec.fact.trim(), survivorSig, memberSigs });
   }
-  return out;
+
+  const owners = new Map();
+  for (const dec of candidates) {
+    for (const sig of dec.memberSigs) {
+      if (!owners.has(sig)) owners.set(sig, []);
+      owners.get(sig).push(dec.index);
+    }
+  }
+  const conflicts = new Map();
+  for (const [sig, indices] of owners) {
+    if (indices.length < 2) continue;
+    for (const index of indices) {
+      if (!conflicts.has(index)) conflicts.set(index, { memberSigs: new Set(), conflictingIndices: new Set() });
+      const c = conflicts.get(index);
+      c.memberSigs.add(sig);
+      for (const other of indices) if (other !== index) c.conflictingIndices.add(other);
+    }
+  }
+  for (const [index, conflict] of conflicts) {
+    rejected.push({
+      index,
+      reason: "overlapping_decisions",
+      memberSigs: [...conflict.memberSigs],
+      conflictingIndices: [...conflict.conflictingIndices].sort((a, b) => a - b),
+    });
+  }
+  const conflictIndices = new Set(conflicts.keys());
+  return {
+    decisions: candidates.filter((dec) => !conflictIndices.has(dec.index)).map(({ index, ...dec }) => dec),
+    submitted: raw.filter((dec) => dec != null).length,
+    rejected: rejected.sort((a, b) => (a.index == null ? -1 : a.index) - (b.index == null ? -1 : b.index)),
+  };
 }
 
 async function applyMerges(db, raw, opts = {}) {
   const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
-  // Recompute the deterministic candidate report against the current store. This
-  // binds apply to fresh, engine-reported clusters: stale/arbitrary/overlapping
-  // caller decisions cannot merge unrelated live facts.
+  const input = normalizeMergeInput(raw);
   const currentReport = await reportMerges(db, opts);
-  const decisions = cleanMergeDecisions(db, raw, currentReport.clusters);
+  if (!input.legacy && input.reportId !== currentReport.report_id) {
+    return {
+      surface: "merges",
+      complete: false,
+      reviewed: false,
+      submitted: Array.isArray(input.decisions) ? input.decisions.filter((dec) => dec != null).length : 0,
+      decisions: 0,
+      clusters_merged: 0,
+      entries_reclaimed: 0,
+      details_retained: 0,
+      rejected: [{
+        index: null,
+        reason: input.reportId ? "report_stale" : "missing_report_id",
+        expected_report_id: currentReport.report_id,
+        supplied_report_id: input.reportId || null,
+        memberSigs: [],
+      }],
+      weave: null,
+    };
+  }
+  const validation = validateMergeDecisions(db, input.decisions, currentReport.clusters);
+  if (validation.rejected.length) {
+    return {
+      surface: "merges",
+      complete: false,
+      reviewed: false,
+      submitted: validation.submitted,
+      decisions: 0,
+      clusters_merged: 0,
+      entries_reclaimed: 0,
+      details_retained: 0,
+      rejected: validation.rejected,
+      weave: null,
+    };
+  }
+  const decisions = validation.decisions;
+  const reviewed = !input.legacy || validation.submitted > 0;
+  if (!reviewed) {
+    return {
+      surface: "merges",
+      complete: true,
+      reviewed: false,
+      submitted: 0,
+      decisions: 0,
+      clusters_merged: 0,
+      entries_reclaimed: 0,
+      details_retained: 0,
+      rejected: [],
+      weave: null,
+    };
+  }
   let clustersMerged = 0, retained = 0;
   const dispBySurvivor = new Map();
   const lossBySurvivor = new Map();
@@ -1636,7 +1757,18 @@ async function applyMerges(db, raw, opts = {}) {
   setMeta(db, "last_reflect", now);
   setMeta(db, "last_reflect_seq", String(maxDirtySeq(db)));
   repairGraph(db);
-  return { surface: "merges", decisions: decisions.length, clusters_merged: clustersMerged, entries_reclaimed: 0, details_retained: retained, weave: weaveResult };
+  return {
+    surface: "merges",
+    complete: true,
+    reviewed: true,
+    submitted: validation.submitted,
+    decisions: decisions.length,
+    clusters_merged: clustersMerged,
+    entries_reclaimed: 0,
+    details_retained: retained,
+    rejected: [],
+    weave: weaveResult,
+  };
 }
 
 function reportSynthesis(db, opts = {}) {
@@ -2157,7 +2289,7 @@ async function main() {
     else if (cmd === "report-salience") r = reportSalience(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-salience") r = applySalience(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
     else if (cmd === "report-merges" || cmd === "consolidate") r = await reportMerges(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
-    else if (cmd === "apply-merges") r = await applyMerges(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "apply-merges") { r = await applyMerges(db, readDecisionFile(flags.file), { asOf: flags["as-of"], sim: Number(flags.sim) || 0 }); gate = r.complete === false; }
     else if (cmd === "report-synthesis") r = reportSynthesis(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-synthesis") r = await applySynthesis(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
     else if (cmd === "apply-concept") { const g = JSON.parse(fs.readFileSync(flags.file, "utf8")); r = await applyConcept(db, g, { asOf: flags["as-of"] }); repairGraph(db); }

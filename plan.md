@@ -147,7 +147,9 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Phase 2 mutation integrity (atomic/idempotent dream, report-bound merges,
   committed merge vectors, edge uniqueness, and expanded doctor checks complete;
   future non-empty memory-id uniqueness is enforced without rewriting diagnosed
-  legacy duplicates, which remain explicit doctor/operator repair items).
+  legacy duplicates, which remain explicit doctor/operator repair items). Merge
+  reports now carry deterministic report identity; apply is all-or-nothing with
+  structured stale/cross-cluster/overlap rejection and retry-safe cursors.
 - [x] Phase 3 recall correctness (pre-truncation activation, historical target-date
   ranking, active date coverage, numeric/cross-month parsing, and ambiguous-May guard
   complete; archive dedup preserves distinct scoped assertions and supersede lineage
@@ -158,13 +160,15 @@ Stage cursors advance only after that stage completes successfully.
   projection is linear; empty report/apply surfaces skip weave entirely. Remaining work:
   scope non-empty maintenance passes and alias reporting without changing semantics).
 - [x] Phase 5 documentation and operational hardening (strict atomic config, exact
-  anchor recognition, and public contract/configuration reconciliation complete).
+  anchor recognition (including wrapped host text), and public contract/configuration
+  reconciliation complete).
 - [x] Local validation (26/26 unit files, migration/doctor on a live-store copy,
   report/apply/projection/recall/viz checks, embedding and projection probes).
 - [x] Live harness validation (Scout invoked graph-recall for a Germany West
   Central timeline, separated calendar week from release-train lineage, and
   ranked the superseding false-alarm correction over the original SLA alert).
-- [x] Full 180-day evaluation (1,087 aligned judgments / 311 questions:
+- [ ] Full 180-day evaluation rerun for the report-bound merge contract. Previous
+  hardening evaluation passed (1,087 aligned judgments / 311 questions:
   mean 5.419 -> 5.635, +0.216; final occurrence 5.399 -> 5.511,
   +0.113; every category non-regressing, temporal reasoning 6.0/6.0,
   no timeouts. Material one-off reversals were consolidation variance:
