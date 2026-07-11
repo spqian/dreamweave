@@ -164,5 +164,10 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Live harness validation (Scout invoked graph-recall for a Germany West
   Central timeline, separated calendar week from release-train lineage, and
   ranked the superseding false-alarm correction over the original SLA alert).
-- [ ] Full 180-day evaluation.
+- [x] Full 180-day evaluation (1,087 aligned judgments / 311 questions:
+  mean 5.419 -> 5.635, +0.216; final occurrence 5.399 -> 5.511,
+  +0.113; every category non-regressing, temporal reasoning 6.0/6.0,
+  no timeouts. Material one-off reversals were consolidation variance:
+  the same evolving-value questions reversed to correct answers in later
+  occurrences, while the aggregate and final-state comparisons improved).
 - [ ] Push/release.
