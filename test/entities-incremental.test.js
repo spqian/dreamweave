@@ -1,14 +1,12 @@
 "use strict";
 // Regression + perf-contract: reportEntities must be INCREMENTAL.
 //
-// Before this fix, reportEntities emitted the ENTIRE active store every night, fanning out to
-// ~O(store) LLM entity-extraction calls per checkpoint (the largest single LLM cost as the bank
-// grew). Entity hubs for OLD facts were already extracted the night they arrived, so only facts new
-// since last_reflect need extraction — mirroring reportSalience's `first_seen > last_reflect` gate.
+// Incremental processing is keyed by engine-owned dirty_seq, never event-time first_seen.
+// A newly ingested historical memory may have an old first_seen but still needs processing.
 //
 // Contract asserted here (incremental mode, the default `connections=incremental`):
-//   1. Facts newer than last_reflect are returned.
-//   2. Facts older than last_reflect are NOT returned (already extracted on a prior night).
+//   1. Facts dirtied after last_reflect_seq are returned, even with an old event date.
+//   2. Facts already covered by the cursor are NOT returned.
 //   3. Archived (tier-3) facts are never returned.
 const fs = require("fs");
 const os = require("os");
@@ -33,12 +31,13 @@ process.env.AGENT_MEMORY_DIR = dataDir;
   sqliteVec.load(db);
   ensureSchema(db);
 
-  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES ('last_reflect', ?)").run("2026-03-01T00:00:00.000Z");
+  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES ('change_seq', '3')").run();
+  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES ('last_reflect_seq', '1')").run();
 
-  const ins = db.prepare("INSERT INTO nodes (signature, class, strength, first_seen, notes, fact, kind) VALUES (?,?,?,?,?,?, 'fact')");
-  ins.run("fact:old-1", "semantic", 0.5, "2026-01-15", null, "An old fact ingested before the last reflect.");
-  ins.run("fact:new-1", "semantic", 0.5, "2026-04-10", null, "A new fact ingested after the last reflect, mentioning Acme Corp.");
-  ins.run("fact:new-archived", "semantic", 0.5, "2026-04-11", "archive", "A new but archived (tier-3) fact.");
+  const ins = db.prepare("INSERT INTO nodes (signature, class, strength, first_seen, notes, fact, kind, ingested_seq, dirty_seq) VALUES (?,?,?,?,?,?, 'fact',?,?)");
+  ins.run("fact:processed-1", "semantic", 0.5, "2026-06-15", null, "A fact already processed by the prior reflection.", 1, 1);
+  ins.run("fact:backdated-new", "semantic", 0.5, "2025-01-10", null, "A newly ingested historical fact mentioning Acme Corp.", 2, 2);
+  ins.run("fact:new-archived", "semantic", 0.5, "2025-01-11", "archive", "A new but archived (tier-3) fact.", 3, 3);
 
   let ok = true;
   const fail = (m) => { console.error("FAIL:", m); ok = false; };
@@ -46,12 +45,12 @@ process.env.AGENT_MEMORY_DIR = dataDir;
   const sigs = new Set(reportEntities(db).facts.map((f) => f.sig));
   console.log("reported entity-fact sigs:", JSON.stringify([...sigs]));
 
-  if (!sigs.has("fact:new-1")) fail("(1) a fact newer than last_reflect was not reported for entity extraction");
-  if (sigs.has("fact:old-1")) fail("(2) a fact older than last_reflect was re-reported (should have been extracted on a prior night)");
+  if (!sigs.has("fact:backdated-new")) fail("(1) a backdated fact dirtied after the cursor was not reported");
+  if (sigs.has("fact:processed-1")) fail("(2) a fact already covered by last_reflect_seq was re-reported");
   if (sigs.has("fact:new-archived")) fail("(3) an archived (tier-3) fact was reported");
 
   console.log(ok
-    ? "\nPASS \u2713 reportEntities only surfaces new, non-archived facts (incremental extraction)"
+    ? "\nPASS \u2713 reportEntities follows dirty_seq, not event-time first_seen"
     : "\nFAILED \u2717 incremental entity-report contract violated");
   db.close();
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* leave tmp */ }

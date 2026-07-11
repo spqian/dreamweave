@@ -152,11 +152,17 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
    `node <AGENT_MEMORY>/src/dream.js ingest-harness --file snapshot.json` — memory_id-keyed, lossless, idempotent. Then hard gate:
    `node <AGENT_MEMORY>/src/dream.js verify-sync --file snapshot.json` (exit 3 + `missing` list unless every harness id is in db). *Invariant: db ⊇ harness. If the gate fails, STOP.*
 
-3. **DREAM.**
+3. **DREAM (association first, then consolidation).**
    `node <AGENT_MEMORY>/src/dream.js dream`
-   Decays active facts/edges, auto-reactivates subjects that reappeared, promotes episodic→semantic when schema/repetition warrants it, evaporates or demotes according to retention mode and tier pressure, prunes old tombstones/weak edges, sets `last_dream`, and reports budget/tier counts.
+   The command first performs an incremental pre-weave so newly ingested facts have
+   `mentions` edges before subject reactivation runs. It then decays active facts/edges,
+   auto-reactivates subjects that reappeared, promotes episodic→semantic when
+   schema/repetition warrants it, evaporates or demotes according to retention mode and
+   tier pressure, prunes old tombstones/weak edges, sets the completed processing cursor,
+   and reports budget/tier counts. Do not replace this with a direct/custom call to the
+   decay phase: association-before-reactivation is a correctness invariant.
 
-4. **WEAVE (connect active facts).**
+4. **WEAVE health pass (connect any post-dream changes).**
    `node <AGENT_MEMORY>/src/dream.js weave` (`--supersede` or `MEMORY_SUPERSEDE=1` enables correction lineage).
    With `MEMORY_INCREMENTAL_WEAVE=1`, only new/dirty facts are woven; otherwise the pass can inspect the full active graph. It adds `mentions`, corroborated `related_to`, low-confidence `similar_to`, and rescue links so active facts have zero islands.
 

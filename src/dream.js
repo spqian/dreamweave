@@ -171,6 +171,20 @@ function parseFlags(argv) {
 const nextId = (db) => db.prepare("SELECT COALESCE(MAX(id),0)+1 m FROM nodes").get().m;
 const getMeta = (db, k) => (db.prepare("SELECT value FROM meta WHERE key=?").get(k) || {}).value;
 const setMeta = (db, k, v) => db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)").run(k, v);
+const getMetaInt = (db, k) => {
+  const n = Number(getMeta(db, k));
+  return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+};
+const currentChangeSeq = (db) => getMetaInt(db, "change_seq");
+const nextChangeSeq = (db) => {
+  const next = currentChangeSeq(db) + 1;
+  setMeta(db, "change_seq", String(next));
+  return next;
+};
+const maxDirtySeq = (db) => {
+  const row = db.prepare("SELECT COALESCE(MAX(dirty_seq),0) m FROM nodes").get();
+  return Math.max(currentChangeSeq(db), Number(row && row.m) || 0);
+};
 
 // EMBED-ONCE: a fact's MiniLM vector is computed once at ingest/weave and stored in
 // vec_nodes. The nightly weave/consolidate KNN loops must REUSE that stored vector as
@@ -302,14 +316,19 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
     if (!exByMem.has(r.memory_id)) exByMem.set(r.memory_id, r);
   }
   const delVec = db.prepare("DELETE FROM vec_nodes WHERE rowid=?");
-  const updChanged = db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END WHERE id=?");
-  const updRevive = db.prepare("UPDATE nodes SET salience=?, notes=NULL WHERE id=?");
+  const updChanged = db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END, dirty_seq=? WHERE id=?");
+  const updRevive = db.prepare("UPDATE nodes SET salience=?, notes=NULL, dirty_seq=? WHERE id=?");
   const updSal = db.prepare("UPDATE nodes SET salience=? WHERE id=?");
-  const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=? WHERE id=?");
-  const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`);
+  const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=?, dirty_seq=? WHERE id=?");
+  const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
+        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)`);
   const res = { harness_count: mems.length, created: 0, refreshed: 0, backfilled: 0, pruned: 0 };
   const harnessIds = new Set(mems.map((m) => m.id || m.memory_id).filter(Boolean));
+  let ingestSeq = 0;
+  const changedSeq = () => {
+    if (!ingestSeq) ingestSeq = nextChangeSeq(db);
+    return ingestSeq;
+  };
   const tx = db.transaction(() => {
     for (const m of mems) {
       const mid = m.id || m.memory_id; if (!mid) continue;
@@ -349,7 +368,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
         // a later ingest date, and this direction also protects merged survivors whose
         // first_seen is the (earlier) min of their members from being pushed forward.
         if (backfillDates && created && !Number.isNaN(Date.parse(created)) && ex.first_seen && Date.parse(fs) < Date.parse(ex.first_seen)) {
-          updFirstSeen.run(fs, ex.id);
+          updFirstSeen.run(fs, changedSeq(), ex.id);
           ex.first_seen = fs;
           res.backfilled += 1;
         }
@@ -361,11 +380,11 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
           // the active tier: re-ingestion by the source of truth is a strong reactivation
           // signal, so it earns its way out of the keyword-only bookshelf.
           delVec.run(BigInt(ex.id));
-          updChanged.run(newFact, category, ex.id);
+          updChanged.run(newFact, category, changedSeq(), ex.id);
           ex.fact = newFact; ex.salience = category; if (ex.notes === "archive") ex.notes = null;
         } else if (ex.notes === "archive") {
           // re-confirmed but text unchanged: still revive from archive (re-embed via missing).
-          updRevive.run(category, ex.id);
+          updRevive.run(category, changedSeq(), ex.id);
           ex.salience = category; ex.notes = null;
         } else if (ex.salience !== category) {
           updSal.run(category, ex.id);
@@ -382,7 +401,8 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       const cls = "episodic";
       const sig = uniqueSig(db, `fact:${deriveSlug(fact)}`);
       const id = nextId(db);
-      insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], fs, now, now, "harness-ingest", fact, "");
+      const seq = changedSeq();
+      insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], fs, now, now, "harness-ingest", fact, "", seq, seq);
       exByMem.set(mid, { id, memory_id: mid, fact, salience: category, notes: "harness-ingest" });
       res.created += 1;
     }
@@ -507,11 +527,13 @@ function computeSchemaFit(db) {
 const promoThreshold = (schemaNorm) => Math.max(1, Math.round(3 - 2 * schemaNorm));
 
 // ---- DREAM core: decay + auto-reactivate + evaporate + housekeeping ----------
-function dreamCore(db, flags) {
+function dreamCoreImpl(db, flags) {
   const now = flags["as-of"] ? new Date(flags["as-of"]) : new Date(Date.now() + (Number(flags["advance-days"]) || 0) * 86400000);
   const nowIso = now.toISOString();
   const runId = flags["run-id"] || `dream-${nowIso.slice(0, 10)}`;
-  const lastDream = getMeta(db, "last_dream") || "1970-01-01T00:00:00.000Z";
+  const lastDreamSeqRaw = getMeta(db, "last_dream_seq");
+  const lastDreamSeq = getMetaInt(db, "last_dream_seq");
+  const dreamInputSeq = maxDirtySeq(db);
   const journal = [];
   const J = (op, sig, reason) => journal.push({ dreamed_at: nowIso, run_id: runId, op, memory_id: "", signature: sig || "", category: "", original_fact: "", result_fact: "", reason });
 
@@ -556,7 +578,9 @@ function dreamCore(db, flags) {
   // entities. Each fact reactivates AT MOST ONCE per run (reactivations counts NIGHTS re-seen,
   // not co-mentions) — so a tier promotion needs persistence across runs, not one busy night.
   // Schema-supported reactivation boosts more (and promotes at a lower threshold).
-  const newFacts = db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND first_seen > ?`).all(lastDream);
+  const newFacts = lastDreamSeqRaw == null
+    ? db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT}`).all()
+    : db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND dirty_seq > ? AND dirty_seq <= ?`).all(lastDreamSeq, dreamInputSeq);
   const newIdSet = new Set(newFacts.map((n) => n.id));
   const triggers = new Map(); // sibling fact id -> count of distinct new facts that re-cued it
   for (const nf of newFacts) {
@@ -747,6 +771,7 @@ function dreamCore(db, flags) {
 
   repairGraph(db);
   setMeta(db, "last_dream", nowIso);
+  setMeta(db, "last_dream_seq", String(dreamInputSeq));
   const final = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
   const archivedNow = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND notes='archive'").get().c;
   const after = budgetParams(final);
@@ -759,6 +784,28 @@ function dreamCore(db, flags) {
   const result = { runId, summary, facts: final, archived: archivedNow, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, pruned_hubs: prunedHubs, reactivated: reentered.size, promoted_semantic: promoSem };
   if (overBy > 0) result.action_needed = `Still ${overBy} over target. Run 'consolidate' and merge the reported clusters (agent) to reduce entry count.`;
   return result;
+}
+
+function dreamCore(db, flags = {}) {
+  const now = flags["as-of"]
+    ? new Date(flags["as-of"])
+    : new Date(Date.now() + (Number(flags["advance-days"]) || 0) * 86400000);
+  const runId = flags["run-id"] || `dream-${now.toISOString().slice(0, 10)}`;
+  if (getMeta(db, "last_completed_dream_run") === runId) {
+    return {
+      runId,
+      skipped: true,
+      reason: "dream run already committed",
+      facts: db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c,
+      archived: db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND notes='archive'").get().c,
+    };
+  }
+  const tx = db.transaction(() => {
+    const result = dreamCoreImpl(db, flags);
+    setMeta(db, "last_completed_dream_run", runId);
+    return result;
+  });
+  return tx();
 }
 
 // ---- WEAVE: connect every fact (zero islands) -------------------------------
@@ -800,18 +847,21 @@ async function weave(db, opts) {
   const K = (opts && opts.k) || 3;
   const SIM = (opts && opts.sim) || 0.45;
   // INCREMENTAL WEAVE (env MEMORY_INCREMENTAL_WEAVE=1): brain-faithful — only process
-  // NEW facts (first_seen > last_weave) and DIRTY ones (merge survivors whose text
-  // changed: gist updated since last_weave). Existing facts already have their entity
+  // NEW or DIRTY facts (dirty_seq > the last successful weave cursor). `first_seen`
+  // is event time and may be years in the past for a newly-arriving historical memory,
+  // so it must never drive processing eligibility. Existing facts already have their entity
   // and sibling edges; a new fact AMENDS its old neighbors by linking to them
   // (recall walks edges bidirectionally, so new->old suffices), and a newly-created
   // entity hub re-links only the old facts that textually mention it (scoped, not O(N)).
   // This makes nightly cost scale with NEW material, not total store size. Default off
   // (full re-derivation) preserves exact legacy behavior.
   const incremental = (opts && opts.incremental) || T.incrementalWeave;
-  const lastWeave = incremental ? (getMeta(db, "last_weave") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
+  const lastWeaveSeqRaw = incremental ? getMeta(db, "last_weave_seq") : null;
+  const lastWeaveSeq = incremental ? getMetaInt(db, "last_weave_seq") : 0;
+  const weaveInputSeq = maxDirtySeq(db);
   const isToWeave = (n) => !incremental
-    || (n.first_seen && n.first_seen > lastWeave)
-    || (n.notes === "gist" && n.last_reactivated && n.last_reactivated > lastWeave);
+    || lastWeaveSeqRaw == null
+    || ((Number(n.dirty_seq) || 0) > lastWeaveSeq && (Number(n.dirty_seq) || 0) <= weaveInputSeq);
 
   // 1) entity vocab from existing entity hubs
   let vocab = vocabWithForms(db);
@@ -820,7 +870,7 @@ async function weave(db, opts) {
   //    extractor learns the entity vocabulary from recurrence (no seed/deny lists), so a
   //    candidate becomes a hub only if it recurs across facts (or has a strong email signal).
   //    Caller-provided typed reads are applied separately via apply-entities.
-  const allActive = db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  const allActive = db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated, dirty_seq FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const factRows = incremental ? allActive.filter(isToWeave) : allActive;
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
@@ -842,6 +892,10 @@ async function weave(db, opts) {
     }
   });
   tx1();
+  const changedHubSigs = [...new Set([
+    ...newHubSigs,
+    ...((opts && Array.isArray(opts.hubSigs)) ? opts.hubSigs : []),
+  ])];
 
   let aliasesMerged = 0;
   vocab = vocabWithForms(db);
@@ -857,12 +911,12 @@ async function weave(db, opts) {
     for (const f of factRows) {
       for (const sig of ent.coMentions(f.fact || "", vocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
     }
-    if (incremental && newHubSigs.length) {
-      const newVocab = vocabWithForms(db).filter((v) => newHubSigs.includes(v.sig));
+    if (incremental && changedHubSigs.length) {
+      const changedVocab = vocabWithForms(db).filter((v) => changedHubSigs.includes(v.sig));
       const toWeaveSigs = new Set(factRows.map((f) => f.signature));
       for (const f of allActive) {
         if (toWeaveSigs.has(f.signature)) continue; // already linked above
-        for (const sig of ent.coMentions(f.fact || "", newVocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
+        for (const sig of ent.coMentions(f.fact || "", changedVocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
       }
     }
   });
@@ -885,7 +939,7 @@ async function weave(db, opts) {
   // bidirectionally, so a single new->old edge connects both ways). Old facts already
   // hold their sibling edges from the night they were woven.
   const factNodes = incremental
-    ? db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().filter(isToWeave)
+    ? db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated, dirty_seq FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().filter(isToWeave)
     : db.prepare("SELECT id, signature, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   await profA(`weave.siblingLink(n=${factNodes.length})`, async () => {
   for (const f of factNodes) {
@@ -1064,7 +1118,10 @@ async function weave(db, opts) {
   }
   });
 
-  if (incremental) setMeta(db, "last_weave", now);
+  if (incremental) {
+    setMeta(db, "last_weave", now);
+    setMeta(db, "last_weave_seq", String(weaveInputSeq));
+  }
   prof("weave.repairGraph", () => repairGraph(db));
   const degFinal = degreeMap(db);
   const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !degFinal.get(s));
@@ -1080,15 +1137,15 @@ function readDecisionFile(file) {
 }
 
 function reportFactRowsForWeave(db) {
-  // Incremental (mirrors reportSalience): entity hubs for OLD facts were already extracted the
-  // night they arrived, so only facts new since last_reflect need entity extraction. Emitting the
-  // whole active store here fanned out to ~O(store) LLM extraction calls per checkpoint and grew
-  // linearly with the store; gating to new facts makes it scale with new material. Non-incremental
-  // (thorough) mode still emits the full store to preserve exact legacy behavior.
+  // Incremental (mirrors reportSalience): only facts changed since the last completed
+  // reflection need entity extraction. dirty_seq is engine processing time; first_seen
+  // remains event time and is intentionally unrelated to incremental eligibility.
   const incrementalR = T.incrementalWeave;
-  const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
-  const newOnlySql = incrementalR ? ` AND first_seen > '${lastReflect.replace(/'/g, "")}'` : "";
-  return db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')${newOnlySql}`).all()
+  const lastReflectSeqRaw = incrementalR ? getMeta(db, "last_reflect_seq") : null;
+  const lastReflectSeq = incrementalR ? getMetaInt(db, "last_reflect_seq") : 0;
+  const newOnlySql = incrementalR && lastReflectSeqRaw != null ? " AND dirty_seq > ?" : "";
+  const stmt = db.prepare(`SELECT signature AS sig, fact FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')${newOnlySql}`);
+  return (incrementalR && lastReflectSeqRaw != null ? stmt.all(lastReflectSeq) : stmt.all())
     .map((f) => ({ sig: f.sig, fact: f.fact || "" }));
 }
 
@@ -1118,6 +1175,7 @@ async function applyEntities(db, raw, opts = {}) {
   const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
   const decisions = cleanEntityDecisions(raw);
   let created = 0, updated = 0;
+  const changedHubSigs = [];
   const tx = db.transaction(() => {
     for (const e of decisions) {
       const existing = db.prepare("SELECT id, text FROM nodes WHERE signature=? AND kind='entity'").get(e.sig);
@@ -1126,16 +1184,18 @@ async function applyEntities(db, raw, opts = {}) {
         const forms = new Set([...(existing.text || "").split("|"), ...formsStr.split("|")].map((f) => f.trim().toLowerCase()).filter((f) => f.length >= 3));
         db.prepare("UPDATE nodes SET text=? WHERE id=?").run([...forms].join("|"), existing.id);
         updated += 1;
+        changedHubSigs.push(e.sig);
       } else {
         const id = nextId(db);
         db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
           VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", formsStr);
         created += 1;
+        changedHubSigs.push(e.sig);
       }
     }
   });
   tx();
-  const weaveResult = await weave(db, { asOf: opts.asOf });
+  const weaveResult = await weave(db, { asOf: opts.asOf, hubSigs: changedHubSigs });
   repairGraph(db);
   return { surface: "entities", accepted: decisions.length, created, updated, weave: weaveResult };
 }
@@ -1167,7 +1227,7 @@ async function applyAliases(db, raw, opts = {}) {
     for (const g of groups) for (const a of g.aliases) { mergeEntityHub(db, g.canonical, a); aliasesMerged += 1; }
   });
   tx();
-  const weaveResult = await weave(db, { asOf: opts.asOf });
+  const weaveResult = await weave(db, { asOf: opts.asOf, hubSigs: groups.map((g) => g.canonical) });
   repairGraph(db);
   return { surface: "aliases", groups: groups.length, aliases_merged: aliasesMerged, weave: weaveResult };
 }
@@ -1191,11 +1251,13 @@ function reportSalience(db) {
   // Merge is non-destructive, so demoted 'detail'/'archive' constituents are never candidates.
   const notColdSql = " AND (notes IS NULL OR notes NOT IN ('detail','archive'))";
   const incrementalR = T.incrementalWeave;
-  const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : "1970-01-01T00:00:00.000Z";
-  const newOnlySql = incrementalR ? ` AND first_seen > '${lastReflect.replace(/'/g, "")}'` : "";
-  const rawCands = db.prepare(
+  const lastReflectSeqRaw = incrementalR ? getMeta(db, "last_reflect_seq") : null;
+  const lastReflectSeq = incrementalR ? getMetaInt(db, "last_reflect_seq") : 0;
+  const newOnlySql = incrementalR && lastReflectSeqRaw != null ? " AND dirty_seq > ?" : "";
+  const candStmt = db.prepare(
     `SELECT id, signature AS sig, fact, first_seen FROM nodes WHERE kind='fact' AND COALESCE(salience_score,0) < ${SAL_PROTECT}${notColdSql}${newOnlySql}`
-  ).all();
+  );
+  const rawCands = incrementalR && lastReflectSeqRaw != null ? candStmt.all(lastReflectSeq) : candStmt.all();
 
   // S3 context (mechanical only — the LLM does the judging, engine stays LLM-less, P5): the
   // nearest existing fact (high cosine ⇒ NOT novel; low ⇒ novel) and any supersede relation
@@ -1346,8 +1408,9 @@ function applySalience(db, raw, opts = {}) {
 
 async function reportMerges(db, opts = {}) {
   const incrementalR = T.incrementalWeave;
-  const lastReflect = incrementalR ? (getMeta(db, "last_reflect") || "1970-01-01T00:00:00.000Z") : null;
-  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: true, seedAfter: incrementalR ? lastReflect : null });
+  const lastReflectSeqRaw = incrementalR ? getMeta(db, "last_reflect_seq") : null;
+  const lastReflectSeq = incrementalR && lastReflectSeqRaw != null ? getMetaInt(db, "last_reflect_seq") : null;
+  const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: true, seedAfterSeq: incrementalR ? lastReflectSeq : null });
   return { surface: "merges", clusters: cons.clusters || [] };
 }
 
@@ -1396,6 +1459,7 @@ async function applyMerges(db, raw, opts = {}) {
       dispBySurvivor.set(dec.survivorSig, disp);
     } catch (e) { process.stderr.write(`[apply-merges] vagueness embed failed: ${e.message}\n`); }
   }
+  const mergeSeq = decisions.length ? nextChangeSeq(db) : currentChangeSeq(db);
   const txM = db.transaction(() => {
     for (const dec of decisions) {
       const survivor = db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(dec.survivorSig);
@@ -1421,16 +1485,16 @@ async function applyMerges(db, raw, opts = {}) {
       // (exactly like every other member) so completed-action / state-transition
       // facts (e.g. "I sent X" vs "do not send X until approved") stay recoverable.
       const survOrig = { fact: survivor.fact, text: survivor.text || survivor.fact, class: (survivor.class === "salient" ? "semantic" : (survivor.class || "semantic")), salience: survivor.salience || "", salience_score: Number(survivor.salience_score) || 0, strength: survivor.strength || 0, reactivations: survivor.reactivations || 0, first_seen: survivor.first_seen };
-      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, salience_score=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist' WHERE id=?")
+      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, salience_score=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist', dirty_seq=? WHERE id=?")
         .run(dec.fact, dec.fact, survClass,
-          salient ? "decision" : (survivor.salience || ""), maxSal, clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, survivor.id);
+          salient ? "decision" : (survivor.salience || ""), maxSal, clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, mergeSeq, survivor.id);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
       // Preserve the survivor's own pre-merge verbatim as a detail of the new gist
       // (memory_id='' — details are archival, not projected to the flat harness).
       const survCloneSig = uniqueSig(db, `fact:${deriveSlug(survOrig.fact || survivor.signature)}`);
-      db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,salience_score,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.salience_score, survOrig.strength, survOrig.reactivations, survOrig.first_seen, now, now, "detail", survOrig.fact, survOrig.text);
+      db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,salience_score,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.salience_score, survOrig.strength, survOrig.reactivations, survOrig.first_seen, now, now, "detail", survOrig.fact, survOrig.text, mergeSeq, mergeSeq);
       db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", survCloneSig, 0.6, now, now);
       db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(survCloneSig, survivor.signature, survOrig.first_seen);
       retained += 1;
@@ -1473,6 +1537,7 @@ async function applyMerges(db, raw, opts = {}) {
   if (missing.length) await profA(`apply-merges.reembed(missing=${missing.length})`, () => reembed(db, missing));
   const weaveResult = await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf }));
   setMeta(db, "last_reflect", now);
+  setMeta(db, "last_reflect_seq", String(maxDirtySeq(db)));
   repairGraph(db);
   return { surface: "merges", decisions: decisions.length, clusters_merged: clustersMerged, entries_reclaimed: 0, details_retained: retained, weave: weaveResult };
 }
@@ -1529,13 +1594,14 @@ async function consolidate(db, opts) {
   const excl = (opts && opts.excludeDetail)
     ? " AND (notes IS NULL OR notes NOT IN ('detail','archive'))"
     : " AND (notes IS NULL OR notes<>'archive')";
-  const facts = db.prepare(`SELECT id, signature, fact, first_seen FROM nodes WHERE kind='fact'${excl}`).all();
+  const facts = db.prepare(`SELECT id, signature, fact, first_seen, dirty_seq FROM nodes WHERE kind='fact'${excl}`).all();
   const mentionsOf = (sig) => new Set(db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(sig).map((r) => r.dst));
   // Incremental: only SEED clusters from new facts (a new fact may merge into an existing
   // cluster; its KNN still finds the old members). Existing-existing dup pairs were
-  // already evaluated the night they arrived. seedAfter = last_reflect timestamp.
-  const seedAfter = opts && opts.seedAfter ? opts.seedAfter : null;
-  const seeds = seedAfter ? facts.filter((f) => (f.first_seen || "") > seedAfter) : facts;
+  // already evaluated after their last content change. Processing eligibility is
+  // revision-based; first_seen remains event time.
+  const seedAfterSeq = opts && opts.seedAfterSeq != null ? Number(opts.seedAfterSeq) : null;
+  const seeds = seedAfterSeq != null ? facts.filter((f) => (Number(f.dirty_seq) || 0) > seedAfterSeq) : facts;
   const seen = new Set();
   const clusters = [];
   for (const f of seeds) {
@@ -1660,14 +1726,15 @@ async function applyConcept(db, group, opts = {}) {
 
   const vec = await embedOne(conceptText);
   const blob = toVecBlob(vec);
+  const conceptSeq = nextChangeSeq(db);
   const tx = db.transaction(() => {
     // id must clear every id-space: a deleted node can leave an orphan vec_nodes/vec_archive
     // rowid above MAX(nodes.id), which would collide on the vec_nodes PK (rubber-duck: orphan vec).
     const vmax = (t) => { try { return db.prepare(`SELECT COALESCE(MAX(rowid),0)+1 m FROM ${t}`).get().m; } catch { return 0; } };
     const cid = Math.max(nextId(db), vmax("vec_nodes"), vmax("vec_archive"));
     const csig = uniqueSig(db, `fact:${deriveSlug(conceptText)}`);
-    db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-      VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(cid, csig, "", "fact", "semantic", "fact", 0.62, conceptFirstSeen, now, now, "gist", conceptText, conceptText);
+    db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
+      VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)`).run(cid, csig, "", "fact", "semantic", "fact", 0.62, conceptFirstSeen, now, now, "gist", conceptText, conceptText, conceptSeq, conceptSeq);
     db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(cid), blob);
     for (const m of fresh) {
       // connect the concept to the entity hubs the member mentioned (keeps it non-island +
@@ -1925,7 +1992,14 @@ async function main() {
     else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"], flags["backfill-dates"] === true || flags["backfill-dates"] === "true"); gate = !r.complete; }
     else if (cmd === "verify-sync") { r = verifySync(db, flags.file); gate = !r.complete; }
     else if (cmd === "repair-dates") r = repairDatesFromText(db, { dryRun: flags["dry-run"] === true || flags["dry-run"] === "true", allowLater: flags["allow-later"] === true || flags["allow-later"] === "true" });
-    else if (cmd === "dream") r = dreamCore(db, flags);
+    else if (cmd === "dream") {
+      // Association must precede reactivation: newly ingested facts have no mention
+      // edges until weave runs, so dreamCore cannot discover that their subjects
+      // reappeared if it runs first. Keep this ordering inside the engine rather than
+      // relying on every host skill/cron integration to orchestrate it correctly.
+      const preweave = await weave(db, { asOf: flags["as-of"], supersede: T.supersede });
+      r = { ...dreamCore(db, flags), preweave };
+    }
     else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
     else if (cmd === "report-entities") r = reportEntities(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-entities") r = await applyEntities(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });

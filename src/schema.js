@@ -23,7 +23,9 @@ function ensureSchema(db) {
       text TEXT,
       fact TEXT,
       kind TEXT,
-      salience_score REAL DEFAULT 0
+      salience_score REAL DEFAULT 0,
+      ingested_seq INTEGER DEFAULT 0,
+      dirty_seq INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS edges (
@@ -103,9 +105,17 @@ function ensureSchema(db) {
   // salience_score (Layer 4): continuous [0,1] importance judged at dream time; modulates
   // half-life. Defaults 0 so pre-existing facts decay purely on their durability class until
   // the dream re-judges them (NULL is coalesced to 0 in the decay formula regardless).
-  for (const col of ["kind TEXT", "fact TEXT", "vagueness REAL", "salience_score REAL DEFAULT 0"]) {
+  for (const col of [
+    "kind TEXT",
+    "fact TEXT",
+    "vagueness REAL",
+    "salience_score REAL DEFAULT 0",
+    "ingested_seq INTEGER DEFAULT 0",
+    "dirty_seq INTEGER DEFAULT 0",
+  ]) {
     try { db.exec(`ALTER TABLE nodes ADD COLUMN ${col}`); } catch (e) { /* already present */ }
   }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_dirty_seq ON nodes(dirty_seq)");
 }
 
 module.exports = { ensureSchema };
