@@ -153,7 +153,8 @@ Stage cursors advance only after that stage completes successfully.
   complete; archive dedup now preserves distinct assertions sharing a broad scope).
 - [ ] Phase 4 performance (recall graph, supersession, sequence, and returned-edge
   queries are seed/cluster scoped and index-driven; reembedding reads only touched
-  edges and runs real 32-item model batches; repeated weave/maintenance and viz work remain).
+  edges and runs real 32-item model batches; visualization projection is linear;
+  repeated weave and remaining nightly maintenance work remain).
 - [ ] Phase 5 documentation and operational hardening (strict atomic config and exact
   anchor recognition complete; public documentation reconciliation remains).
 - [ ] Local validation.

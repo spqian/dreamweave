@@ -393,17 +393,17 @@ const data = {"nodes":[],"links":[]};
         const ra=rnd(n.idx*3.17+7.1), rb=rnd(n.idx*9.73+13.3), R2=ENT_R*1.18;
         const th=ra*Math.PI*2, ph=Math.acos(2*rb-1);
         n._bx=Math.sin(ph)*Math.cos(th)*R2; n._by=Math.sin(ph)*Math.sin(th)*R2; n._bz=Math.cos(ph)*R2; } }
-    // normalize the layout envelope to the PCA radius so the spread sliders keep their feel
+    // normalize the layout envelope to the semantic-projection radius so the spread sliders keep their feel
     let pcaMax=0; for(const n of nodes){ if(n.px!=null){ const r=Math.hypot(n.px,n.py,n.pz); if(r>pcaMax)pcaMax=r; } }
     if(!pcaMax) pcaMax=150;
     let hubMax=0; for(const n of nodes){ if(n._bx==null) continue; const r=Math.hypot(n._bx,n._by,n._bz); if(r>hubMax)hubMax=r; }
     const sc=pcaMax/(hubMax||1);
     for(const n of nodes){ if(n._bx!=null){ n._bx*=sc; n._by*=sc; n._bz*=sc; } }
   }
-  try { computeHubLayout(); } catch(e){ console.error('hub layout failed, falling back to PCA', e); }
+  try { computeHubLayout(); } catch(e){ console.error('hub layout failed, falling back to semantic projection', e); }
 
   // ---- live layout state (tunable via the ⚙ Layout panel) ----
-  // Anchors are the whitened PCA coords (n.px/py/pz). We scale each PCA axis independently
+  // Anchors are the whitened semantic projection (n.px/py/pz). We scale each axis independently
   // so the cloud can be stretched along its dominant semantic axes. Defaults give the
   // stretched, less-dense look; every value is live-editable and re-applied without a reload.
   const LAYOUT_DEFAULT = { xs:4.8, ys:3.2, zs:3.9, charge:41, linkDist:31, rot:0.55, hub:5.0 };
@@ -460,7 +460,7 @@ const data = {"nodes":[],"links":[]};
   function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
 
   // ---- buttons ----
-  // Live layout panel: rescale PCA anchors (spread) + tune forces / rotation without a reload.
+  // Live layout panel: rescale semantic anchors (spread) + tune forces / rotation without a reload.
   function applyLayout(reheat){
     if(!Graph) return;
     const gd=Graph.graphData();

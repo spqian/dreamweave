@@ -2011,41 +2011,46 @@ function exportViz(db) {
   return { nodes: nodes.length, links: links.length, projected: proj.size, output: VIZ_OUT };
 }
 
-// Project 384-dim node embeddings to 3D via PCA (Gram-matrix power iteration) + per-axis
-// whitening, so memories are positioned by MEANING. Disconnected facts land near
-// semantically-similar neighbours instead of being flung into empty space by repulsion.
+// Project embeddings to 3D with deterministic orthogonal random axes + per-axis
+// whitening. The old PCA materialized an N×N Gram matrix and performed hundreds
+// of dense passes over it, making visualization O(N²) in both memory and time.
+// This remains semantic and deterministic while scaling O(N×D).
 function projectEmbeddings3D(db) {
   const out = new Map();
   let rows;
   try { rows = db.prepare("SELECT n.signature s, v.embedding e FROM vec_nodes v JOIN nodes n ON n.id=v.rowid").all(); }
   catch { return out; }
   const N = rows.length; if (N < 4) return out;
-  const D = 384;
-  const X = rows.map((r) => { const b = r.e; const f = new Float32Array(b.buffer, b.byteOffset, D); return Array.from(f); });
-  const mean = new Array(D).fill(0);
-  for (const v of X) for (let j = 0; j < D; j++) mean[j] += v[j];
-  for (let j = 0; j < D; j++) mean[j] /= N;
-  for (const v of X) for (let j = 0; j < D; j++) v[j] -= mean[j];
-  const G = []; for (let i = 0; i < N; i++) G.push(new Float64Array(N));
-  for (let i = 0; i < N; i++) for (let k = i; k < N; k++) { let s = 0; const a = X[i], b = X[k]; for (let j = 0; j < D; j++) s += a[j] * b[j]; G[i][k] = s; G[k][i] = s; }
-  const powerIter = (M, n, iters) => {
-    let v = new Float64Array(n); for (let i = 0; i < n; i++) v[i] = Math.sin(i * 12.9898 + 1) * 43758.5453 % 1 || 0.1;
-    let val = 0;
-    for (let t = 0; t < iters; t++) {
-      const w = new Float64Array(n);
-      for (let i = 0; i < n; i++) { let s = 0; const Mi = M[i]; for (let j = 0; j < n; j++) s += Mi[j] * v[j]; w[i] = s; }
-      let nrm = 0; for (let i = 0; i < n; i++) nrm += w[i] * w[i]; nrm = Math.sqrt(nrm) || 1;
-      for (let i = 0; i < n; i++) w[i] /= nrm; val = nrm; v = w;
-    }
-    return { vec: v, val };
-  };
-  const deflate = (M, n, vec, val) => { for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) M[i][j] -= val * vec[i] * vec[j]; };
+  const D = cfg.EMBED_DIM;
   const axes = [];
-  for (let c = 0; c < 3; c++) { const e = powerIter(G, N, 220); axes.push({ vec: e.vec, val: Math.max(e.val, 1e-9) }); deflate(G, N, e.vec, e.val); }
-  const coords = rows.map(() => [0, 0, 0]);
   for (let c = 0; c < 3; c++) {
-    const sc = Math.sqrt(axes[c].val);
-    const col = Array.from(axes[c].vec, (x) => x * sc);
+    const axis = new Float64Array(D);
+    for (let j = 0; j < D; j++) {
+      const x = Math.sin((j + 1) * (12.9898 + c * 17.123)) * 43758.5453;
+      axis[j] = (x - Math.floor(x)) * 2 - 1;
+    }
+    for (const prior of axes) {
+      let dotp = 0;
+      for (let j = 0; j < D; j++) dotp += axis[j] * prior[j];
+      for (let j = 0; j < D; j++) axis[j] -= dotp * prior[j];
+    }
+    let norm = 0;
+    for (let j = 0; j < D; j++) norm += axis[j] * axis[j];
+    norm = Math.sqrt(norm) || 1;
+    for (let j = 0; j < D; j++) axis[j] /= norm;
+    axes.push(axis);
+  }
+  const coords = rows.map(() => [0, 0, 0]);
+  for (let i = 0; i < N; i++) {
+    const b = rows[i].e;
+    for (let c = 0; c < 3; c++) {
+      let sum = 0;
+      for (let j = 0; j < D; j++) sum += b.readFloatLE(j * 4) * axes[c][j];
+      coords[i][c] = sum;
+    }
+  }
+  for (let c = 0; c < 3; c++) {
+    const col = coords.map((p) => p[c]);
     let m = 0; for (const x of col) m += x; m /= N;
     let sd = 0; for (const x of col) sd += (x - m) * (x - m); sd = Math.sqrt(sd / N) || 1;
     for (let i = 0; i < N; i++) coords[i][c] = (col[i] - m) / sd;
@@ -2140,4 +2145,4 @@ if (require.main === module) {
   main().catch((e) => { console.error("ERROR:", e); process.exit(1); });
 }
 
-module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph, dreamCore, doctor };
+module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph, dreamCore, doctor, projectEmbeddings3D };
