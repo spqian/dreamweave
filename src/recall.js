@@ -182,6 +182,27 @@ function parseDateRange(query, nowRef) {
   const back = (n) => { const d = new Date(base); d.setUTCDate(d.getUTCDate() - n); return d; };
   const win = (n) => ({ lo: iso(back(n)), hi: iso(base) });
   const clampN = (s, max) => Math.max(1, Math.min(max, parseInt(s, 10) || 1));
+  // Named weekday ranges resolve to the most recent completed occurrence. For example,
+  // with a Sunday --as-of, "Monday through Friday" means the immediately preceding
+  // Monday-Friday window. Requiring a range connector (or a temporal preposition for a
+  // single weekday) avoids treating standing phrases such as "Friday catch-up" as dates.
+  const weekdays = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+  const weekdayNames = Object.keys(weekdays).join("|");
+  const previousWeekday = (day) => {
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate()));
+    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() - day + 7) % 7));
+    return d;
+  };
+  m = q.match(new RegExp(`\\b(${weekdayNames})\\s*(?:-|–|to|through|thru)\\s*(${weekdayNames})\\b`, "i"));
+  if (m) {
+    const startDay = weekdays[m[1]], endDay = weekdays[m[2]];
+    const end = previousWeekday(endDay);
+    const start = new Date(end);
+    start.setUTCDate(start.getUTCDate() - ((endDay - startDay + 7) % 7));
+    return { lo: iso(start), hi: iso(end) };
+  }
+  m = q.match(new RegExp(`\\b(?:on|last|past|previous)\\s+(${weekdayNames})\\b`, "i"));
+  if (m) { const d = iso(previousWeekday(weekdays[m[1]])); return { lo: d, hi: d }; }
   if (/\bday before yesterday\b/.test(q)) { const d = iso(back(2)); return { lo: d, hi: d }; }
   if (/\byesterday\b/.test(q)) { const d = iso(back(1)); return { lo: d, hi: d }; }
   if (/\btoday\b/.test(q)) { const d = iso(base); return { lo: d, hi: d }; }

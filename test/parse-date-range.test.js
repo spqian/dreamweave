@@ -38,6 +38,10 @@ eq("PPVNET container DNS mitigation status", null);
 eq("what did the team decide about pricing", null);
 
 // relative phrases resolved against as-of (2026-06-30)
+eq("what happened Monday through Friday", { lo: "2026-06-22", hi: "2026-06-26" });
+eq("changes from Tuesday to Thursday", { lo: "2026-06-23", hi: "2026-06-25" });
+eq("what happened on Monday", { lo: "2026-06-29", hi: "2026-06-29" });
+eq("preserve the Friday catch-up rule", null);
 eq("what happened to Germany West Central last week", { lo: "2026-06-23", hi: "2026-06-30" });
 eq("anything yesterday", { lo: "2026-06-29", hi: "2026-06-29" });
 eq("what shipped today", { lo: "2026-06-30", hi: "2026-06-30" });

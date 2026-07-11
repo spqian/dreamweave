@@ -167,7 +167,7 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Live harness validation (Scout invoked graph-recall for a Germany West
   Central timeline, separated calendar week from release-train lineage, and
   ranked the superseding false-alarm correction over the original SLA alert).
-- [x] Full 180-day evaluation rerun for the report-bound merge contract passed.
+- [ ] Full 180-day current-head evaluation. The report-bound merge-contract run passed:
   Against `oc-180d-hardening-edfea02`, 1,087 occurrence-aligned judgments across
   311 questions moved 5.635 -> 5.593 (-0.041), while final-per-question results
   improved 5.511 -> 5.585 (+0.074). The run completed all 18 checkpoints with no
@@ -176,5 +176,8 @@ Stage cursors advance only after that stage completes successfully.
   resolution (+0.111) improved. Small mixed category deltas and the larger
   occurrence-only synthesis variance came from different LLM consolidation
   survivors/judgments; inspected final reversals were isolated rather than a
-  systematic merge-contract failure.
+  systematic merge-contract failure. That run exposed a pre-existing parser gap:
+  q310's "Monday through Friday" did not activate date-window retrieval and scored
+  4/6. Weekday-range parsing is now implemented and must restore temporal reasoning
+  to 6/6 in the next current-head evaluation before this gate closes.
 - [ ] Push/release.
