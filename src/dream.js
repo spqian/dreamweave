@@ -1252,7 +1252,9 @@ async function applyEntities(db, raw, opts = {}) {
       const formsStr = [...new Set(e.forms)].filter((f) => f.length >= 3).join("|");
       if (existing) {
         const forms = new Set([...(existing.text || "").split("|"), ...formsStr.split("|")].map((f) => f.trim().toLowerCase()).filter((f) => f.length >= 3));
-        db.prepare("UPDATE nodes SET text=? WHERE id=?").run([...forms].join("|"), existing.id);
+        const nextText = [...forms].join("|");
+        if (nextText === (existing.text || "")) continue;
+        db.prepare("UPDATE nodes SET text=? WHERE id=?").run(nextText, existing.id);
         updated += 1;
         changedHubSigs.push(e.sig);
       } else {
@@ -1265,7 +1267,7 @@ async function applyEntities(db, raw, opts = {}) {
     }
   });
   tx();
-  const weaveResult = await weave(db, { asOf: opts.asOf, hubSigs: changedHubSigs });
+  const weaveResult = changedHubSigs.length ? await weave(db, { asOf: opts.asOf, hubSigs: changedHubSigs }) : null;
   repairGraph(db);
   return { surface: "entities", accepted: decisions.length, created, updated, weave: weaveResult };
 }
@@ -1297,7 +1299,7 @@ async function applyAliases(db, raw, opts = {}) {
     for (const g of groups) for (const a of g.aliases) { mergeEntityHub(db, g.canonical, a); aliasesMerged += 1; }
   });
   tx();
-  const weaveResult = await weave(db, { asOf: opts.asOf, hubSigs: groups.map((g) => g.canonical) });
+  const weaveResult = groups.length ? await weave(db, { asOf: opts.asOf, hubSigs: groups.map((g) => g.canonical) }) : null;
   repairGraph(db);
   return { surface: "aliases", groups: groups.length, aliases_merged: aliasesMerged, weave: weaveResult };
 }
@@ -1627,8 +1629,10 @@ async function applyMerges(db, raw, opts = {}) {
   });
   txM();
   const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
-  if (missing.length) await profA(`apply-merges.reembed(missing=${missing.length})`, () => reembed(db, missing));
-  const weaveResult = await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf }));
+  if (decisions.length && missing.length) await profA(`apply-merges.reembed(missing=${missing.length})`, () => reembed(db, missing));
+  const weaveResult = decisions.length
+    ? await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf }))
+    : null;
   setMeta(db, "last_reflect", now);
   setMeta(db, "last_reflect_seq", String(maxDirtySeq(db)));
   repairGraph(db);

@@ -22,9 +22,9 @@ already processed a node.
 
 Incremental stages instead use monotonic engine-owned processing metadata:
 
-- `ingested_at`: when the engine first accepted the node.
-- `dirty_at`: when content or processing-relevant metadata last changed.
-- stage cursors: the highest successfully processed change revision/time.
+- `ingested_seq`: revision when the engine first accepted the node.
+- `dirty_seq`: latest content or processing-relevant revision.
+- stage cursors: the highest successfully processed revision.
 
 Stage cursors advance only after that stage completes successfully.
 
@@ -107,7 +107,7 @@ Stage cursors advance only after that stage completes successfully.
 - Make embedding inference truly batched/chunked.
 - Scope graph repair and degree work while preserving full `doctor` validation.
 - Incrementally report alias candidates instead of all hubs.
-- Replace visualization's quadratic Gram PCA with bounded randomized/covariance PCA.
+- Replace visualization's quadratic Gram PCA with a bounded linear semantic projection.
 
 ## Phase 5 - Operations and documentation
 
@@ -144,10 +144,10 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Phase 1.2 nightly ordering.
 - [x] Phase 1.3 dirty entity propagation (approved hub/form backfill, ambiguous
   short-name filtering, and bounded cross-night mechanical evidence complete).
-- [ ] Phase 2 mutation integrity (atomic/idempotent dream, report-bound merges,
+- [x] Phase 2 mutation integrity (atomic/idempotent dream, report-bound merges,
   committed merge vectors, edge uniqueness, and expanded doctor checks complete;
   future non-empty memory-id uniqueness is enforced without rewriting diagnosed
-  legacy duplicates; operator resolution of legacy duplicates remains).
+  legacy duplicates, which remain explicit doctor/operator repair items).
 - [x] Phase 3 recall correctness (pre-truncation activation, historical target-date
   ranking, active date coverage, numeric/cross-month parsing, and ambiguous-May guard
   complete; archive dedup preserves distinct scoped assertions and supersede lineage
@@ -155,10 +155,12 @@ Stage cursors advance only after that stage completes successfully.
 - [ ] Phase 4 performance (recall graph, supersession, sequence, and returned-edge
   queries are seed/cluster scoped and index-driven; reembedding reads only touched
   edges and runs real 32-item model batches; vector identity self-heals and visualization
-  projection is linear; repeated weave and remaining nightly maintenance work remain).
+  projection is linear; empty report/apply surfaces skip weave entirely. Remaining work:
+  scope non-empty maintenance passes and alias reporting without changing semantics).
 - [x] Phase 5 documentation and operational hardening (strict atomic config, exact
   anchor recognition, and public contract/configuration reconciliation complete).
-- [ ] Local validation.
+- [x] Local validation (26/26 unit files, migration/doctor on a live-store copy,
+  report/apply/projection/recall/viz checks, embedding and projection probes).
 - [ ] Live harness validation.
 - [ ] Full 180-day evaluation.
 - [ ] Push/release.
