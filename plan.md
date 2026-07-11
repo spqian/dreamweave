@@ -146,7 +146,8 @@ Stage cursors advance only after that stage completes successfully.
   ambiguous short-name filtering complete; cross-night mechanical evidence remains).
 - [ ] Phase 2 mutation integrity (atomic/idempotent dream, report-bound merges,
   committed merge vectors, edge uniqueness, and expanded doctor checks complete;
-  non-empty memory-id enforcement remains).
+  future non-empty memory-id uniqueness is enforced without rewriting diagnosed
+  legacy duplicates; operator resolution of legacy duplicates remains).
 - [ ] Phase 3 recall correctness (pre-truncation activation, historical target-date
   ranking, active date coverage, numeric/cross-month parsing, and ambiguous-May guard
   complete; scoped edge retrieval and remaining dedup policy work remain).

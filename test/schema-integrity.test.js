@@ -29,6 +29,30 @@ if (db.prepare("SELECT count(*) c FROM edges").get().c !== 1) throw new Error("m
 db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight) VALUES ('fact:a','related_to','fact:b',0.9)").run();
 if (db.prepare("SELECT count(*) c FROM edges").get().c !== 1) throw new Error("edge unique index does not enforce INSERT OR IGNORE");
 
-console.log("PASS \u2713 schema deduplicates and constrains graph edge identity");
+// A legacy duplicate memory_id must not make migration destructive, but once
+// migrated the schema must reject every new duplicate assignment.
+db.exec("DROP TRIGGER trg_nodes_memory_id_insert_unique; DROP TRIGGER trg_nodes_memory_id_update_unique");
+const insNode = db.prepare("INSERT INTO nodes(signature,memory_id,kind,class) VALUES (?,?, 'fact','episodic')");
+insNode.run("fact:legacy-a", "legacy-duplicate");
+insNode.run("fact:legacy-b", "legacy-duplicate");
+ensureSchema(db);
+if (db.prepare("SELECT count(*) c FROM nodes WHERE memory_id='legacy-duplicate'").get().c !== 2) {
+  throw new Error("migration rewrote legacy duplicate memory IDs");
+}
+try {
+  insNode.run("fact:new-duplicate", "legacy-duplicate");
+  throw new Error("duplicate memory_id insert was accepted");
+} catch (e) {
+  if (!String(e.message).includes("duplicate non-empty memory_id")) throw e;
+}
+insNode.run("fact:unique", "unique-id");
+try {
+  db.prepare("UPDATE nodes SET memory_id='legacy-duplicate' WHERE signature='fact:unique'").run();
+  throw new Error("duplicate memory_id update was accepted");
+} catch (e) {
+  if (!String(e.message).includes("duplicate non-empty memory_id")) throw e;
+}
+
+console.log("PASS \u2713 schema constrains graph edges and future memory identity");
 db.close();
 fs.rmSync(dataDir, { recursive: true, force: true });

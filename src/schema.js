@@ -121,6 +121,30 @@ function ensureSchema(db) {
   db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_memory_id ON nodes(memory_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_nodes_kind_notes_first_seen ON nodes(kind, notes, first_seen)");
 
+  // Legacy stores can contain duplicate harness IDs. Rewriting either row would
+  // destroy projection identity, so leave those rows for doctor/operator repair
+  // while preventing every new insert or memory_id change from adding ambiguity.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_nodes_memory_id_insert_unique
+    BEFORE INSERT ON nodes
+    WHEN coalesce(NEW.memory_id, '') <> ''
+      AND EXISTS (SELECT 1 FROM nodes WHERE memory_id = NEW.memory_id)
+    BEGIN
+      SELECT RAISE(ABORT, 'duplicate non-empty memory_id');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_nodes_memory_id_update_unique
+    BEFORE UPDATE OF memory_id ON nodes
+    WHEN coalesce(NEW.memory_id, '') <> ''
+      AND EXISTS (
+        SELECT 1 FROM nodes
+        WHERE memory_id = NEW.memory_id AND id <> OLD.id
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'duplicate non-empty memory_id');
+    END;
+  `);
+
   // Many mutation paths intentionally use INSERT OR IGNORE for graph edges. That is
   // only meaningful when the schema enforces edge identity. Old stores may already
   // contain duplicates, so collapse them once before creating the unique index.
