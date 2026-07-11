@@ -66,6 +66,13 @@ function runRecall(query, asOf) {
     insVecA.run(BigInt(info.lastInsertRowid), toVecBlob(await embedOne(m.fact)));
     insDetail.run(m.sig, conceptSig, m.first_seen);
   }
+  const scopedDistinct = [
+    ["fact:family-pickup", "[family] School pickup remains at 3 PM on weekdays.", "2026-06-20"],
+    ["fact:family-dinner", "[family] Weekend dinner remains at 6 PM.", "2026-06-21"],
+  ];
+  for (const [sig, fact, firstSeen] of scopedDistinct) {
+    insNode.run(sig, "semantic", 0.4, firstSeen, fact, "archive");
+  }
   db.close();
 
   let ok = true;
@@ -97,6 +104,14 @@ function runRecall(query, asOf) {
   const c = runRecall("what happened on 2026-06-27", "2026-06-30");
   const cNode = c.cluster.nodes.find((n) => n.id === activeNullSig);
   if (!cNode) fail("(C) date-only lookup omitted an active notes=NULL fact");
+
+  // ---- (D) A scope label is not assertion identity. Distinct facts under the
+  // same [family] scope must both survive non-enumerative archive dedup. ----
+  const d = runRecall("family pickup dinner schedule");
+  const dIds = new Set(d.cluster.nodes.map((n) => n.id));
+  if (!dIds.has("fact:family-pickup") || !dIds.has("fact:family-dinner")) {
+    fail("(D) broad scope dedup suppressed a distinct family fact");
+  }
 
   console.log(ok ? "\nPASS \u2713 bookshelf recalled both with and without a time window" : "\nFAILED \u2717");
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* leave tmp */ }

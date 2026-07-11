@@ -148,9 +148,9 @@ Stage cursors advance only after that stage completes successfully.
   committed merge vectors, edge uniqueness, and expanded doctor checks complete;
   future non-empty memory-id uniqueness is enforced without rewriting diagnosed
   legacy duplicates; operator resolution of legacy duplicates remains).
-- [ ] Phase 3 recall correctness (pre-truncation activation, historical target-date
+- [x] Phase 3 recall correctness (pre-truncation activation, historical target-date
   ranking, active date coverage, numeric/cross-month parsing, and ambiguous-May guard
-  complete; remaining archive/scope dedup policy work remains).
+  complete; archive dedup now preserves distinct assertions sharing a broad scope).
 - [ ] Phase 4 performance (recall graph, supersession, sequence, and returned-edge
   queries are seed/cluster scoped and index-driven; nightly scan and batching work remain).
 - [ ] Phase 5 documentation and operational hardening (strict atomic config and exact

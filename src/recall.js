@@ -214,11 +214,6 @@ function normalizeForMatch(text) {
     .trim();
 }
 
-function scopeTag(text) {
-  const m = String(text || "").match(/^\s*\[([^\]]{1,80})\]/);
-  return m ? normalizeForMatch(m[1]) : "";
-}
-
 function phraseHits(hay, phrases) {
   if (!phrases.length) return 0;
   const padded = ` ${hay} `;
@@ -237,13 +232,12 @@ function compareDetailCandidate(a, b) {
 
 function collapseKeys(fact, enumerative) {
   const norm = normalizeForMatch(fact);
-  const scope = scopeTag(fact);
   const keys = [];
   if (norm) keys.push(`text:${norm}`);
-  // Non-enumerative queries need one representative sidecar per scoped daily
-  // re-emission, not one atom per day. Enumerative queries may legitimately need
-  // several facts under the same scope, so exact-text collapse still applies.
-  if (scope && !enumerative) keys.push(`scope:${scope}`);
+  // Collapse only the same normalized assertion. A bracketed scope is a broad
+  // subject label, not fact identity: using it as a key dropped distinct details
+  // such as two different [family] schedule rules. normalizeForMatch already
+  // removes ISO dates, so exact daily re-emissions still collapse.
   return keys;
 }
 
