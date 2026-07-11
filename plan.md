@@ -142,8 +142,8 @@ Stage cursors advance only after that stage completes successfully.
 - [x] Local-only branch and no-push validation gate established.
 - [x] Phase 1.1 processing/event clock separation.
 - [x] Phase 1.2 nightly ordering.
-- [ ] Phase 1.3 dirty entity propagation (approved hub/form backfill complete;
-  ambiguous short-name filtering complete; cross-night mechanical evidence remains).
+- [x] Phase 1.3 dirty entity propagation (approved hub/form backfill, ambiguous
+  short-name filtering, and bounded cross-night mechanical evidence complete).
 - [ ] Phase 2 mutation integrity (atomic/idempotent dream, report-bound merges,
   committed merge vectors, edge uniqueness, and expanded doctor checks complete;
   future non-empty memory-id uniqueness is enforced without rewriting diagnosed

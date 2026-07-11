@@ -8,9 +8,11 @@
 //   1. Facts dirtied after last_reflect_seq are returned, even with an old event date.
 //   2. Facts already covered by the cursor are NOT returned.
 //   3. Archived (tier-3) facts are never returned.
+//   4. Mechanical recurrence evidence spans incremental nightly boundaries.
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "entities-incr-test-"));
 process.env.AGENT_MEMORY_DIR = dataDir;
@@ -49,10 +51,37 @@ process.env.AGENT_MEMORY_DIR = dataDir;
   if (sigs.has("fact:processed-1")) fail("(2) a fact already covered by last_reflect_seq was re-reported");
   if (sigs.has("fact:new-archived")) fail("(3) an archived (tier-3) fact was reported");
 
+  // Night 1 contains one Alice Example mention and must not promote it.
+  ins.run("fact:alice-prior", "semantic", 0.5, "2026-06-14", null, "Alice Example confirmed the migration owner.", 1, 1);
+  db.close();
+  execFileSync(process.execPath, [
+    path.join(__dirname, "..", "src", "dream.js"),
+    "weave", "--as-of", "2026-06-15T00:00:00.000Z",
+  ], { env: { ...process.env, AGENT_MEMORY_DIR: dataDir }, encoding: "utf8" });
+  const db1 = new Database(path.join(dataDir, "memory.db"));
+  if (db1.prepare("SELECT count(*) c FROM nodes WHERE signature='person:alice-example'").get().c !== 0) {
+    fail("(4) one occurrence incorrectly formed an entity hub on night 1");
+  }
+
+  // Night 2 dirties only the second mention. A delta-only extractor sees one
+  // occurrence again; the persisted evidence window must combine both nights.
+  db1.prepare("INSERT INTO nodes (signature, class, strength, first_seen, notes, fact, kind, ingested_seq, dirty_seq) VALUES (?,?,?,?,?,?, 'fact',?,?)")
+    .run("fact:alice-new", "semantic", 0.5, "2026-06-16", null, "Alice Example reported the migration status.", 4, 4);
+  db1.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES ('change_seq','4')").run();
+  db1.close();
+  execFileSync(process.execPath, [
+    path.join(__dirname, "..", "src", "dream.js"),
+    "weave", "--as-of", "2026-06-16T00:00:00.000Z",
+  ], { env: { ...process.env, AGENT_MEMORY_DIR: dataDir }, encoding: "utf8" });
+  const db2 = new Database(path.join(dataDir, "memory.db"), { readonly: true });
+  const hub = db2.prepare("SELECT count(*) c FROM nodes WHERE signature='person:alice-example' AND kind='entity'").get().c;
+  const mentions = db2.prepare("SELECT count(*) c FROM edges WHERE rel='mentions' AND dst='person:alice-example' AND src IN ('fact:alice-prior','fact:alice-new')").get().c;
+  if (hub !== 1 || mentions !== 2) fail(`(4) cross-night recurrence did not form and backfill the hub (hub=${hub}, mentions=${mentions})`);
+
   console.log(ok
     ? "\nPASS \u2713 reportEntities follows dirty_seq, not event-time first_seen"
     : "\nFAILED \u2717 incremental entity-report contract violated");
-  db.close();
+  db2.close();
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* leave tmp */ }
   process.exit(ok ? 0 : 1);
 })().catch((e) => { console.error(e); try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch {} process.exit(1); });

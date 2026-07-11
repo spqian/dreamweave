@@ -896,7 +896,22 @@ async function weave(db, opts) {
   const factRows = incremental ? allActive.filter(isToWeave) : allActive;
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
   let newHubs = 0;
-  const corpusEnts = prof(`weave.extractCorpus(facts=${factRows.length})`, () => ent.extractEntitiesCorpus(factRows.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 }));
+  // Recurrence evidence must survive nightly batch boundaries. Looking only at
+  // factRows means one mention tonight plus one tomorrow is never seen together,
+  // so a genuinely recurring subject can never earn a hub. Reuse the persisted
+  // active facts as a bounded evidence window: always include this run's dirty
+  // facts, then fill from the most recently dirtied active facts up to the normal
+  // working-set bound. This remains independent of total store size.
+  const evidenceLimit = Math.max(500, Math.min(2500, Number(T.tier2Max || 2500)));
+  const evidenceBySig = new Map(factRows.map((f) => [f.signature, f]));
+  if (incremental && evidenceBySig.size < evidenceLimit) {
+    for (const f of [...allActive].sort((a, b) => (Number(b.dirty_seq) || 0) - (Number(a.dirty_seq) || 0))) {
+      if (!evidenceBySig.has(f.signature)) evidenceBySig.set(f.signature, f);
+      if (evidenceBySig.size >= evidenceLimit) break;
+    }
+  }
+  const entityEvidence = incremental ? [...evidenceBySig.values()] : factRows;
+  const corpusEnts = prof(`weave.extractCorpus(facts=${entityEvidence.length})`, () => ent.extractEntitiesCorpus(entityEvidence.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 }));
   const allEnts = new Map();
   for (const e of corpusEnts) {
     if (!allEnts.has(e.sig)) allEnts.set(e.sig, { sig: e.sig, type: e.type, forms: new Set(e.forms) });
