@@ -136,16 +136,18 @@ function extractEntities(fact) {
 }
 
 // SELF-BOOTSTRAPPING corpus extraction (no seed lists). Runs over ALL facts and
-// promotes a candidate person to an entity hub only if it RECURS — appears in at
-// least `minFacts` distinct facts — OR carries a strong single-occurrence signal
-// (an email binding). This learns the entity vocabulary from the data itself, so it
-// works in any domain with zero configuration. One-off capitalized phrases (a product
-// name mentioned once, "Board Meeting", etc.) never become hubs; recurring subjects do.
+// promotes a candidate person only when it has at least one STRUCTURAL person signal
+// (email binding, person-like subject/verb frame, or collaborator/list frame).
+// Recurring Title-Cased bigrams may reinforce that candidate across otherwise-neutral
+// mentions, but capitalization + recurrence alone never asserts "person": operational
+// states such as "Prod Canary" and "Awaiting Promotion" are often repeated in title
+// case and are not names. The caller LLM remains authoritative for ambiguous cases.
 //   facts: array of fact-text strings
 //   opts.minFacts: recurrence threshold (default 2)
 function extractEntitiesCorpus(facts, opts = {}) {
   const minFacts = Math.max(1, Number(opts.minFacts || process.env.MEMORY_ENTITY_MIN_FACTS || 2));
   const cand = new Map();    // sig -> { sig, type, forms:Set, facts:Set<idx> }
+  const weak = new Map();    // wide-net occurrences; reinforce only structurally proposed people
   const strong = new Set();  // sigs with an email binding (promote at count 1)
 
   // CASE-EVIDENCE (self-bootstrapping, no word lists): a token that the corpus also
@@ -181,6 +183,12 @@ function extractEntitiesCorpus(facts, opts = {}) {
     c.facts.add(idx);
     if (isStrong) strong.add(e.sig);
   };
+  const noteWeak = (e, idx) => {
+    if (!weak.has(e.sig)) weak.set(e.sig, { forms: new Set(), facts: new Set() });
+    const w = weak.get(e.sig);
+    e.forms.forEach((f) => w.forms.add(f));
+    w.facts.add(idx);
+  };
   facts.forEach((fact, idx) => {
     const text = fact || "";
     // strong signal: email-bound person
@@ -196,15 +204,22 @@ function extractEntitiesCorpus(facts, opts = {}) {
     for (const e of extractEntities(text)) {
       note(e, idx, strong.has(e.sig) || emailSigs.has(e.sig));
     }
-    // WIDE NET: every capitalized bigram is a weak person candidate. Precision comes
-    // from the case-evidence filter above + the recurrence gate below, not from lists.
+    // WIDE NET: capitalized bigrams are recurrence EVIDENCE, not independent proof of
+    // personhood. They may extend a person already proposed by a structural frame
+    // somewhere in the corpus, but cannot mint a person hub on their own.
     const bigramRe = /\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b/g;
     while ((m = bigramRe.exec(text))) {
       if (!isNamePart(m[1], m[2])) continue;
       const sig = `person:${slug(`${m[1]} ${m[2]}`)}`;
-      note({ sig, type: "person", forms: [normalize(`${m[1]} ${m[2]}`)] }, idx, false);
+      noteWeak({ sig, forms: [normalize(`${m[1]} ${m[2]}`)] }, idx);
     }
   });
+  for (const [sig, w] of weak) {
+    const c = cand.get(sig);
+    if (!c || c.type !== "person") continue;
+    w.forms.forEach((f) => c.forms.add(f));
+    w.facts.forEach((idx) => c.facts.add(idx));
+  }
   const out = [];
   for (const c of cand.values()) {
     if (strong.has(c.sig) || c.facts.size >= minFacts || c.type === "ref") {
@@ -485,4 +500,3 @@ module.exports = {
   isHistoricalIntentQuery, isCorrectionCueText,
   extractHardSpecifics, ageTag, humanizeRelation, renderNodeText,
 };
-
