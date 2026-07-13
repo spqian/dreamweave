@@ -78,6 +78,27 @@ function ensureSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_detail_of_gist   ON detail_of(gist_sig);
     CREATE INDEX IF NOT EXISTS idx_detail_of_detail ON detail_of(detail_sig);
+
+    -- CALLER ADJUDICATIONS on mechanically-proposed entity hubs (Mapping Dataflow
+    -- fix, durable half). A deterministic/mechanical hub candidate is always
+    -- PROVISIONAL until the caller reviews it via report-entities/apply-entities hub
+    -- review. This is a real schema/table, not JSON hidden in notes, precisely so a
+    -- rejected or retyped mechanical candidate is never silently recreated by a
+    -- later weave: weave() consults this table and refuses to recreate any sig
+    -- whose status is 'rejected' or 'retyped'. status: 'provisional' (never
+    -- reviewed) | 'approved' (caller kept/created/updated it) | 'rejected' (caller
+    -- says this candidate is not a real entity) | 'retyped' (superseded by
+    -- retyped_to). One row per mechanically- or caller-known hub signature.
+    CREATE TABLE IF NOT EXISTS entity_adjudications (
+      sig          TEXT PRIMARY KEY,
+      status       TEXT NOT NULL,
+      action       TEXT,
+      retyped_to   TEXT,
+      reviewed_at  TEXT,
+      reviewed_seq INTEGER,
+      report_id    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_entity_adjudications_status ON entity_adjudications(status);
   `);
 
   // Backfill detail_of for databases created before this table existed, from the

@@ -102,6 +102,90 @@ active graph, but nothing is truly forgotten.
    all-or-nothing: stale, overlapping, malformed, or cross-cluster decisions mutate
    nothing and do not advance the processing cursor.
 
+7a. **ALL language-specific engine behavior — not just entity extraction — is a
+   pluggable, LOCAL, deterministic language service.** This covers: what looks like a
+   name or a grammatical function word / plausible surface form (entity
+   extraction); natural-language TEMPORAL parsing (month/weekday names, relative
+   phrases like "last week", the US m/d[/y] numeric-date convention);
+   tokenization/normalization/stopwording used for matching, lexical recall
+   seeding, and signature slugging; query-SHAPE detection (enumerative/specifics/
+   historical intent); the vagueness-trace's hard-specific literal extraction
+   (money/percent/multiple/counted-quantity phrasing); the relative age-tag labels
+   used in recall output; and the humanized node/relation embedding prose for a
+   fact-less hub. None of it is hard-coded in `dream.js` or `recall.js` — both call
+   the RESOLVED service's methods, and `timeline.js`/`graphtext.js` are thin
+   backward-compatible FACADES that resolve the service internally so existing
+   callers/exports keep working unchanged. It lives behind `src/langsvc.js` (a
+   small loader/facade) with the shipped default `src/langsvc.English.js`, which owns:
+   `normalize`/`slug`, `formsFor`/`extractEntities`/`extractEntitiesCorpus`/`coMentions`
+   (entities — PROPOSING only, see below), `parseDateRange`/`monthNames` (temporal),
+   `normalizeForMatch`/`significantTerms`/`isQueryStopword`/`isSignatureStopword`/
+   `tokenize` (tokenization/stopwording), `isEnumerativeQuery`/`isSpecificsIntentQuery`/
+   `isTemporalWord`/`isHistoricalIntentQuery`/`isCorrectionCueText` (query/fact-shape
+   detection), `extractHardSpecifics` (vagueness-trace literals), `ageTag` (relative
+   age labels), and `renderNodeText` (node/relation embedding prose). `src/sig-utils.js`
+   keeps only the truly generic, language-independent "type:slug" signature parsing
+   (`labelOf`/`typeOf`/`buildVocab`) — even ASCII-lowercasing/punctuation-collapsing
+   (`normalize`/`slug`) is an English/Latin-script assumption and lives in the
+   language service, not sig-utils.
+   The loader VALIDATES every resolved service (direct object, module path, or the
+   default) against this full interface and throws immediately, explicitly, on a
+   malformed plugin (missing method(s)) — it never silently falls back to English.
+   A behavior feature flag is deliberately NOT how the service is swapped —
+   callers/tests inject an alternate module path (or a direct object) instead, and
+   `recall.js`'s CLI honors the same `MEMORY_LANG_SERVICE` env var as `dream.js`.
+   Not everything is language-specific, though: protocol-level ISO date parsing,
+   `type:slug` signature mechanics, and relation identifiers are language-neutral
+   and stay in the engine/`sig-utils.js`.
+
+   For ENTITY extraction specifically, the service is PROPOSING, not authoritative:
+   every candidate it proposes is provisional. The caller LLM remains the sole
+   authority: it reviews mechanically-created entity hubs through the bounded hub
+   review carried on `report-entities`/`apply-entities` (see below) and can `keep`,
+   `retype`, `reject`, or `remove_forms`. (`parseDateRange`/tokenization are NOT part
+   of that review contract — they are read-path/matching mechanics, not judgments a
+   caller adjudicates.)
+
+   **Mechanical misclassification must be provisional, reversible, and small blast
+   radius.** The concrete fix for this: a multi-token label (e.g. a detected "First
+   Last" person candidate) is NEVER split into single-token surface forms by the
+   mechanical extractor — only the full phrase is a default surface form. Splitting
+   is exactly what turns one bad candidate into a magnet (every unrelated fact that
+   happens to use either word ordinarily gets falsely co-mentioned). Short
+   forms/aliases are only ever added by explicit CALLER approval (an `apply-entities`
+   decision's `forms`, or a hub-review `retype`). Precision here comes from
+   recurrence gating + full-phrase-only matching, not from English casing hacks or
+   hand-curated denylists.
+
+   **Hub review is bounded and report-bound.** `report-entities` returns, in
+   addition to the usual per-fact typing candidates, a bounded `hubs[]` list:
+   every not-yet-reviewed ("provisional") mechanically-created hub (prioritized by
+   mention degree — i.e. blast radius) plus a small rotating slow-review window over
+   already-approved older hubs. Each hub entry carries its `sig`/`type`/`forms`,
+   mention `degree`, a bounded sample of mentioning facts, and `status`
+   (`provisional`/`approved`). The whole report — facts AND hubs — is covered by one
+   deterministic `report_id` (a hash of facts + hub composition/status/degree/forms),
+   exactly like the merge report contract.
+
+   `apply-entities` accepts either the legacy bare decision array (create/augment,
+   unchanged) or a report-bound envelope `{report_id, decisions, hub_reviews}`. A
+   stale `report_id` or any malformed/invalid `hub_reviews` entry rejects the WHOLE
+   apply atomically — `complete:false`, a structured `rejected` reason, zero
+   mutation, and the review cursor does not advance. The engine validates only
+   report membership, action, type, and forms; it never re-judges the caller's
+   decision. `reject`/`retype`/`remove_forms` sever the false `mentions` edge(s),
+   drop any `related_to`/`similar_to` edge between two affected facts (it may have
+   been corroborated by the now-false hub), mark only those facts dirty, and run a
+   SCOPED reweave — preserving the zero-island and vector invariants without a
+   blanket rescan. `retype` repoints a mention edge to the new sig only where the
+   fact text matches a caller-approved new form — never a blind transfer of every
+   old edge. These adjudications are durable, in a real
+   `entity_adjudications` table (not JSON hidden in `notes`): a rejected or
+   retyped mechanical candidate's signature is never recreated by a later weave.
+   The now-evidence-free hub itself is left for the EXISTING degree-zero hub prune
+   (at `dream`, not `weave`) to clear — no separate decay timer is introduced, and
+   genuine historical mentions are never blanket-decayed.
+
 8. **Merge with TEMPORAL SEQUENCING — the Tier-1 "instincts" are sequence-aware.** Two
    parts:
    - **Within the projection:** the injected gist list is laid out so the *episodic*

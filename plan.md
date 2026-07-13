@@ -183,5 +183,12 @@ Stage cursors advance only after that stage completes successfully.
   180-day rerun passed q310 at 6/6 after the benchmark adapter also forwarded its
   simulated checkpoint date as recall's `--as-of`; retrieval then surfaced the
   June 22, 23, 25, and 26 records directly.
+- [x] Pluggable-language/entity-lifecycle 180-day validation. Against the prior
+  merge-contract run, the canonical 1,087-judgment profile improved 5.593 -> 5.640
+  occurrence-weighted, and the 180-day checkpoint improved 5.522 -> 5.536.
+  Temporal reasoning scored 6/6 on all 31 occurrences. Per-question inspection
+  found no language-service or entity-correction mechanism regression; the mixed
+  reversals were retrieval/consolidation and judge variance already present in
+  this LLM-driven profile.
 - [x] Push/release approved after local, live-harness, full-evaluation, and targeted
   weekday-range validation gates passed.

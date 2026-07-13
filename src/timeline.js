@@ -6,6 +6,15 @@
 // position carries the fine order; this tag carries the gist-level recency. We
 // deliberately avoid emitting a precise stored timestamp as the load-bearing signal:
 // recent is sharp, long-ago is fuzzy, exactly as in human memory.
+//
+// ageDays() is pure elapsed-time arithmetic (protocol-level, language-neutral) and
+// stays here. The LABELS themselves ("just now", "long ago", ...) are English prose
+// judgment, so they live behind the pluggable language service (see langsvc.js) —
+// this module is a thin, backward-compatible FACADE: ageTag()/relAge() resolve the
+// caller's language service (default English, or an explicit/env-selected plugin)
+// and delegate, so every existing call site (recall.js, dream.js) keeps working
+// unchanged while the actual wording is no longer hard-coded in the engine.
+const langsvc = require("./langsvc");
 
 function ageDays(firstSeen, now) {
   const t = Date.parse(firstSeen || "");
@@ -14,20 +23,13 @@ function ageDays(firstSeen, now) {
   return Math.max(0, Math.floor((n - t) / 86400000));
 }
 
-function ageTag(d) {
-  if (d == null) return "undated";
-  if (d <= 2) return "just now";
-  if (d <= 7) return "this week";
-  if (d <= 21) return "past couple weeks";
-  if (d <= 45) return "last month or so";
-  if (d <= 90) return "a couple months ago";
-  if (d <= 150) return "earlier this period";
-  return "long ago";
+function ageTag(d, opts) {
+  return langsvc.resolve(opts && opts.languageService).ageTag(d);
 }
 
 // Convenience: tag from a first_seen + reference "now".
-function relAge(firstSeen, now) {
-  return ageTag(ageDays(firstSeen, now));
+function relAge(firstSeen, now, opts) {
+  return ageTag(ageDays(firstSeen, now), opts);
 }
 
 // Pull the EARLIEST explicit calendar date out of a fact's text — the most

@@ -32,6 +32,7 @@ const path = require("path");
 const { embedTexts, embedOne, toVecBlob } = require("./embed");
 const { buildNodeText } = require("./graphtext");
 const ent = require("./entities");
+const langsvc = require("./langsvc");
 const { ensureSchema } = require("./schema");
 const { ageDays, ageTag, earliestTextDate } = require("./timeline");
 const cfg = require("../config");
@@ -118,40 +119,26 @@ const clamp01 = (x) => Math.max(0, Math.min(1, x));
 // unit-normalize a vector; dot product of two vectors (used for the gist vagueness trace).
 const unit = (v) => { let n = 0; for (let i = 0; i < v.length; i++) n += v[i] * v[i]; n = Math.sqrt(n) || 1; const o = new Float32Array(v.length); for (let i = 0; i < v.length; i++) o[i] = v[i] / n; return o; };
 const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
-// HARD-SPECIFIC extraction for the vagueness trace. A "hard specific" is an answer-bearing
-// literal a generalized gist cannot reconstruct: money, percentage, multiple, and
-// counted quantities. DATES/TIMES are deliberately EXCLUDED — per-day "as of 2026-03-26"
-// restatement timestamps are CORRECTLY dropped by generalization and would swamp the signal.
-// Returns a Set of normalized token strings so the same value stated two ways collides.
-const HARD_SPEC = {
-  money: /\$\s?\d[\d.,]*(?:\s?[-–]\s?\d[\d.,]*)?\s?(?:million|billion|thousand|[mbk])?\b/gi,
-  pct: /\b\d+(?:\.\d+)?\s?%/g,
-  mult: /\b\d+(?:\.\d+)?\s?x\b/gi,
-  count: /\b\d{1,4}\s+(?:people|employees|seats|headcount|customers|users|accounts|deals|reps|hires|roles|units|shares|basis points|bps)\b/gi,
-};
-function extractHardSpecifics(text) {
-  const out = new Set();
-  if (!text) return out;
-  for (const re of Object.values(HARD_SPEC)) {
-    const m = text.match(re);
-    if (!m) continue;
-    for (let t of m) {
-      t = t.toLowerCase().replace(/\s+/g, "")
-        .replace(/million/g, "m").replace(/billion/g, "b").replace(/thousand/g, "k")
-        .replace(/–/g, "-");
-      if (t) out.add(t);
-    }
-  }
-  return out;
-}
-const UNTRUSTED = /<\/?untrusted_memory>/g;const STOPW = new Set("the a an is are was were of for to in on and or that with as at by from this its not be no into".split(" "));
+// HARD-SPECIFIC extraction for the vagueness trace (money/percent/multiple/counted-
+// quantity literals a generalized gist can't reconstruct) is English count-noun and
+// money-scale vocabulary ("million"/"billion"/"thousand", "people"/"seats"/...), so it
+// now lives behind the language service as extractHardSpecifics() (see langsvc.js /
+// langsvc.English.js) instead of a hard-coded regex table here — call sites resolve
+// the language service (see applyMerges) and call L.extractHardSpecifics(text).
+const UNTRUSTED = /<\/?untrusted_memory>/g;
 
 function normalizeHarnessFact(raw) {
   return String(raw || "").replace(UNTRUSTED, "").trim();
 }
 
-function deriveSlug(fact) {
-  const w = ent.normalize(fact).split(" ").filter((x) => !STOPW.has(x) && x.length > 2).slice(0, 5).join("-");
+// Signature slug derivation is LANGUAGE-SPECIFIC (normalize/stopword filtering):
+// callers with a resolved languageService (e.g. weave()) should pass it through;
+// standalone call sites (migration/ingest/consolidation helpers with no opts
+// threading of their own) fall back to the default-resolved service, matching
+// legacy behavior exactly when no alternate service is configured.
+function deriveSlug(fact, langService) {
+  const L = langService || lang();
+  const w = L.normalize(fact).split(" ").filter((x) => !L.isSignatureStopword(x) && x.length > 2).slice(0, 5).join("-");
   return (w || "fact").slice(0, 48);
 }
 
@@ -196,6 +183,11 @@ const maxDirtySeq = (db) => {
   return Math.max(currentChangeSeq(db), Number(row && row.m) || 0);
 };
 
+// Resolve the pluggable language service for this call. Default is the shipped
+// English implementation; opts.languageService lets a caller (or a test) inject an
+// alternate deterministic, local, PROPOSING-only service. See langsvc.js.
+const lang = (opts) => langsvc.resolve(opts && opts.languageService);
+
 // EMBED-ONCE: a fact's MiniLM vector is computed once at ingest/weave and stored in
 // vec_nodes. The nightly weave/consolidate KNN loops must REUSE that stored vector as
 // the query rather than re-embedding every fact every night (which made cost grow with
@@ -219,16 +211,16 @@ function uniqueSig(db, base) {
 }
 
 // ---- embeddings -------------------------------------------------------------
-function injectText(node, edgesBySig) {
+function injectText(node, edgesBySig, opts) {
   const f = (node.fact || "").trim();
   if (f) return f;
-  return buildNodeText(node.signature, edgesBySig.get(node.signature) || []);
+  return buildNodeText(node.signature, edgesBySig.get(node.signature) || [], opts);
 }
 
-async function reembed(db, onlyIds) {
+async function reembed(db, onlyIds, opts) {
   const rows = onlyIds
-    ? db.prepare(`SELECT id, signature, fact FROM nodes WHERE id IN (${onlyIds.map(() => "?").join(",")})`).all(...onlyIds)
-    : db.prepare("SELECT id, signature, fact FROM nodes").all();
+    ? db.prepare(`SELECT id, signature, fact, kind FROM nodes WHERE id IN (${onlyIds.map(() => "?").join(",")})`).all(...onlyIds)
+    : db.prepare("SELECT id, signature, fact, kind FROM nodes").all();
   if (!rows.length) return;
   const sigJson = JSON.stringify(rows.map((r) => r.signature));
   const edges = db.prepare(`
@@ -239,11 +231,17 @@ async function reembed(db, onlyIds) {
   const eb = new Map();
   rows.forEach((r) => eb.set(r.signature, []));
   edges.forEach((e) => { if (eb.has(e.src)) eb.get(e.src).push(e); if (eb.has(e.dst)) eb.get(e.dst).push(e); });
-  const texts = rows.map((r) => injectText(r, eb));
+  const texts = rows.map((r) => injectText(r, eb, opts));
   const vecs = await embedTexts(texts);
   const tx = db.transaction(() => {
     rows.forEach((r, i) => {
-      db.prepare("UPDATE nodes SET text=? WHERE id=?").run(texts[i], r.id);
+      // ENTITY nodes overload `text` as their persisted surface-forms store (pipe-
+      // joined, read by vocabWithForms/hub review/apply-entities). injectText()'s
+      // buildNodeText(...) description is only the EMBEDDING input for a hub (facts
+      // have none of their own) — it must never overwrite the forms a caller or the
+      // mechanical extractor already recorded there. Only fact nodes (whose `text`
+      // is just a fact-content mirror) get it persisted.
+      if (r.kind !== "entity") db.prepare("UPDATE nodes SET text=? WHERE id=?").run(texts[i], r.id);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(r.id));
       // Re-embedding means this node is ACTIVE again; ensure it isn't ALSO left in the
       // cold vec_archive (revive path), or it would surface from both KNN pools.
@@ -839,10 +837,15 @@ function dreamCore(db, flags = {}) {
 // Build a forms-aware entity vocab: label-derived forms (formsFor) UNION any extra
 // surface forms stored on the hub node's text column (set by caller/corpus extraction
 // and alias folding), so abbreviations and first-name aliases still match.
-function vocabWithForms(db) {
-  const rows = db.prepare("SELECT signature, text FROM nodes WHERE kind='entity'").all();
+// Hubs the caller has REJECTED or RETYPED away are excluded entirely — otherwise a
+// severed mention edge would simply be re-added by the very next weave (the node
+// itself is left for the existing degree-zero prune to clear once evidence is gone).
+function vocabWithForms(db, langService) {
+  const L = langService || lang();
+  const disqualified = new Set(db.prepare("SELECT sig FROM entity_adjudications WHERE status IN ('rejected','retyped')").all().map((r) => r.sig));
+  const rows = db.prepare("SELECT signature, text FROM nodes WHERE kind='entity'").all().filter((r) => !disqualified.has(r.signature));
   const vocab = rows.map((r) => {
-    const base = ent.formsFor(r.signature);
+    const base = L.formsFor(r.signature);
     const extra = (r.text || "").split("|").map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 3);
     return { sig: r.signature, type: ent.typeOf(r.signature), forms: [...new Set([...base, ...extra])] };
   });
@@ -890,6 +893,7 @@ async function weave(db, opts) {
   const now = (opts && opts.asOf) ? new Date(opts.asOf).toISOString() : new Date().toISOString();
   const K = (opts && opts.k) || 3;
   const SIM = (opts && opts.sim) || 0.45;
+  const L = lang(opts);
   // INCREMENTAL WEAVE (env MEMORY_INCREMENTAL_WEAVE=1): brain-faithful — only process
   // NEW or DIRTY facts (dirty_seq > the last successful weave cursor). `first_seen`
   // is event time and may be years in the past for a newly-arriving historical memory,
@@ -908,7 +912,7 @@ async function weave(db, opts) {
     || ((Number(n.dirty_seq) || 0) > lastWeaveSeq && (Number(n.dirty_seq) || 0) <= weaveInputSeq);
 
   // 1) entity vocab from existing entity hubs
-  let vocab = vocabWithForms(db);
+  let vocab = vocabWithForms(db, L);
 
   // 2) extract new entities from facts -> create hubs. SELF-BOOTSTRAPPING: the corpus
   //    extractor learns the entity vocabulary from recurrence (no seed/deny lists), so a
@@ -917,6 +921,13 @@ async function weave(db, opts) {
   const allActive = db.prepare("SELECT id, signature, fact, first_seen, notes, last_reactivated, dirty_seq FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const factRows = incremental ? allActive.filter(isToWeave) : allActive;
   const haveSig = new Set(db.prepare("SELECT signature FROM nodes").all().map((r) => r.signature));
+  // Never recreate a mechanical candidate the caller already adjudicated away
+  // (Mapping Dataflow fix, durable half): 'rejected' means the caller judged the
+  // sig itself is not a real entity; 'retyped' means it was superseded by
+  // retyped_to. Both are permanent blast-radius containment, reversible only by a
+  // fresh, explicit caller decision (apply-entities decisions[], not this
+  // mechanical path).
+  const blockedSigs = new Set(db.prepare("SELECT sig FROM entity_adjudications WHERE status IN ('rejected','retyped')").all().map((r) => r.sig));
   let newHubs = 0;
   // Recurrence evidence must survive nightly batch boundaries. Looking only at
   // factRows means one mention tonight plus one tomorrow is never seen together,
@@ -933,7 +944,7 @@ async function weave(db, opts) {
     }
   }
   const entityEvidence = incremental ? [...evidenceBySig.values()] : factRows;
-  const corpusEnts = prof(`weave.extractCorpus(facts=${entityEvidence.length})`, () => ent.extractEntitiesCorpus(entityEvidence.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 }));
+  const corpusEnts = prof(`weave.extractCorpus(facts=${entityEvidence.length})`, () => L.extractEntitiesCorpus(entityEvidence.map((f) => f.fact || ""), { minFacts: (opts && opts.minFacts) || 2 }));
   const allEnts = new Map();
   for (const e of corpusEnts) {
     if (!allEnts.has(e.sig)) allEnts.set(e.sig, { sig: e.sig, type: e.type, forms: new Set(e.forms) });
@@ -943,6 +954,7 @@ async function weave(db, opts) {
   const tx1 = db.transaction(() => {
     for (const e of allEnts.values()) {
       if (haveSig.has(e.sig)) continue;
+      if (blockedSigs.has(e.sig)) continue;
       const id = nextId(db);
       const formsStr = [...e.forms].filter((f) => f.length >= 3).join("|");
       db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
@@ -957,7 +969,7 @@ async function weave(db, opts) {
   ])];
 
   let aliasesMerged = 0;
-  vocab = vocabWithForms(db);
+  vocab = vocabWithForms(db, L);
 
   // 3) co-mention edges fact -> entity. For toWeave (new/dirty) facts: link all entities
   //    they mention. AMENDMENT: when new hubs were created, also link the EXISTING facts
@@ -968,14 +980,14 @@ async function weave(db, opts) {
   let mentionEdges = 0;
   const tx2 = db.transaction(() => {
     for (const f of factRows) {
-      for (const sig of ent.coMentions(f.fact || "", vocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
+      for (const sig of L.coMentions(f.fact || "", vocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
     }
     if (incremental && changedHubSigs.length) {
-      const changedVocab = vocabWithForms(db).filter((v) => changedHubSigs.includes(v.sig));
+      const changedVocab = vocabWithForms(db, L).filter((v) => changedHubSigs.includes(v.sig));
       const toWeaveSigs = new Set(factRows.map((f) => f.signature));
       for (const f of allActive) {
         if (toWeaveSigs.has(f.signature)) continue; // already linked above
-        for (const sig of ent.coMentions(f.fact || "", changedVocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
+        for (const sig of L.coMentions(f.fact || "", changedVocab)) { addEdge(f.signature, "mentions", sig, 0.8); mentionEdges += 1; }
       }
     }
   });
@@ -985,7 +997,7 @@ async function weave(db, opts) {
   //    nodes are intentionally un-embedded — never re-embed them (that's what makes them
   //    cheap), so they are excluded here.
   const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
-  if (missing.length) await profA(`weave.reembed(missing=${missing.length})`, () => reembed(db, missing));
+  if (missing.length) await profA(`weave.reembed(missing=${missing.length})`, () => reembed(db, missing, { languageService: L }));
   // 5) vector sibling links fact <-> fact, CORROBORATED.
   //    shared entity (co-mention overlap) -> related_to (trusted).
   //    else high similarity only      -> similar_to  (low-confidence suggestion).
@@ -1027,9 +1039,9 @@ async function weave(db, opts) {
   // neutral temporal evolution that preserves both). The corpus-frequency tables are computed
   // ONCE here — entFreq scans ALL ~1M mention edges at 50k, so it must not run twice — and the
   // sequence step is ALWAYS-ON, so the scaffold is hoisted out of the SUP-gated block.
-  const toks = (s) => new Set(ent.normalize(s || "").split(" ").filter((w) => w.length > 4 && !STOPW.has(w)));
+  const toks = (s) => new Set(L.normalize(s || "").split(" ").filter((w) => w.length > 4 && !L.isSignatureStopword(w)));
   const jaccard = (a, b) => { if (!a.size || !b.size) return 0; let i = 0; for (const x of a) if (b.has(x)) i++; return i / (a.size + b.size - i); };
-  const scopeOf = (s) => { const m = String(s || "").match(/^\s*\[([^\]]{1,40})\]/); return m ? ent.normalize(m[1]) : ""; };
+  const scopeOf = (s) => { const m = String(s || "").match(/^\s*\[([^\]]{1,40})\]/); return m ? L.normalize(m[1]) : ""; };
   const subjFull = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const subjBySig = new Map(subjFull.map((r) => [r.signature, r]));
   // Entity-hub corpus frequency. A genuine same-subject restatement shares a SPECIFIC entity
@@ -1067,9 +1079,8 @@ async function weave(db, opts) {
   let supersedeEdges = 0;
   const SUP = (opts && opts.supersede) || T.supersede;
   if (SUP) await profA("weave.supersede", async () => {
-    const CUE = /\b(correct(?:ion|ed|s)?|chang(?:e|ed|ing)?|updat(?:e|ed)?|revis(?:e|ed)?|no longer|instead of|rather than|supersed(?:e|ed|es)?|overrid(?:e|den|es)?|replac(?:e|ed|es)?|moved? (?:to|up|earlier|from)|push(?:ed)? (?:to|up|earlier)|now \w+ not)\b/i;
     for (const f of subjSource) {
-      if (!f.fact || !CUE.test(f.fact)) continue;
+      if (!f.fact || !L.isCorrectionCueText(f.fact)) continue;
       const fe = mentionsOf(f.signature);   // entity hubs (may be empty — e.g. single-name principals)
       const ft = toks(f.fact);              // content tokens
       const fScope = scopeOf(f.fact);
@@ -1205,6 +1216,11 @@ async function weave(db, opts) {
 
 // ---- REPORT/APPLY: caller-driven judgment contract ---------------------------
 const ENTITY_DECISION_TYPES = new Set(["person", "org", "team", "place", "project", "system", "topic"]);
+const VALID_HUB_ACTIONS = new Set(["keep", "retype", "reject", "remove_forms"]);
+// Bounded caller review batch sizes (env-overridable, mirrors other engine bounds).
+const HUB_REVIEW_PROVISIONAL_MAX = Number(process.env.MEMORY_HUB_REVIEW_MAX || 20);
+const HUB_REVIEW_SLOW_MAX = Number(process.env.MEMORY_HUB_SLOW_REVIEW_MAX || 10);
+const HUB_REVIEW_SAMPLE_MAX = 3;
 
 function readDecisionFile(file) {
   if (!file) throw new Error("missing --file <decisions.json>");
@@ -1224,11 +1240,85 @@ function reportFactRowsForWeave(db) {
     .map((f) => ({ sig: f.sig, fact: f.fact || "" }));
 }
 
-function reportEntities(db) {
-  return { surface: "entities", facts: reportFactRowsForWeave(db) };
+// ---- entity hub review (bounded, caller-owned) ------------------------------
+// A mechanically-created hub (notes='weave-extract') is 'provisional' until the
+// caller reviews it (keep/retype/reject/remove_forms); anything else (caller-
+// created/updated, or scaffolding restored by repairGraph) defaults to 'approved'
+// unless entity_adjudications overrides it (durable half of the Mapping Dataflow fix).
+function hubStatusOf(node, adj) {
+  if (adj && adj.status) return adj.status;
+  return node.notes === "weave-extract" ? "provisional" : "approved";
+}
+function hubDegree(db, sig) {
+  return (db.prepare("SELECT count(*) c FROM edges WHERE rel='mentions' AND dst=?").get(sig) || {}).c || 0;
+}
+function hubSampleFacts(db, sig, limit) {
+  return db.prepare("SELECT n.fact f FROM edges e JOIN nodes n ON n.signature=e.src WHERE e.rel='mentions' AND e.dst=? ORDER BY n.id ASC LIMIT ?")
+    .all(sig, limit).map((r) => r.f || "");
 }
 
-function cleanEntityDecisions(raw) {
+// Bounded review set: EVERY provisional (mechanically-created, unreviewed) hub is
+// prioritized (highest blast-radius / degree first, up to HUB_REVIEW_PROVISIONAL_MAX),
+// plus a small ROTATING slow re-review window over already-approved older hubs
+// (HUB_REVIEW_SLOW_MAX, cursor persisted in meta so successive reports eventually
+// cover the whole approved set without ever scanning it all at once).
+function buildHubReview(db, opts = {}) {
+  const L = lang(opts);
+  const rows = db.prepare("SELECT id, signature, notes, text, first_seen FROM nodes WHERE kind='entity' ORDER BY id ASC").all();
+  const adjBySig = new Map(db.prepare("SELECT * FROM entity_adjudications").all().map((r) => [r.sig, r]));
+  const live = rows
+    .map((n) => ({ n, status: hubStatusOf(n, adjBySig.get(n.signature)) }))
+    .filter(({ status }) => status !== "rejected" && status !== "retyped"); // already decided; drop from review
+
+  const provisional = live.filter(({ status }) => status === "provisional")
+    .map(({ n }) => ({ n, degree: hubDegree(db, n.signature) }))
+    .sort((a, b) => (b.degree - a.degree) || (Date.parse(a.n.first_seen || 0) - Date.parse(b.n.first_seen || 0)) || (a.n.id - b.n.id))
+    .slice(0, HUB_REVIEW_PROVISIONAL_MAX);
+  const provisionalSigs = new Set(provisional.map(({ n }) => n.signature));
+
+  const approvedPool = live.filter(({ status, n }) => status === "approved" && !provisionalSigs.has(n.signature))
+    .map(({ n }) => n).sort((a, b) => a.id - b.id);
+  const cursorId = getMetaInt(db, "entity_hub_slow_cursor");
+  const after = approvedPool.filter((n) => n.id > cursorId);
+  const wrapped = after.length >= HUB_REVIEW_SLOW_MAX ? after : after.concat(approvedPool.filter((n) => n.id <= cursorId));
+  const slow = wrapped.slice(0, HUB_REVIEW_SLOW_MAX).map((n) => ({ n, degree: hubDegree(db, n.signature) }));
+
+  const hubs = [...provisional, ...slow].map(({ n, degree }) => {
+    const extra = (n.text || "").split("|").map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 3);
+    return {
+      sig: n.signature, type: ent.typeOf(n.signature), label: ent.labelOf(n.signature),
+      forms: [...new Set([...L.formsFor(n.signature), ...extra])],
+      degree,
+      sample: hubSampleFacts(db, n.signature, HUB_REVIEW_SAMPLE_MAX),
+      status: hubStatusOf(n, adjBySig.get(n.signature)),
+    };
+  });
+  const nextSlowCursor = wrapped.length ? wrapped[Math.min(HUB_REVIEW_SLOW_MAX, wrapped.length) - 1].id : cursorId;
+  return { hubs, nextSlowCursor };
+}
+
+// Deterministic report_id: any DB change that would invalidate a caller's decisions
+// (facts changed, hub composition/status/degree/forms changed) changes the hash.
+function buildEntityReport(db, opts = {}) {
+  const facts = reportFactRowsForWeave(db);
+  const { hubs, nextSlowCursor } = buildHubReview(db, opts);
+  const basisSeq = maxDirtySeq(db);
+  const identity = {
+    basis_seq: basisSeq,
+    facts: facts.map((f) => f.sig).sort(),
+    hubs: hubs.map((h) => ({ sig: h.sig, status: h.status, degree: h.degree, forms: [...h.forms].sort() })),
+  };
+  const reportId = crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return { report_id: reportId, basis_seq: basisSeq, facts, hubs, nextSlowCursor };
+}
+
+function reportEntities(db, opts = {}) {
+  const r = buildEntityReport(db, opts);
+  return { surface: "entities", report_id: r.report_id, basis_seq: r.basis_seq, facts: r.facts, hubs: r.hubs };
+}
+
+function cleanEntityDecisions(raw, langService) {
+  const L = langService || lang();
   if (!Array.isArray(raw)) return [];
   const out = new Map();
   for (const e of raw) {
@@ -1237,8 +1327,8 @@ function cleanEntityDecisions(raw) {
     let type = String(e.type || ent.typeOf(sig) || "topic").toLowerCase().trim();
     if (!ENTITY_DECISION_TYPES.has(type)) type = "topic";
     if (!sig.startsWith(`${type}:`) || sig.length < type.length + 3 || sig.length > 80) continue;
-    const forms = new Set(Array.isArray(e.forms) ? e.forms.map((f) => String(f).toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim()).filter((f) => f.length >= 3) : []);
-    for (const f of ent.formsFor(sig)) forms.add(f);
+    const forms = new Set(Array.isArray(e.forms) ? e.forms.map((f) => L.normalize(String(f))).filter((f) => f.length >= 3) : []);
+    for (const f of L.formsFor(sig)) forms.add(f);
     if (!forms.size) continue;
     if (!out.has(sig)) out.set(sig, { sig, type, forms: new Set() });
     forms.forEach((f) => out.get(sig).forms.add(f));
@@ -1246,35 +1336,304 @@ function cleanEntityDecisions(raw) {
   return [...out.values()].map((e) => ({ sig: e.sig, type: e.type, forms: [...e.forms] }));
 }
 
+// Create-or-augment an entity hub node. Returns changed=false when an existing
+// hub's forms are already a superset (idempotent no-op — matches legacy behavior).
+function upsertHubNode(db, sig, formsStr, now, notes) {
+  const existing = db.prepare("SELECT id, text FROM nodes WHERE signature=? AND kind='entity'").get(sig);
+  if (existing) {
+    const forms = new Set([...(existing.text || "").split("|"), ...formsStr.split("|")].map((f) => f.trim().toLowerCase()).filter((f) => f.length >= 3));
+    const nextText = [...forms].join("|");
+    if (nextText === (existing.text || "")) return { id: existing.id, created: false, changed: false };
+    db.prepare("UPDATE nodes SET text=? WHERE id=?").run(nextText, existing.id);
+    return { id: existing.id, created: false, changed: true };
+  }
+  const id = nextId(db);
+  db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
+    VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, notes, "", formsStr);
+  return { id, created: true, changed: true };
+}
+
+function upsertAdjudication(db, sig, status, action, now, seq, reportId, retypedTo) {
+  db.prepare(`INSERT INTO entity_adjudications(sig,status,action,retyped_to,reviewed_at,reviewed_seq,report_id)
+      VALUES (?,?,?,?,?,?,?)
+      ON CONFLICT(sig) DO UPDATE SET status=excluded.status, action=excluded.action, retyped_to=excluded.retyped_to,
+        reviewed_at=excluded.reviewed_at, reviewed_seq=excluded.reviewed_seq, report_id=excluded.report_id`)
+    .run(sig, status, action, retypedTo || null, now, seq, reportId || null);
+}
+
+function factMatchesForms(factText, forms, langService) {
+  const L = langService || lang();
+  const text = ` ${L.normalize(factText)} `;
+  return forms.some((f) => text.includes(` ${f} `));
+}
+
+// Sever every mention edge INTO hubSig for which keepFn(factText) is false.
+// Returns the set of severed (affected) fact signatures.
+function severHubMentions(db, hubSig, keepFn) {
+  const affected = new Set();
+  const srcs = db.prepare("SELECT src FROM edges WHERE rel='mentions' AND dst=?").all(hubSig).map((r) => r.src);
+  for (const src of srcs) {
+    const node = db.prepare("SELECT fact FROM nodes WHERE signature=? AND kind='fact'").get(src);
+    if (!keepFn(node ? (node.fact || "") : "")) {
+      db.prepare("DELETE FROM edges WHERE src=? AND rel='mentions' AND dst=?").run(src, hubSig);
+      affected.add(src);
+    }
+  }
+  return affected;
+}
+
+// Retype: sever every OLD mention edge, repointing it to newSig ONLY when the
+// fact's text matches one of the caller-approved NEW forms — never a blind
+// transfer of every old edge.
+function retypeHubMentions(db, oldSig, newSig, newForms, now, langService) {
+  const affected = new Set();
+  const srcs = db.prepare("SELECT src FROM edges WHERE rel='mentions' AND dst=?").all(oldSig).map((r) => r.src);
+  for (const src of srcs) {
+    const node = db.prepare("SELECT fact FROM nodes WHERE signature=? AND kind='fact'").get(src);
+    const text = node ? (node.fact || "") : "";
+    db.prepare("DELETE FROM edges WHERE src=? AND rel='mentions' AND dst=?").run(src, oldSig);
+    affected.add(src);
+    if (src !== newSig && factMatchesForms(text, newForms, langService)) {
+      const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='mentions' AND dst=?").get(src, newSig);
+      if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(src, "mentions", newSig, 0.8, now, now);
+    }
+  }
+  return affected;
+}
+
+// The false hub may have CORROBORATED fact-to-fact related_to/similar_to edges
+// (shared co-mention was the corroborating signal). Once its evidence is severed,
+// drop every such edge TOUCHING an affected fact — remove_forms can sever only
+// one side of a previously corroborated pair. The scoped reweave below recomputes
+// the affected fact's outbound neighborhood truthfully from vectors + real mentions.
+function severCorroboratedSiblingEdges(db, affectedSigs) {
+  if (!affectedSigs.size) return 0;
+  const arr = [...affectedSigs];
+  const ph = arr.map(() => "?").join(",");
+  return db.prepare(`DELETE FROM edges WHERE rel IN ('related_to','similar_to') AND (src IN (${ph}) OR dst IN (${ph}))`).run(...arr, ...arr).changes;
+}
+
+function markFactsDirty(db, sigs, seq) {
+  if (!sigs.size) return;
+  const stmt = db.prepare("UPDATE nodes SET dirty_seq=? WHERE signature=? AND kind='fact'");
+  for (const s of sigs) stmt.run(seq, s);
+}
+
+function normalizeEntityInput(raw) {
+  if (Array.isArray(raw)) return { legacy: true, reportId: null, decisions: raw, hubReviews: [] };
+  if (raw && typeof raw === "object") {
+    const hasDecisions = Object.prototype.hasOwnProperty.call(raw, "decisions");
+    const hasHubReviews = Object.prototype.hasOwnProperty.call(raw, "hub_reviews");
+    const malformed = (hasDecisions && !Array.isArray(raw.decisions)) || (hasHubReviews && !Array.isArray(raw.hub_reviews));
+    return {
+      legacy: false,
+      reportId: typeof raw.report_id === "string" ? raw.report_id : "",
+      decisions: malformed ? null : (hasDecisions ? raw.decisions : []),
+      hubReviews: malformed ? null : (hasHubReviews ? raw.hub_reviews : []),
+    };
+  }
+  return { legacy: false, reportId: "", decisions: null, hubReviews: null };
+}
+
+// Validate hub_reviews atomically: engine validates only REPORT MEMBERSHIP, action,
+// type, and forms (never re-judges the caller's decision itself). ANY invalid entry
+// voids the whole batch (mirrors validateMergeDecisions's all-or-nothing contract).
+function validateHubReviews(raw, currentHubs, langService) {
+  const L = langService || lang();
+  if (!Array.isArray(raw)) return { reviews: [], submitted: 0, rejected: [{ index: null, reason: "malformed_hub_reviews", sig: null }] };
+  const bySig = new Map(currentHubs.map((h) => [h.sig, h]));
+  const reviews = [];
+  const rejected = [];
+  const seenSig = new Set();
+  for (let index = 0; index < raw.length; index += 1) {
+    const r = raw[index];
+    if (r == null) continue;
+    if (typeof r !== "object" || typeof r.sig !== "string" || typeof r.action !== "string") {
+      rejected.push({ index, reason: "malformed_hub_review", sig: (r && r.sig) || null }); continue;
+    }
+    const sig = r.sig;
+    const hub = bySig.get(sig);
+    if (!hub) { rejected.push({ index, reason: "not_in_report", sig }); continue; }
+    if (seenSig.has(sig)) { rejected.push({ index, reason: "duplicate_sig", sig }); continue; }
+    const action = r.action.trim().toLowerCase();
+    if (!VALID_HUB_ACTIONS.has(action)) { rejected.push({ index, reason: "invalid_action", sig, action: r.action }); continue; }
+    if (action === "retype") {
+      const type = String(r.type || "").toLowerCase().trim();
+      const newSig = typeof r.new_sig === "string" ? r.new_sig.trim().toLowerCase() : "";
+      if (!ENTITY_DECISION_TYPES.has(type) || !newSig.startsWith(`${type}:`) || newSig.length < type.length + 3 || newSig.length > 80) {
+        rejected.push({ index, reason: "invalid_retype", sig }); continue;
+      }
+      const forms = Array.isArray(r.forms) ? r.forms.map((f) => L.normalize(String(f))).filter((f) => f.length >= 3) : [];
+      reviews.push({ sig, action, type, newSig, forms });
+    } else if (action === "remove_forms") {
+      const baseForms = new Set(L.formsFor(sig));
+      const requested = Array.isArray(r.forms) ? r.forms.map((f) => String(f).toLowerCase().trim()).filter(Boolean) : [];
+      // Only ALIASES the caller (or a prior caller decision) explicitly added can be
+      // removed — the mechanically-derived base/full-phrase form is never removable
+      // here; that requires retype/reject instead (small, reversible blast radius).
+      const validForms = requested.filter((f) => hub.forms.includes(f) && !baseForms.has(f));
+      if (!validForms.length) { rejected.push({ index, reason: "no_valid_forms_to_remove", sig }); continue; }
+      reviews.push({ sig, action, forms: validForms });
+    } else {
+      reviews.push({ sig, action });
+    }
+    seenSig.add(sig);
+  }
+  return { reviews, submitted: raw.filter((r) => r != null).length, rejected };
+}
+
 async function applyEntities(db, raw, opts = {}) {
   const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
-  const decisions = cleanEntityDecisions(raw);
-  let created = 0, updated = 0;
-  const changedHubSigs = [];
-  const tx = db.transaction(() => {
-    for (const e of decisions) {
-      const existing = db.prepare("SELECT id, text FROM nodes WHERE signature=? AND kind='entity'").get(e.sig);
-      const formsStr = [...new Set(e.forms)].filter((f) => f.length >= 3).join("|");
-      if (existing) {
-        const forms = new Set([...(existing.text || "").split("|"), ...formsStr.split("|")].map((f) => f.trim().toLowerCase()).filter((f) => f.length >= 3));
-        const nextText = [...forms].join("|");
-        if (nextText === (existing.text || "")) continue;
-        db.prepare("UPDATE nodes SET text=? WHERE id=?").run(nextText, existing.id);
-        updated += 1;
-        changedHubSigs.push(e.sig);
-      } else {
-        const id = nextId(db);
-        db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
-          VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`).run(id, e.sig, "", "entity", "semantic", "semantic", 0.5, now, now, now, "weave-extract", "", formsStr);
-        created += 1;
+  const L = lang(opts);
+  const input = normalizeEntityInput(raw);
+
+  if (input.legacy) {
+    const decisions = cleanEntityDecisions(input.decisions, L);
+    // A NEW dirty revision (never the current/max dirty seq) so any downstream
+    // incremental weave cursor comparison is unambiguous — see the non-legacy
+    // branch's comment on `seq` below for why re-using maxDirtySeq is wrong.
+    const seq = decisions.length ? nextChangeSeq(db) : currentChangeSeq(db);
+    let created = 0, updated = 0;
+    const changedHubSigs = [];
+    const tx = db.transaction(() => {
+      for (const e of decisions) {
+        const formsStr = [...new Set(e.forms)].filter((f) => f.length >= 3).join("|");
+        const { created: isNew, changed } = upsertHubNode(db, e.sig, formsStr, now, "caller-approved");
+        if (!changed) continue;
+        if (isNew) { created += 1; upsertAdjudication(db, e.sig, "approved", "create", now, seq, null); } else updated += 1;
         changedHubSigs.push(e.sig);
       }
+    });
+    tx();
+    const weaveResult = changedHubSigs.length ? await weave(db, { asOf: opts.asOf, hubSigs: changedHubSigs, languageService: L }) : null;
+    repairGraph(db);
+    return {
+      surface: "entities", complete: true, reviewed: decisions.length > 0,
+      accepted: decisions.length, created, updated,
+      hub_reviews_applied: 0, mentions_severed: 0, sibling_edges_removed: 0, facts_marked_dirty: 0,
+      rejected: [], weave: weaveResult,
+    };
+  }
+
+  const currentReport = buildEntityReport(db, opts);
+  if (input.reportId !== currentReport.report_id) {
+    return {
+      surface: "entities", complete: false, reviewed: false,
+      accepted: 0, created: 0, updated: 0, hub_reviews_applied: 0,
+      rejected: [{
+        index: null,
+        reason: input.reportId ? "report_stale" : "missing_report_id",
+        expected_report_id: currentReport.report_id,
+        supplied_report_id: input.reportId || null,
+      }],
+      weave: null,
+    };
+  }
+  if (input.decisions === null || input.hubReviews === null) {
+    return {
+      surface: "entities", complete: false, reviewed: false,
+      accepted: 0, created: 0, updated: 0, hub_reviews_applied: 0,
+      rejected: [{ index: null, reason: "malformed_envelope" }],
+      weave: null,
+    };
+  }
+  const decisions = cleanEntityDecisions(input.decisions, L);
+  const hubValidation = validateHubReviews(input.hubReviews, currentReport.hubs, L);
+  if (hubValidation.rejected.length) {
+    return {
+      surface: "entities", complete: false, reviewed: false,
+      accepted: 0, created: 0, updated: 0, hub_reviews_applied: 0,
+      rejected: hubValidation.rejected,
+      weave: null,
+    };
+  }
+
+  // BUG FIX (hub-review reweave scoping): affected facts must be stamped with a
+  // BRAND-NEW dirty revision, never maxDirtySeq(db)/currentChangeSeq(db) as-is. In
+  // the (common) steady-state case where the store has no other pending dirty
+  // work, maxDirtySeq(db) already EQUALS the persisted `last_weave_seq` cursor
+  // (see weave()'s isToWeave: `dirty_seq > lastWeaveSeq`). Marking an affected
+  // fact dirty at that same value makes it INDISTINGUISHABLE from "already woven"
+  // — the scoped incremental reweave below would silently skip re-deriving its
+  // mention/sibling edges after a reject/retype/remove_forms severs them.
+  // nextChangeSeq(db) always mints a value strictly greater than the current
+  // cursor, so the scoped reweave is guaranteed to pick the affected facts back up.
+  const hasStructuralWork = decisions.length > 0 || hubValidation.reviews.some((r) => r.action !== "keep");
+  const seq = hasStructuralWork ? nextChangeSeq(db) : currentChangeSeq(db);
+
+  let created = 0, updated = 0;
+  const changedHubSigs = [];
+  const allAffected = new Set();
+  let mentionsSevered = 0, siblingEdgesRemoved = 0;
+  const tx = db.transaction(() => {
+    for (const e of decisions) {
+      const formsStr = [...new Set(e.forms)].filter((f) => f.length >= 3).join("|");
+      const { created: isNew, changed } = upsertHubNode(db, e.sig, formsStr, now, "caller-approved");
+      if (!changed) continue;
+      if (isNew) { created += 1; upsertAdjudication(db, e.sig, "approved", "create", now, seq, currentReport.report_id); } else updated += 1;
+      changedHubSigs.push(e.sig);
     }
+
+    for (const review of hubValidation.reviews) {
+      if (review.action === "keep") {
+        // No structural change; do not force a reweave for a pure keep.
+        upsertAdjudication(db, review.sig, "approved", "keep", now, seq, currentReport.report_id);
+        continue;
+      }
+      if (review.action === "reject") {
+        const affected = severHubMentions(db, review.sig, () => false);
+        mentionsSevered += affected.size;
+        siblingEdgesRemoved += severCorroboratedSiblingEdges(db, affected);
+        affected.forEach((s) => allAffected.add(s));
+        upsertAdjudication(db, review.sig, "rejected", "reject", now, seq, currentReport.report_id);
+        changedHubSigs.push(review.sig);
+        continue;
+      }
+      if (review.action === "remove_forms") {
+        const node = db.prepare("SELECT id, text FROM nodes WHERE signature=? AND kind='entity'").get(review.sig);
+        if (!node) continue;
+        const removeSet = new Set(review.forms);
+        const remainingExtra = (node.text || "").split("|").map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 3 && !removeSet.has(s));
+        db.prepare("UPDATE nodes SET text=? WHERE id=?").run(remainingExtra.join("|"), node.id);
+        const remainingForms = [...new Set([...L.formsFor(review.sig), ...remainingExtra])];
+        const affected = severHubMentions(db, review.sig, (text) => factMatchesForms(text, remainingForms, L));
+        mentionsSevered += affected.size;
+        siblingEdgesRemoved += severCorroboratedSiblingEdges(db, affected);
+        affected.forEach((s) => allAffected.add(s));
+        upsertAdjudication(db, review.sig, "approved", "remove_forms", now, seq, currentReport.report_id);
+        changedHubSigs.push(review.sig);
+        continue;
+      }
+      if (review.action === "retype") {
+        const newForms = [...new Set([...review.forms, ...L.formsFor(review.newSig)])];
+        upsertHubNode(db, review.newSig, newForms.join("|"), now, "caller-approved");
+        const affected = retypeHubMentions(db, review.sig, review.newSig, newForms, now, L);
+        mentionsSevered += affected.size;
+        siblingEdgesRemoved += severCorroboratedSiblingEdges(db, affected);
+        affected.forEach((s) => allAffected.add(s));
+        upsertAdjudication(db, review.sig, "retyped", "retype", now, seq, currentReport.report_id, review.newSig);
+        upsertAdjudication(db, review.newSig, "approved", "retype", now, seq, currentReport.report_id);
+        changedHubSigs.push(review.sig, review.newSig);
+      }
+    }
+
+    markFactsDirty(db, allAffected, seq);
   });
   tx();
-  const weaveResult = changedHubSigs.length ? await weave(db, { asOf: opts.asOf, hubSigs: changedHubSigs }) : null;
+  setMeta(db, "entity_hub_slow_cursor", String(currentReport.nextSlowCursor));
+
+  const weaveResult = changedHubSigs.length ? await weave(db, { asOf: opts.asOf, hubSigs: [...new Set(changedHubSigs)], languageService: L }) : null;
   repairGraph(db);
-  return { surface: "entities", accepted: decisions.length, created, updated, weave: weaveResult };
+  return {
+    surface: "entities", complete: true, reviewed: true,
+    accepted: decisions.length, created, updated,
+    hub_reviews_applied: hubValidation.reviews.length,
+    mentions_severed: mentionsSevered,
+    sibling_edges_removed: siblingEdgesRemoved,
+    facts_marked_dirty: allAffected.size,
+    rejected: [],
+    weave: weaveResult,
+  };
 }
 
 function reportAliases(db) {
@@ -1583,6 +1942,7 @@ function validateMergeDecisions(db, raw, reportedClusters = null) {
 }
 
 async function applyMerges(db, raw, opts = {}) {
+  const L = lang(opts);
   const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
   const input = normalizeMergeInput(raw);
   const currentReport = await reportMerges(db, opts);
@@ -1650,9 +2010,9 @@ async function applyMerges(db, raw, opts = {}) {
       .filter(Boolean);
     if (memFacts.length < 2) continue;
     const memberSpecs = new Set();
-    for (const f of memFacts) for (const t of extractHardSpecifics(f)) memberSpecs.add(t);
+    for (const f of memFacts) for (const t of L.extractHardSpecifics(f)) memberSpecs.add(t);
     if (memberSpecs.size) {
-      const survSpecs = extractHardSpecifics(dec.fact);
+      const survSpecs = L.extractHardSpecifics(dec.fact);
       let dropped = 0;
       for (const t of memberSpecs) if (!survSpecs.has(t)) dropped += 1;
       lossBySurvivor.set(dec.survivorSig, { dropped, total: memberSpecs.size });
@@ -1750,9 +2110,9 @@ async function applyMerges(db, raw, opts = {}) {
   });
   txM();
   const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
-  if (decisions.length && missing.length) await profA(`apply-merges.reembed(missing=${missing.length})`, () => reembed(db, missing));
+  if (decisions.length && missing.length) await profA(`apply-merges.reembed(missing=${missing.length})`, () => reembed(db, missing, { languageService: L }));
   const weaveResult = decisions.length
-    ? await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf }))
+    ? await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf, languageService: L }))
     : null;
   setMeta(db, "last_reflect", now);
   setMeta(db, "last_reflect_seq", String(maxDirtySeq(db)));
@@ -2283,7 +2643,7 @@ async function main() {
     }
     else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
     else if (cmd === "report-entities") r = reportEntities(db, { asOf: flags["as-of"] });
-    else if (cmd === "apply-entities") r = await applyEntities(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "apply-entities") { r = await applyEntities(db, readDecisionFile(flags.file), { asOf: flags["as-of"] }); gate = r.complete === false; }
     else if (cmd === "report-aliases") r = reportAliases(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-aliases") r = await applyAliases(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
     else if (cmd === "report-salience") r = reportSalience(db, { asOf: flags["as-of"] });

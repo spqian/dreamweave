@@ -11,6 +11,18 @@ const sqliteVec = require("sqlite-vec");
 const { embedOne, toVecBlob } = require("./embed");
 const { ageDays, ageTag } = require("./timeline");
 const cfg = require("../config");
+const langsvc = require("./langsvc");
+
+// Resolve the pluggable language service (see langsvc.js). recall.js NEVER
+// hard-codes English temporal parsing, tokenization, or query-shape judgment
+// directly — natural-language date parsing (months/weekdays/relative phrases/
+// numeric-date convention), tokenize/normalizeForMatch/significantTerms/
+// stopwording, enumerative- and specifics-intent query detection, and
+// temporal-vs-topic term separation all live behind the resolved service
+// (langsvc.English.js is the shipped default). Same resolution order as
+// dream.js's `lang(opts)`: explicit injection/module path in opts, else
+// MEMORY_LANG_SERVICE env var, else the default. No behavior feature flag.
+const lang = (opts) => langsvc.resolve(opts && opts.languageService);
 
 const DB_PATH = cfg.DB_PATH;
 const ACT_LAMBDA = 0.2;
@@ -116,123 +128,21 @@ function parseArgs(argv) {
   return args;
 }
 
-// Parse a temporal window from a natural-language query so the cold bookshelf can be
-// looked up by TIME (not just semantic/keyword). first_seen is stored ISO ("2026-06-25T..")
-// which a query like "June 25" never LIKE-matches — this bridges NL dates to an ISO range.
+// Natural-language TEMPORAL parsing (month/weekday names, relative phrases, the US
+// m/d[/y] numeric-date convention) is LANGUAGE-SPECIFIC and lives behind the
+// pluggable language service (see langsvc.js/langsvc.English.js) — this is a thin
+// wrapper preserving recall.js's `parseDateRange` export for existing callers/tests.
 // Returns { lo, hi } inclusive ISO-date bounds (YYYY-MM-DD) or null when no date intent.
-const MONTHS = { jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4, may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12 };
-function pad2(n) { return String(n).padStart(2, "0"); }
-function lastDay(y, m) { return new Date(y, m, 0).getDate(); }
-function parseDateRange(query, nowRef) {
-  const q = String(query || "").toLowerCase();
-  const defYear = (nowRef instanceof Date && !Number.isNaN(nowRef.getTime())) ? nowRef.getFullYear() : new Date().getFullYear();
-  // 1) ISO full date  2026-06-25
-  let m = q.match(/(\d{4})-(\d{2})-(\d{2})/);
-  if (m) { const d = `${m[1]}-${m[2]}-${m[3]}`; return { lo: d, hi: d }; }
-  // 2) ISO month  2026-06
-  m = q.match(/(\d{4})-(\d{2})(?!\d)/);
-  if (m) { const y = +m[1], mo = +m[2]; return { lo: `${m[1]}-${m[2]}-01`, hi: `${m[1]}-${m[2]}-${pad2(lastDay(y, mo))}` }; }
-  // 3) numeric date (US host convention): 2/27 or 2/27/2026.
-  m = q.match(/\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])(?:\/(\d{4}))?\b/);
-  if (m) {
-    const mo = +m[1], yr = m[3] ? +m[3] : defYear, d = Math.min(+m[2], lastDay(yr, mo));
-    const iso = `${yr}-${pad2(mo)}-${pad2(d)}`;
-    return { lo: iso, hi: iso };
-  }
-  // 4) cross-month named range: May 27 to June 2 [2026].
-  const monthNames = Object.keys(MONTHS).join("|");
-  m = q.match(new RegExp(`\\b(${monthNames})\\s+(\\d{1,2})(?:,?\\s*(\\d{4}))?\\s*(?:-|–|to|through)\\s*(${monthNames})\\s+(\\d{1,2})(?:,?\\s*(\\d{4}))?\\b`, "i"));
-  if (m) {
-    const mo1 = MONTHS[m[1]], mo2 = MONTHS[m[4]];
-    let y1 = m[3] ? +m[3] : defYear;
-    let y2 = m[6] ? +m[6] : y1;
-    if (!m[6] && mo2 < mo1) y2 += 1;
-    const d1 = Math.min(+m[2], lastDay(y1, mo1));
-    const d2 = Math.min(+m[5], lastDay(y2, mo2));
-    return { lo: `${y1}-${pad2(mo1)}-${pad2(d1)}`, hi: `${y2}-${pad2(mo2)}-${pad2(d2)}` };
-  }
-  // 5) month name (+ optional qualifier / day / year)
-  const monthRe = new RegExp(`(late|early|mid|middle|end of|beginning of)?\\s*(${Object.keys(MONTHS).join("|")})\\b(?:\\s+(\\d{1,2})(?!\\d))?(?:\\s*[-–to]{1,3}\\s*(\\d{1,2})(?!\\d))?(?:,?\\s*(\\d{4}))?`, "i");
-  m = q.match(monthRe);
-  if (m) {
-    if (m[2].toLowerCase() === "may" && !m[1] && !m[3] && !m[5]) {
-      const temporalMay = /\b(?:in|during|from|since|through|throughout)\s+may\b|\bmay\s+(?:events?|incidents?|changes?|updates?|notes?|summary|timeline|records?)\b/i.test(q);
-      if (!temporalMay) m = null;
-    }
-  }
-  if (m) {
-    const qual = m[1] || "", mo = MONTHS[m[2]], d1 = m[3] ? +m[3] : null, d2 = m[4] ? +m[4] : null, yr = m[5] ? +m[5] : defYear;
-    const ld = lastDay(yr, mo);
-    if (d1 && d2) return { lo: `${yr}-${pad2(mo)}-${pad2(Math.min(d1, d2))}`, hi: `${yr}-${pad2(mo)}-${pad2(Math.min(ld, Math.max(d1, d2)))}` };
-    if (d1) { const d = `${yr}-${pad2(mo)}-${pad2(Math.min(d1, ld))}`; return { lo: d, hi: d }; }
-    // whole month, optionally narrowed by qualifier
-    let lo = 1, hi = ld;
-    if (/late|end of/.test(qual)) { lo = 21; hi = ld; }
-    else if (/early|beginning of/.test(qual)) { lo = 1; hi = 10; }
-    else if (/mid|middle/.test(qual)) { lo = 11; hi = 20; }
-    return { lo: `${yr}-${pad2(mo)}-${pad2(lo)}`, hi: `${yr}-${pad2(mo)}-${pad2(hi)}` };
-  }
-  // 6) RELATIVE phrases resolved against nowRef (the --as-of anchor, else system now). Explicit
-  // dates/months above take precedence; this fills natural temporal language so queries like
-  // "what happened last week", "yesterday", "in the past 3 days" reliably trigger the date-window
-  // (archive_time) scan instead of falling back to blind topical recall. Windows are rolling
-  // [nowRef-N, nowRef] inclusive; the DB compares on the date prefix so events on `hi` are included.
-  const base = (nowRef instanceof Date && !Number.isNaN(nowRef.getTime())) ? new Date(nowRef) : new Date();
-  const iso = (dt) => `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
-  const back = (n) => { const d = new Date(base); d.setUTCDate(d.getUTCDate() - n); return d; };
-  const win = (n) => ({ lo: iso(back(n)), hi: iso(base) });
-  const clampN = (s, max) => Math.max(1, Math.min(max, parseInt(s, 10) || 1));
-  // Named weekday ranges resolve to the most recent completed occurrence. For example,
-  // with a Sunday --as-of, "Monday through Friday" means the immediately preceding
-  // Monday-Friday window. Requiring a range connector (or a temporal preposition for a
-  // single weekday) avoids treating standing phrases such as "Friday catch-up" as dates.
-  const weekdays = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
-  const weekdayNames = Object.keys(weekdays).join("|");
-  const previousWeekday = (day) => {
-    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate()));
-    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() - day + 7) % 7));
-    return d;
-  };
-  m = q.match(new RegExp(`\\b(${weekdayNames})\\s*(?:-|–|to|through|thru)\\s*(${weekdayNames})\\b`, "i"));
-  if (m) {
-    const startDay = weekdays[m[1]], endDay = weekdays[m[2]];
-    const end = previousWeekday(endDay);
-    const start = new Date(end);
-    start.setUTCDate(start.getUTCDate() - ((endDay - startDay + 7) % 7));
-    return { lo: iso(start), hi: iso(end) };
-  }
-  m = q.match(new RegExp(`\\b(?:on|last|past|previous)\\s+(${weekdayNames})\\b`, "i"));
-  if (m) { const d = iso(previousWeekday(weekdays[m[1]])); return { lo: d, hi: d }; }
-  if (/\bday before yesterday\b/.test(q)) { const d = iso(back(2)); return { lo: d, hi: d }; }
-  if (/\byesterday\b/.test(q)) { const d = iso(back(1)); return { lo: d, hi: d }; }
-  if (/\btoday\b/.test(q)) { const d = iso(base); return { lo: d, hi: d }; }
-  // "last/past N day(s)|week(s)|month(s)"
-  m = q.match(/\b(?:last|past|previous|prior)\s+(\d{1,3})\s+(day|week|month)s?\b/);
-  if (m) { const unit = m[2], mult = unit === "day" ? 1 : unit === "week" ? 7 : 31; return win(clampN(m[1], unit === "day" ? 90 : unit === "week" ? 26 : 24) * mult); }
-  // "last/past few|several|couple days|weeks"
-  if (/\b(?:last|past|recent|these past)\s+(?:few|several|couple(?:\s+of)?)\s+days\b/.test(q)) return win(7);
-  if (/\b(?:last|past|recent|these past)\s+(?:few|several|couple(?:\s+of)?)\s+weeks\b/.test(q)) return win(21);
-  // singular period windows
-  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+week\b/.test(q)) return win(7);
-  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+month\b/.test(q)) return win(31);
-  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+quarter\b/.test(q)) return win(92);
-  if (/\b(?:last|past|previous|prior|this(?:\s+past)?)\s+year\b/.test(q)) return win(365);
-  if (/\b(?:recently|lately|of late|in recent days)\b/.test(q)) return win(10);
-  return null;
+function parseDateRange(query, nowRef, opts) {
+  return lang(opts).parseDateRange(query, nowRef);
 }
 
-const STOP = new Set(
-  "the a an is are was were of for to in on and or that with as at by from this its not be no into what which who whom whose when where why how did do does has have had will would should could about over under more most than then them they their our your you i me my we us work works working update updates updated status note notes keep keeps keeping kept reminder reminders daily weekly monthly today yesterday tomorrow".split(" ")
-);
-
-function normalizeForMatch(text) {
-  return String(text || "")
-    .toLowerCase()
-    .replace(/^\s*\[[^\]]+\]\s*/, " ")
-    .replace(/\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b/g, " ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+// Query-significance stopwording, match-normalization, and significant-term
+// extraction are ALSO language-specific (which words are "noise", how punctuation
+// collapses for matching) — thin wrappers over the resolved language service, kept
+// so recall.js's existing exports/call sites are unaffected.
+function normalizeForMatch(text, opts) {
+  return lang(opts).normalizeForMatch(text);
 }
 
 function phraseHits(hay, phrases) {
@@ -251,8 +161,8 @@ function compareDetailCandidate(a, b) {
     || ((Date.parse(b.first_seen || "") || 0) - (Date.parse(a.first_seen || "") || 0));
 }
 
-function collapseKeys(fact, enumerative) {
-  const norm = normalizeForMatch(fact);
+function collapseKeys(fact, enumerative, opts) {
+  const norm = normalizeForMatch(fact, opts);
   const keys = [];
   if (norm) keys.push(`text:${norm}`);
   // Collapse only the same normalized assertion. A bracketed scope is a broad
@@ -264,8 +174,8 @@ function collapseKeys(fact, enumerative) {
 
 // Significant query terms shared by the lexical-seed channel and the Tier-3 keyword tiers.
 // Mirrors the `terms` extraction downstream (kept in one place so both stay in sync).
-function significantTerms(query, limit) {
-  return [...new Set((String(query || "").toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) || []).filter((t) => !STOP.has(t)))].slice(0, limit || 10);
+function significantTerms(query, limit, opts) {
+  return lang(opts).significantTerms(query, limit);
 }
 
 // HYBRID LEXICAL SEEDS. Dense cosine seeding buries a specific committed fact whose long
@@ -281,7 +191,7 @@ function significantTerms(query, limit) {
 // ranker scores low. `minHitsFloor`/`budget` are exposed for testing.
 function selectLexicalSeeds(db, query, opts = {}) {
   const budget = opts.budget != null ? opts.budget : 2;
-  const terms = opts.terms || significantTerms(query);
+  const terms = opts.terms || significantTerms(query, undefined, opts);
   if (terms.length < 2 || budget <= 0) return [];
   // Require a lexically-distinctive match: at least 2 terms, and at least ~40% of the
   // query's significant terms — enough to demand the fact is ABOUT the query, not a
@@ -314,6 +224,10 @@ async function main() {
     console.error('Usage: node lib/recall.js --query "<text>" [--max-hops 2]');
     process.exit(2);
   }
+  // Resolved once for this run: default English service, or MEMORY_LANG_SERVICE
+  // plugin (see langsvc.js). All temporal/tokenization/stopword judgment below
+  // goes through L, never a hard-coded English list.
+  const L = lang();
 
   const db = new Database(DB_PATH, { readonly: true });
   sqliteVec.load(db);
@@ -321,10 +235,9 @@ async function main() {
   const qFloat = await embedOne(args.query);
   const qvec = toVecBlob(qFloat);
   const seedNowRef = args.asOf ? new Date(args.asOf) : new Date();
-  const seedDateRange = parseDateRange(args.query, seedNowRef);
+  const seedDateRange = L.parseDateRange(args.query, seedNowRef);
   const seedDateIntent = seedDateRange != null;
-  const histIntent = seedDateIntent
-    || /\b(as of|during|origin(?:al|ally)?|before it|previous(?:ly)?|used to|initially|initial|at the time|back then)\b/i.test(args.query || "");
+  const histIntent = seedDateIntent || L.isHistoricalIntentQuery(args.query || "");
 
   // 1) Vector KNN -> candidate seeds (cosine distance; lower = closer). Seeds are FACTS
   //    only: entity hubs are also embedded, but a hub seed consumes a limited seed slot
@@ -422,11 +335,11 @@ async function main() {
   // forecast bridge" on Caldwell/ERP queries). So an EXPANDED member (one not already in the
   // cluster on its own merits) is admitted only if it shares >=2 significant content tokens with
   // the query — keeping the queried statement's own evolution while dropping unrelated lineages.
-  const qTokens = new Set((args.query.toLowerCase().match(/[a-z0-9]+/g) || []).filter((w) => w.length > 4 && !STOP.has(w)));
+  const qTokens = new Set(L.tokenize(args.query).filter((w) => w.length > 4 && !L.isQueryStopword(w)));
   const sharesQueryTopic = (txt) => {
     let n = 0;
-    for (const w of new Set((String(txt || "").toLowerCase().match(/[a-z0-9]+/g) || []))) {
-      if (w.length > 4 && !STOP.has(w) && qTokens.has(w) && ++n >= 2) return true;
+    for (const w of new Set(L.tokenize(String(txt || "")))) {
+      if (w.length > 4 && !L.isQueryStopword(w) && qTokens.has(w) && ++n >= 2) return true;
     }
     return false;
   };
@@ -507,7 +420,7 @@ async function main() {
   // Significant query terms (shared by the detail-expansion and archive tiers below).
   // Domain stopwords keep standing-intent/daily-status words ("work", "updates",
   // "keep", "note") from opening the archive floodgates by themselves.
-  const terms = [...new Set((args.query.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) || []).filter((t) => !STOP.has(t)))].slice(0, 8);
+  const terms = L.significantTerms(args.query, 8);
   const phrases = [];
   for (let i = 0; i < terms.length - 1; i += 1) phrases.push(`${terms[i]} ${terms[i + 1]}`);
   for (let i = 0; i < terms.length - 2; i += 1) phrases.push(`${terms[i]} ${terms[i + 1]} ${terms[i + 2]}`);
@@ -517,7 +430,7 @@ async function main() {
   // when the parent is strong and the detail is genuinely unreachable. These sidecars
   // are globally budgeted/collapsed so they add dated specifics without flooding or
   // displacing the primary seed/gist/graph cluster.
-  const enumerative = /\b(all|each|every|list|enumerate|which|who\s+were|how\s+many|name\s+the)\b/i.test(args.query);
+  const enumerative = L.isEnumerativeQuery(args.query);
   const detailBudget = enumerative ? 5 : 4;
   const parentLimit = enumerative ? 5 : 4;
   const seedSet = new Set(seeds);
@@ -548,7 +461,7 @@ async function main() {
       for (const g of strongGists) {
         for (const r of detailStmt.all(g.signature)) {
           if (clusterSet.has(r.signature)) continue;
-          const hay = `${normalizeForMatch(r.fact)} ${String(r.first_seen || "").toLowerCase()}`;
+          const hay = `${L.normalizeForMatch(r.fact)} ${String(r.first_seen || "").toLowerCase()}`;
           const hits = terms.reduce((a, t) => a + (hay.includes(t) ? 1 : 0), 0);
           const ph = phraseHits(hay, phrases);
           // Tight relevance gate: require a phrase hit or multi-term evidence (unless
@@ -665,7 +578,7 @@ async function main() {
   let archiveTimeRows = [];
   {
     const asOfDate = args.asOf ? new Date(args.asOf) : new Date();
-    const range = parseDateRange(args.query, asOfDate);
+    const range = L.parseDateRange(args.query, asOfDate);
     if (range) {
       try {
         const rows = db.prepare(`
@@ -678,7 +591,7 @@ async function main() {
         `).all(range.lo, range.hi);
         const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows].flatMap((r) => collapseKeys(r.fact, enumerative)));
         const scored = rows.map((r) => {
-          const hay = normalizeForMatch(r.fact || "");
+          const hay = L.normalizeForMatch(r.fact || "");
           const hits = terms.reduce((acc, t) => acc + (hay.includes(t) ? 1 : 0), 0);
           return { ...r, hits };
         }).sort((a, b) => (b.hits - a.hits) || String(b.first_seen).localeCompare(String(a.first_seen)));
@@ -709,7 +622,7 @@ async function main() {
   let activeTimeRows = [];
   {
     const asOfDate2 = args.asOf ? new Date(args.asOf) : new Date();
-    const range2 = parseDateRange(args.query, asOfDate2);
+    const range2 = L.parseDateRange(args.query, asOfDate2);
     if (range2) {
       try {
         const rows = db.prepare(`
@@ -723,14 +636,13 @@ async function main() {
         // date-window pull is to surface the specific dated record even when a scope-mate (e.g.
         // an abstract "family items stay private" gist) is already present in another tier.
         const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows, ...archiveTimeRows].flatMap((r) => collapseKeys(r.fact, true)));
-        const temporalWords = new Set([...Object.keys(MONTHS), "happened", "event", "events", "incident", "incidents", "change", "changed", "changes", "update", "updates", "summary", "timeline", "record", "records"]);
         const topicTerms = terms.filter((t) =>
-          !temporalWords.has(t)
+          !L.isTemporalWord(t)
           && !/^\d+$/.test(t)
           && !/^\d{4}-\d{1,2}-\d{1,2}$/.test(t)
         );
         const scored = rows.map((r) => {
-          const hay = normalizeForMatch(r.fact || "");
+          const hay = L.normalizeForMatch(r.fact || "");
           const hits = topicTerms.reduce((acc, t) => acc + (hay.includes(t) ? 1 : 0), 0);
           return { ...r, hits };
         }).filter((r) => topicTerms.length === 0 || r.hits >= 1)
@@ -794,7 +706,7 @@ async function main() {
     return t && t > m ? t : m;
   }, 0);
   const nowRef = args.asOf ? new Date(args.asOf) : (latest ? new Date(latest) : new Date());
-  const dateRange = parseDateRange(args.query, nowRef);
+  const dateRange = L.parseDateRange(args.query, nowRef);
   const dateIntent = dateRange != null;
 
   // 2f) ANCHOR-DAY active recall (DATELESS episode reconstruction). Tiers 2d/2e reconstruct a dated
@@ -812,7 +724,7 @@ async function main() {
   // a latest-sighting, not the episode date). Term-gated + budgeted so it ADDS the episode's relevant
   // records without flooding; tagged via='anchor_day'. Engine-native so BOTH the live graph-recall
   // skill and any flat projection inherit it (not a bench-only file trick).
-  const specificsIntent = enumerative || /\b(exact|exactly|precise|verbatim|specific|list|which|how\s+many|enumerate|that\s+(session|meeting|day|call|week|conversation)|in\s+that\s+(session|meeting|call))\b/i.test(args.query || "");
+  const specificsIntent = enumerative || L.isSpecificsIntentQuery(args.query || "");
   const ANCHOR_COS_FLOOR = 0.30;
   let anchorDayRows = [];
   if (!dateIntent && terms.length) {
@@ -851,7 +763,7 @@ async function main() {
           `).all(...days);
           const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows, ...archiveTimeRows, ...activeTimeRows].flatMap((r) => collapseKeys(r.fact, true)));
           const scored = rows.map((r) => {
-            const hay = normalizeForMatch(r.fact || "");
+            const hay = L.normalizeForMatch(r.fact || "");
             const hits = terms.reduce((a, t) => a + (hay.includes(t) ? 1 : 0), 0);
             return { ...r, hits };
           }).filter((r) => r.hits >= 1)

@@ -4,6 +4,11 @@
 
 Most agent memory is a flat text file that grows unbounded and gets RAG'd. **dreamweave** is different: your agent *dreams*. A nightly pass **weaves a brain-faithful graph+vector memory** and consolidates it like sleep — a forgetting curve drops noise, duplicates **merge**, and survivors **weave** into one connected graph — across three tiers (instinct / recall / archive). The **recall** path then answers with semantic vector search **plus graph-neighbor expansion**.
 
+<p align="center">
+  <img src="docs/assets/memory-nebula.png" alt="Dreamweave semantic nebula visualizing 1,024 memories and their entity connections" width="100%">
+</p>
+<p align="center"><em>Your memory, alive: explore facts, entities, temporal structure, and activated connections in the 3D semantic nebula.</em></p>
+
 What makes it different from other "dream"/memory skills:
 
 - **Graph + vector, not flat RAG** — entities and facts with edges; recall returns *neighbors*, which is what actually helps synthesis. The **weave** is the signature operation.
@@ -229,10 +234,15 @@ agent-memory/
   package.json
   src/
     dream.js                # the consolidation engine (all subcommands)
-    recall.js               # vector + graph recall (read path)
+    recall.js               # vector + graph recall (read path) — temporal parsing/tokenization via langsvc
     embed.js                # local embeddings (transformers.js)
-    entities.js             # entity extraction for the weave
-    graphtext.js            # neighbor-naming text for embeddings
+    entities.js             # backward-compat shim (re-exports sig-utils + default langsvc)
+    sig-utils.js             # generic "type:slug" signature parsing (labelOf/typeOf/buildVocab only)
+    langsvc.js               # pluggable language-service loader/facade (no LLM, local, deterministic)
+    langsvc.English.js       # default (English) service: entities, normalize/slug, temporal parsing,
+                             #   tokenization/stopwords, query-shape detection, hard-specifics, age-tag, node prose
+    timeline.js              # age-day math (generic) + ageTag/relAge facade (labels resolved via langsvc)
+    graphtext.js            # neighbor-naming text for embeddings — facade over langsvc's renderNodeText
     schema.js               # fresh-db schema bootstrap
   viz/
     graph-store-visualization.html   # explorer template (empty data line)

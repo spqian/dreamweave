@@ -176,10 +176,39 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
 
    For each surface, the report OUTPUT the caller reads and the decision INPUT the caller must write:
 
-   - **entities** — type the recurring named subjects of each fact.
-     report: `{surface:"entities", facts:[{sig,fact}]}`
-     judge: for each fact list concrete named entities (people/orgs/teams/places/projects/systems/recurring topics); resolve a bare first name to its full name when another fact disambiguates; **skip** dates, numbers, generic nouns, one-off phrases. Type ∈ `person|org|team|place|project|system|topic`; `sig` = `"<type>:<kebab-name>"`; `forms` = lowercased surface strings (full name + long tokens, ≥3 chars).
-     decision: `[{sig, type, forms:[...]}]`
+   - **entities** — type the recurring named subjects of each fact, PLUS review the bounded set of
+     mechanically-created entity hubs the engine proposes.
+     The mechanical extractor (a local, deterministic, PROPOSING-only language service —
+     `src/langsvc.js`/`src/langsvc.English.js`, never an LLM) is **not authoritative**: every
+     hub it creates is `provisional` until you review it here, and it never auto-splits a
+     multi-token label ("First Last") into single-token forms — only the full phrase is a
+     default surface form, so a bad candidate can never become a magnet that falsely
+     co-mentions unrelated facts. Short forms/aliases only exist once YOU add them.
+     report: `{surface:"entities", report_id, basis_seq, facts:[{sig,fact}], hubs:[{sig,type,label,forms,degree,sample,status}]}`
+     `hubs[]` is bounded: every not-yet-reviewed (`status:"provisional"`) hub first (highest
+     mention `degree`/blast-radius first), plus a small rotating slow re-review window over
+     already-`approved` older hubs. `sample` is a few facts that mention the hub — use it
+     (not just the label) to judge whether the candidate is real.
+     judge (facts): for each fact list concrete named entities (people/orgs/teams/places/projects/systems/recurring topics); resolve a bare first name to its full name when another fact disambiguates; **skip** dates, numbers, generic nouns, one-off phrases. Type ∈ `person|org|team|place|project|system|topic`; `sig` = `"<type>:<kebab-name>"`; `forms` = lowercased surface strings (full name + long tokens, ≥3 chars).
+     judge (hubs): for each hub in `hubs[]`, decide one action — **conservatively**, from the
+     `sample` facts alone:
+       • `keep` — the hub is a real, correctly-typed entity as-is.
+       • `retype {type, new_sig, forms:[...]}` — same entity, wrong type/sig (e.g. mechanically
+         typed `person:` but it's really a `system:`/`topic:`); `forms` may add caller-approved
+         aliases for the NEW sig (still explicit, never auto-derived).
+       • `reject` — this is not a real entity at all (a Mapping-Dataflow-style misparse); its
+         mention edges and any fact-pair sibling edge they may have corroborated are severed,
+         and the sig is never mechanically recreated.
+       • `remove_forms {forms:[...]}` — the hub is real but carries a bad alias (never the
+         hub's own base/full-phrase form — that requires `retype`/`reject` instead); only
+         facts that matched solely via the removed alias lose their mention edge.
+     decision file: `{report_id, decisions:[{sig, type, forms:[...]}], hub_reviews:[{sig, action, ...}]}`
+     (the legacy bare array `[{sig,type,forms}]` — entity **create/augment only**, no hub
+     review — is still accepted unchanged). `apply-entities` is atomic on the hub-review half:
+     any stale `report_id` or invalid `hub_reviews` entry (unknown sig, bad action/type/forms)
+     rejects the WHOLE apply — `complete:false`, structured `rejected`, zero mutation, cursor
+     unmoved. The engine validates only report membership/action/type/forms — it never
+     re-judges your decision.
 
    - **aliases** — merge entity hubs that name the SAME entity.
      report: `{surface:"aliases", hubs:[{sig,label}]}`
