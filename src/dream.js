@@ -3586,6 +3586,7 @@ function exportViz(db) {
   for (const n of nodes) { const p = proj.get(n.id); if (p) { n.px = p[0]; n.py = p[1]; n.pz = p[2]; } }
   const ids = new Set(nodes.map((n) => n.id));
   const links = db.prepare("SELECT src AS source, dst AS target, rel, weight FROM edges ORDER BY weight DESC").all().filter((l) => ids.has(l.source) && ids.has(l.target));
+  attachChronicles(db, nodes, ids, links);
   const html = fs.readFileSync(VIZ_TEMPLATE, "utf8").split(/\r?\n/);
   const idx = html.findIndex((l) => l.startsWith("const data = "));
   if (idx < 0) throw new Error("viz template data line not found");
@@ -3601,6 +3602,50 @@ function exportViz(db) {
   return { nodes: nodes.length, links: links.length, projected: proj.size, output: VIZ_OUT };
 }
 
+// Attach chronicle period metadata (resolution, period window, evidence count) onto the
+// exported chronicle nodes and emit the two link families the viz timeline mode needs but
+// that don't live in the `edges` table: chronicle->evidence rollup, and cross-resolution
+// containment (day->week->month->quarter->year, derived from period windows). The
+// next_period spine already rides `edges`, so it is emitted with the ordinary links.
+function attachChronicles(db, nodes, ids, links) {
+  let chrons;
+  try {
+    chrons = db.prepare(`
+      SELECT c.node_sig id, c.resolution res, c.period_start ps, c.period_end pe,
+             c.covered_event_count evc, c.version ver
+      FROM chronicles c JOIN nodes n ON n.signature=c.node_sig
+      WHERE n.kind='chronicle' AND (n.notes IS NULL OR n.notes NOT LIKE '%archive%')`).all();
+  } catch { return; } // pre-chronicle store
+  if (!chrons.length) return;
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const entryStmt = db.prepare("SELECT ordinal, slot_label, summary, change_kind, aspect FROM chronicle_entries WHERE chronicle_sig=? ORDER BY ordinal");
+  for (const c of chrons) {
+    const n = byId.get(c.id); if (!n) continue;
+    n.res = c.res; n.ps = c.ps; n.pe = c.pe; n.evc = c.evc; n.ver = c.ver;
+    n.entries = entryStmt.all(c.id).map((e) => ({ o: e.ordinal, s: e.slot_label, sum: e.summary, ck: e.change_kind, asp: e.aspect }));
+  }
+  // chronicle -> evidence fact links (one per chronicle/evidence pair)
+  try {
+    const ev = db.prepare("SELECT DISTINCT chronicle_sig source, evidence_sig target FROM chronicle_evidence").all();
+    for (const l of ev) if (ids.has(l.source) && ids.has(l.target)) links.push({ source: l.source, target: l.target, rel: "chronicle_evidence", weight: 0.5 });
+  } catch { /* no evidence table */ }
+  // cross-resolution containment: each chronicle links up to the nearest coarser chronicle
+  // whose period window contains its midpoint.
+  const tierOf = { day: 0, week: 1, month: 2, quarter: 3, year: 4 };
+  const dayNum = (iso) => { const d = new Date(iso + "T00:00:00Z"); return Math.floor(d.getTime() / 86400000); };
+  const act = chrons.filter((c) => c.ps);
+  act.forEach((c) => { c._a = dayNum(c.ps); c._b = dayNum(c.pe || c.ps); c._m = (c._a + c._b) / 2; c._t = tierOf[c.res] || 0; });
+  const byTier = {}; act.forEach((c) => { (byTier[c._t] || (byTier[c._t] = [])).push(c); });
+  for (const c of act) {
+    if (c._t >= 4) continue;
+    for (let t2 = c._t + 1; t2 <= 4; t2++) {
+      const arr = byTier[t2]; if (!arr) continue;
+      const k = arr.find((x) => x._a <= c._m && c._m <= x._b);
+      if (k) { links.push({ source: c.id, target: k.id, rel: "rollup", weight: 0.5 }); break; }
+    }
+  }
+}
+
 // Project embeddings to 3D with deterministic orthogonal random axes + per-axis
 // whitening. The old PCA materialized an N×N Gram matrix and performed hundreds
 // of dense passes over it, making visualization O(N²) in both memory and time.
@@ -3610,6 +3655,10 @@ function projectEmbeddings3D(db) {
   let rows;
   try { rows = db.prepare("SELECT n.signature s, v.embedding e FROM vec_nodes v JOIN nodes n ON n.id=v.rowid").all(); }
   catch { return out; }
+  // co-project chronicle embeddings into the SAME whitened space so the timeline's
+  // semantic-mode fallback places chronicles alongside their evidence.
+  try { rows = rows.concat(db.prepare("SELECT n.signature s, v.embedding e FROM vec_chronicles v JOIN nodes n ON n.id=v.rowid").all()); }
+  catch { /* no chronicle embeddings */ }
   const N = rows.length; if (N < 4) return out;
   const D = cfg.EMBED_DIM;
   const axes = [];

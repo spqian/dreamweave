@@ -121,6 +121,7 @@ html[data-theme="dark"] #graph { background:
         <option value="semantic">semantic</option>
         <option value="episodic">episodic</option>
         <option value="entity">entity (hub)</option>
+        <option value="chronicle">chronicle (period)</option>
       </select>
     </div>
     <div>
@@ -134,6 +135,7 @@ html[data-theme="dark"] #graph { background:
         <span><i id="lg-semantic"></i>semantic</span>
         <span><i id="lg-episodic"></i>episodic</span>
         <span><i id="lg-entity"></i>entity</span>
+        <span><i style="background:#d94f74"></i>chronicle</span>
       </div>
     </div>
     <div>
@@ -194,10 +196,12 @@ const data = {"nodes":[],"links":[]};
   const BG=hexToRgb(css('--cp-scene2')||'#02020a');
   const _isDark=document.documentElement.getAttribute('data-theme')==='dark';
   const PAL={ salient:hexToRgb(css('--cp-warning')), semantic:hexToRgb(css('--cp-accent')), episodic:hexToRgb(css('--cp-link')), entity:(_isDark?[240,242,248]:[20,20,20]) };
+  const RES_COLOR={ day:hexToRgb('#f4a6b8'), week:hexToRgb('#ea7a95'), month:hexToRgb('#d94f74'), quarter:hexToRgb('#b52d55'), year:hexToRgb('#8a1638') };
+  const RES_SIZE={ day:3.4, week:6, month:9.5, quarter:13, year:17 };
   ['salient','semantic','episodic','entity'].forEach(k=>{ const el=document.getElementById('lg-'+k); if(el) el.style.background='rgb('+PAL[k].join(',')+')'; });
   const mix=(c,t)=>'rgb('+c.map((v,i)=>Math.round(v+(BG[i]-v)*t)).join(',')+')';
   const rgbStr=c=>'rgb('+c.join(',')+')';
-  const baseColor=n=> n.kind==='entity'?PAL.entity:(PAL[n.cls]||PAL.semantic);
+  const baseColor=n=> n.kind==='chronicle'?(RES_COLOR[n.res]||PAL.salient):(n.kind==='entity'?PAL.entity:(PAL[n.cls]||PAL.semantic));
 
   const elGraph=document.getElementById('graph'), elLabels=document.getElementById('labels'), elErr=document.getElementById('err');
   const search=document.getElementById('search'), hitCountEl=document.getElementById('hitCount');
@@ -206,7 +210,8 @@ const data = {"nodes":[],"links":[]};
 
   // ---- data ----
   const nodes=data.nodes.map((d,i)=>({ id:d.id, kind:d.kind||'fact', cls:((d.salience_score==null?0:d.salience_score)>=0.5?'salient':d.class), salience_score:(d.salience_score==null?0:d.salience_score), strength:(d.strength==null?0.5:d.strength),
-    reactivations:d.reactivations||0, notes:d.notes||'', fact:d.fact||'', memory_id:d.memory_id||'', px:(d.px==null?null:d.px), py:(d.py==null?null:d.py), pz:(d.pz==null?null:d.pz), idx:i }));
+    reactivations:d.reactivations||0, notes:d.notes||'', fact:d.fact||'', memory_id:d.memory_id||'', px:(d.px==null?null:d.px), py:(d.py==null?null:d.py), pz:(d.pz==null?null:d.pz), idx:i,
+    res:d.res, ps:d.ps, pe:d.pe, evc:d.evc, ver:d.ver, entries:d.entries }));
   const byId=new Map(nodes.map(n=>[n.id,n]));
   const rawLinks=data.links.map(l=>({source:l.source,target:l.target,rel:l.rel,weight:(l.weight==null?0.5:l.weight)})).filter(l=>byId.has(l.source)&&byId.has(l.target));
   const adj=nodes.map(()=>[]); const edgesOf=nodes.map(()=>[]);
@@ -223,7 +228,7 @@ const data = {"nodes":[],"links":[]};
   // belief evolved or was overridden. Drawing both at once makes a hairball, and time-reference
   // hubs (e.g. ref:2026, which every fact naming the year links to) become degenerate mention
   // hubs that dominate the meaning-nebula. The toggle lets you view one axis at a time.
-  const TEMPORAL_RELS=new Set(['sequence','supersedes']);
+  const TEMPORAL_RELS=new Set(['sequence','supersedes','next_period','chronicle_evidence','rollup']);
   const isTemporalRel=r=>TEMPORAL_RELS.has(r);
   const isTimeRefHub=n=>n.kind==='entity'&&/^ref:(?:19|20)\d{2}(?:[-:]\d{1,2}){0,2}$/.test(n.id);
   let linkMode='semantic', edgeMode=rawLinks.length>1000?'hover':'always';
@@ -261,6 +266,7 @@ const data = {"nodes":[],"links":[]};
   function activeEdgeNode(){ return edgeMode==='hover'?hoverId:focusId; }
   function linkIncidentFocus(l){ const id=activeEdgeNode(); if(id==null) return false; const [s,t]=endIds(l); return s===id||t===id; }
   function linkWidthOf(l){ let w=0.6+l.weight*1.2;
+    if(linkMode==='temporal'){ if(l.rel==='next_period') return 2.6; if(l.rel==='chronicle_evidence') return 0.4; if(l.rel==='rollup') return 1.1; }
     if(edgeMode==='hover'&&hoverId!=null&&linkIncidentFocus(l)) return w*0.5+3.2;
     if(focusPulse>0 && linkIncidentFocus(l)) w = w*0.5 + 0.4 + 3.4*focusPulse; return w; }
   function recomputeHops(){
@@ -277,16 +283,18 @@ const data = {"nodes":[],"links":[]};
     if(q && seeds.length){ flyTo(byId.get(nodes[seeds[0]].id)); }
   }
   function passesFilter(n){ const cf=classFilter.value;
-    if(cf!=='all'){ if(cf==='entity'){ if(n.kind!=='entity')return false; } else if(n.cls!==cf||n.kind!=='fact')return false; }
+    if(cf!=='all'){ if(cf==='entity'){ if(n.kind!=='entity')return false; } else if(cf==='chronicle'){ if(n.kind!=='chronicle')return false; } else if(n.cls!==cf||n.kind!=='fact')return false; }
     if(n.kind==='fact' && n.strength<parseFloat(strength.value)) return false; return true; }
   function dimT(n){ if(hop===null)return 0; const h=hop[n.idx]; if(h===0)return 0; if(h===1)return 0.42; if(h===2)return 0.68; return 0.88; }
   function nodeVis(n){ if(!passesFilter(n)) return false;
-    if(linkMode==='semantic' && refHub[n.idx]) return false;
+    if(linkMode==='semantic'){ if(refHub[n.idx]||n.kind==='chronicle') return false; return true; }
+    if(refHub[n.idx]) return false;
+    if(!n._thas) return false;
     return true; }
   const avgCol=(a,b)=>{ const ca=baseColor(a),cb=baseColor(b); return [(ca[0]+cb[0])>>1,(ca[1]+cb[1])>>1,(ca[2]+cb[2])>>1]; };
   // In temporal mode a node with no sequence/supersedes edge is kept as faint background
   // context (the nebula shape stays legible) while the lineages render bright on top.
-  function tmpBg(n){ return linkMode==='temporal' && !nodeHasTemporal[n.idx] && !(hop!==null&&hop[n.idx]===0); }
+  function tmpBg(n){ return false; }
   function nodeColor(n){ if(!passesFilter(n)) return mix(baseColor(n),0.95);
     if(tmpBg(n)) return mix(baseColor(n),0.86); return mix(baseColor(n),dimT(n)); }
   // Node size: facts scale with strength; ENTITY HUBS are bigger — the hub set AVERAGES ~LAYOUT.hub×
@@ -303,11 +311,13 @@ const data = {"nodes":[],"links":[]};
   function nodeSize(n){ let base;
     if(n.kind==='entity'){ const H=(typeof LAYOUT!=='undefined'?LAYOUT.hub:5); base=_avgFact*H*((_entRaw.get(n.idx)||1)/(_mr||1));
       base=Math.max(_avgFact*Math.max(1.1,H*0.42), Math.min(base, _avgFact*H*2.7)); }
+    else if(n.kind==='chronicle'){ base=(RES_SIZE[n.res]||4)*(hop!==null&&hop[n.idx]===0?1.35:1); return base; }
     else base=0.9+n.strength*2.8;
     let s=base*(hop!==null&&hop[n.idx]===0?1.8:1); if(tmpBg(n)) s*=0.5; return s; }
   function signalOf(l,a,b){ return l.weight/Math.sqrt(Math.max(1,degree[a.idx]*degree[b.idx])); }
   function linkVis(l){ if(!linkActive(l)) return false; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t);
     if(!a||!b||!nodeVis(a)||!nodeVis(b)) return false;
+    if(linkMode==='temporal'){ if(l.rel==='next_period'||l.rel==='chronicle_evidence'||l.rel==='rollup') return true; }
     if(edgeMode==='always') return true;
     const id=activeEdgeNode(); return id!=null&&(s===id||t===id);
   }
@@ -316,7 +326,9 @@ const data = {"nodes":[],"links":[]};
     if(!a||!b) return mix(PAL.entity,0.7); if(!nodeVis(a)||!nodeVis(b)) return 'rgba(0,0,0,0)';
     if(edgeMode==='hover'&&hoverId!=null&&linkIncidentFocus(l)) return 'rgba('+GOLD[0]+','+GOLD[1]+','+GOLD[2]+',0.92)';
     if(focusPulse>0 && linkIncidentFocus(l)) return 'rgba('+GOLD[0]+','+GOLD[1]+','+GOLD[2]+','+(0.5+0.45*focusPulse).toFixed(3)+')';
-    if(linkMode==='temporal'){ const base=l.rel==='supersedes'?PAL.salient:PAL.episodic;
+    if(linkMode==='temporal'){ if(l.rel==='chronicle_evidence') return mix(PAL.entity,0.55);
+      if(l.rel==='rollup') return mix(PAL.semantic,0.35);
+      const base=l.rel==='next_period'?PAL.semantic:(l.rel==='supersedes'?PAL.salient:PAL.episodic);
       if(hop!==null){ const hit=hop[a.idx]===0||hop[b.idx]===0; return mix(base, hit?0.0:0.4); }
       return mix(base,0.12); }
     const col=avgCol(a,b);
@@ -365,7 +377,8 @@ const data = {"nodes":[],"links":[]};
         let tx=n.ax,ty=n.ay,tz=n.az;
         if(fc && n.id!==focusId){ const m=byId.get(n.id), h=hop?hop[m.idx]:-1;
           if(h===1||h===2){ const k=h===1?1.4:1.95; tx=fc.ax+(n.ax-fc.ax)*k; ty=fc.ay+(n.ay-fc.ay)*k; tz=fc.az+(n.az-fc.az)*k; } }
-        n.vx+=(tx-n.x)*strength*alpha; n.vy+=(ty-n.y)*strength*alpha; n.vz+=(tz-n.z)*strength*alpha; } }
+        const _pm=(byId.get(n.id)||{})._pull||1;
+        n.vx+=(tx-n.x)*strength*alpha*_pm; n.vy+=(ty-n.y)*strength*alpha*_pm; n.vz+=(tz-n.z)*strength*alpha*_pm; } }
     f.initialize=function(arr){ ns=arr; }; return f; }
   // ---- HUB-ANCHORED LAYERED LAYOUT ------------------------------------------
   // Instead of positioning every node purely by its embedding, we lay the graph out in
@@ -416,6 +429,58 @@ const data = {"nodes":[],"links":[]};
   }
   try { computeHubLayout(); } catch(e){ console.error('hub layout failed, falling back to semantic projection', e); }
 
+  // ---- TIMELINE anchors (temporal-mode chronicle backbone + evidence bloom) ----
+  const RES_TIER={ day:0, week:1, month:2, quarter:3, year:4 };
+  (function computeTimeline(){
+    const ep=d=>{ const t=Date.parse(d); return isNaN(t)?null:t/8.64e7; };
+    let tmin=Infinity,tmax=-Infinity; const cT={};
+    for(const n of nodes){ if(n.kind==='chronicle'&&n.ps){ const a=ep(n.ps), b=ep(n.pe||n.ps); if(a!=null){ const m=(a+(b!=null?b:a))/2; cT[n.id]=m; if(m<tmin)tmin=m; if(m>tmax)tmax=m; } } }
+    const XW=760, GAP=150, span=Math.max(1,tmax-tmin);
+    const tx=m=>((m-tmin)/span)*2*XW-XW;
+    for(const n of nodes){ if(n.kind==='chronicle'&&cT[n.id]!=null){ const tier=RES_TIER[n.res]||0;
+      n._tx=tx(cT[n.id]); n._ty=(tier-1.3)*GAP; n._tz=0; n._thas=1; n._pull=4.2; } else if(n.kind==='chronicle'){ n._thas=0; } }
+    // evidence: assign each fact to the FIRST chronicle it rolls up to, hang it below in a wisp
+    const owner={};
+    for(const l of rawLinks){ if(l.rel!=='chronicle_evidence') continue;
+      const a=byId.get(l.source), b=byId.get(l.target);
+      const c=(a&&a.kind==='chronicle')?a:((b&&b.kind==='chronicle')?b:null);
+      const f=(a&&a.kind==='chronicle')?b:a; if(!c||!f||c._tx==null||f.kind!=='fact'||owner[f.id]!=null) continue;
+      owner[f.id]=c.id; (c._ecount=(c._ecount||0)); const i=c._ecount++;
+      f._tx=c._tx+((i%2)?1:-1)*(6+4*i); f._ty=c._ty-40-20*i; f._tz=0; f._thas=1; f._pull=2.6; }
+    for(const n of nodes){ if(n.kind==='fact' && n._thas==null) n._thas=0; if(n.kind==='entity') n._thas=0; }
+  })();
+
+  // ---- TIMELINE <-> NEBULA transition ----
+  let _tlRAF=0;
+  function applyTimeline(on){
+    if(!Graph) return;
+    const gd=Graph.graphData().nodes;
+    for(const o of gd){ const n=byId.get(o.id); if(!n) continue;
+      if(on){
+        if(n.kind!=='chronicle' && n._thas){ o.ax=n._tx; o.ay=n._ty; o.az=0; o.fx=undefined; o.fy=undefined; o.fz=0; }
+      } else {
+        o.fx=undefined; o.fy=undefined; o.fz=undefined;
+        if(n._px!=null){ o.ax=n._px*LAYOUT.xs; o.ay=n._py*LAYOUT.ys; o.az=n._pz*LAYOUT.zs; }
+      } }
+    try { if(Graph.d3Force('link')) Graph.d3Force('link').strength(on?0.02:0.22); } catch(_){}
+    try { if(Graph.d3Force('charge')) Graph.d3Force('charge').strength(on?-7:-LAYOUT.charge); } catch(_){}
+    const ctrl=Graph.controls(); if(ctrl){ ctrl.autoRotate=!on; ctrl.enableRotate=!on; }
+    cancelAnimationFrame(_tlRAF);
+    if(on){
+      const chr=[]; for(const o of gd){ const n=byId.get(o.id); if(n&&n.kind==='chronicle'&&n._thas){ chr.push({o:o, tx:n._tx, ty:n._ty, sx:(o.x==null?n._tx:o.x), sy:(o.y==null?n._ty:o.y), sz:(o.z==null?0:o.z)}); } }
+      const T=950, t0=performance.now();
+      (function step(){ if(linkMode!=='temporal') return; const k=Math.min(1,(performance.now()-t0)/T); const e=k<0.5?2*k*k:1-Math.pow(-2*k+2,2)/2;
+        for(const c of chr){ const x=c.sx+(c.tx-c.sx)*e, y=c.sy+(c.ty-c.sy)*e, z=c.sz+(0-c.sz)*e; c.o.fx=x; c.o.fy=y; c.o.fz=z; c.o.x=x; c.o.y=y; c.o.z=z; }
+        if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
+        if(k<1){ _tlRAF=requestAnimationFrame(step); } else { for(const c of chr){ c.o.fx=c.tx; c.o.fy=c.ty; c.o.fz=0; }
+          try{ Graph.cameraPosition({x:0,y:0,z:900},{x:0,y:0,z:0},0); setTimeout(function(){ try{ Graph.zoomToFit(900,70);}catch(_){}},90); }catch(_){} }
+      })();
+      if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
+    } else {
+      if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
+      setTimeout(function(){ try{ Graph.zoomToFit(800,50); }catch(_){}}, 700);
+    }
+  }
   // ---- live layout state (tunable via the ⚙ Layout panel) ----
   // Anchors are the whitened semantic projection (n.px/py/pz). We scale each axis independently
   // so the cloud can be stretched along its dominant semantic axes. Defaults give the
@@ -471,7 +536,7 @@ const data = {"nodes":[],"links":[]};
     const ce=Math.cos(el); cam.position.x=t.x+r*ce*Math.sin(az); cam.position.y=t.y+r*Math.sin(el); cam.position.z=t.z+r*ce*Math.cos(az);
     cam.lookAt(t); const c=Graph.controls(); c&&c.update&&c.update(); lastInteract=Date.now(); pauseRotate(); }
   function pauseRotate(){ const c=Graph&&Graph.controls(); if(c) c.autoRotate=false; }
-  function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
+  function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on && linkMode!=='temporal'; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
   // OrbitControls dollies toward controls.target, which makes wheel zoom feel pinned to the
   // previously focused node. Scale both camera and target around the world-space point under
   // the pointer instead: that point remains under the cursor while zoom also becomes a natural
@@ -539,12 +604,14 @@ const data = {"nodes":[],"links":[]};
     document.getElementById('modeSem').classList.toggle('on',m==='semantic');
     document.getElementById('modeTmp').classList.toggle('on',m==='temporal');
     document.getElementById('hint').textContent = m==='temporal'
-      ? 'Temporal axis — sequence (lineage) + supersedes (override) only. Non-temporal nodes shown dim for context.'
+      ? 'Timeline — chronicles form the time axis (day→year); the facts each period summarizes group around it. Click a chronicle to reveal its evidence.'
       : 'Semantic axis — meaning links; year-reference hubs hidden.';
     focusId=null; hideDetail(); search.value=''; hitCountEl.textContent='';
-    recomputeHops(); refreshStats(); if(Graph){ Graph.zoomToFit(700,40); if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); } }
+    applyTimeline(m==='temporal');
+    recomputeHops(); refreshStats(); }
   document.getElementById('modeSem').onclick=()=>setLinkMode('semantic');
   document.getElementById('modeTmp').onclick=()=>setLinkMode('temporal');
+  { const _mp=new URLSearchParams(location.search).get('mode'); if(_mp==='temporal') setTimeout(function(){ setLinkMode('temporal'); },900); }
   function setEdgeMode(mode){ edgeMode=mode;
     document.getElementById('edgeAlways').classList.toggle('on',mode==='always');
     document.getElementById('edgeClick').classList.toggle('on',mode==='click');
@@ -581,7 +648,7 @@ const data = {"nodes":[],"links":[]};
         focusPulse=eased; if(Graph.linkWidth) Graph.linkWidth(linkWidthOf).linkColor(linkColorOf);
         if(p>=1) focusPulseStart=0; }
       // resume auto-rotate after 4s idle
-      if(autoRotate){ const c=Graph.controls(); if(c && !c.autoRotate && Date.now()-lastInteract>4000) c.autoRotate=true; }
+      if(autoRotate && linkMode!=='temporal'){ const c=Graph.controls(); if(c && !c.autoRotate && Date.now()-lastInteract>4000) c.autoRotate=true; }
       // AUTO LABELS: score nodes that are visible, in front of camera, and on-screen; label the most important.
       const cam=Graph.camera(); const gd=Graph.graphData().nodes;
       const Wp=elGraph.clientWidth||900, Hp=elGraph.clientHeight||760;
