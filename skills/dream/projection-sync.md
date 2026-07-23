@@ -30,8 +30,8 @@ consolidation is routed through `apply-*` (see `SKILL.md` stage 5).
   `P`. Excludes entity hubs, `detail`, and `archive`. Each record:
   ```json
   { "memory_id": "<harness id or ''>", "signature": "fact:<slug>",
-    "category": "decision|fact|context|preference", "tier": "gist|episodic",
-    "strength": 0.87, "first_seen": "2026-01-11T...", "age": "months ago|null",
+    "category": "decision|fact|context|preference", "tier": "gist|episodic|chronicle",
+    "strength": 0.87, "source_day": "2026-01-11|null", "age": "months ago|null",
     "fact": "<raw text>", "display": "<inject-ready line; episodic is age-prefixed>" }
   ```
   - `P[0]` is the engine **anchor record** (channel E) — always present; treat like any other record.
@@ -87,22 +87,22 @@ as a **consolidation-born dream memory**, not a fresh session note:
 
 | harness field | value from the record |
 |---|---|
-| text/content | `r.display` (episodic already age-prefixed; gist is timeless) |
+| text/content | `r.display` (episodic already age-prefixed; gist/chronicle are timeless) |
 | `category`    | `r.category` |
 | `source`      | **`"dream"`** (or `"consolidation"`) — **never** `"session"` |
-| `createdAt`   | `r.first_seen` — **preserve it; do not reset to now** |
-| tier hint     | `r.tier` (`gist`/`episodic`) if the host stores a tier/tag |
+| `createdAt`   | episodic: `r.source_day`; gist/chronicle: **omit/null** |
+| tier hint     | `r.tier` (`gist`/`episodic`/`chronicle`) if the host stores a tier/tag |
 
-> **`createdAt` is load-bearing and MUST round-trip.** Every recreate (ADD and UPDATE) passes
-> `createdAt = r.first_seen`, which is now the memory's real event date. If the host `m_remember`
+> **Episodic `createdAt` is provenance and MUST round-trip. Gists and chronicles are timeless.** Every episodic
+> recreate passes `createdAt = r.source_day`; every gist/chronicle recreate omits it. If the host `m_remember`
 > silently stamps its own "now" instead of honoring this argument, then every diff-driven recreate
 > launders the event date away — the exact failure that collapsed a whole store onto ingest/rebuild
 > dates. **Verify once** that the host honors it: after a projection that recreated ≥1 memory,
-> re-read that memory and confirm its `createdAt` equals the `first_seen` you sent (not ~now). If it
+> re-read that episodic memory and confirm its `createdAt` equals the `source_day` you sent (not ~now). If it
 > doesn't, that's a **host bug** — stop relying on `createdAt` as the event-date source and treat the
 > engine's `repair-dates` (in-text dates) as the source of truth until the host is fixed.
 > If the host `m_remember` cannot set `source`/`createdAt`, project anyway but record the limitation — the
-> db-side provenance (tier, vagueness, first_seen) still lives in the engine; the harness copy is only a
+> db-side provenance (tier and episodic `source_day`) still lives in the engine; the harness copy is only a
 > projection. The **must-have** is that survivors are projected and `record-projection` runs.
 
 ## Teach the db the assigned ids
@@ -140,7 +140,8 @@ projPairs = []
 
 # 1. ADD new survivors
 for r in P where r.memory_id == "":
-    id = m_remember(r.display, category=r.category, source="dream", createdAt=r.first_seen)
+    id = m_remember(r.display, category=r.category, source="dream",
+                    createdAt=(r.source_day if r.tier == "episodic" else null))
     projPairs += { signature: r.signature, memory_id: id }
 
 # 2. FORGET demoted / removed
@@ -150,7 +151,8 @@ for h in H where h.id not in exportedIds:
 # 3. UPDATE changed  (compare the FACT, not the age-prefixed display -> no churn on age rollover)
 for r in P where r.memory_id != "" and r.fact != stripAge(text_of(H, r.memory_id)):
     m_forget(r.memory_id)
-    id = m_remember(r.display, category=r.category, source="dream", createdAt=r.first_seen)
+    id = m_remember(r.display, category=r.category, source="dream",
+                    createdAt=(r.source_day if r.tier == "episodic" else null))
     projPairs += { signature: r.signature, memory_id: id }
 
 # teach the db

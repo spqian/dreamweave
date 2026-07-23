@@ -34,6 +34,7 @@ const { buildNodeText } = require("./graphtext");
 const ent = require("./entities");
 const langsvc = require("./langsvc");
 const { ensureSchema } = require("./schema");
+const { renderNodeEnvelope } = require("./memory-render");
 const { ageDays, ageTag, earliestTextDate } = require("./timeline");
 const cfg = require("../config");
 const tuning = require("./tuning");
@@ -168,6 +169,21 @@ function parseFlags(argv) {
 const nextId = (db) => db.prepare("SELECT COALESCE(MAX(id),0)+1 m FROM nodes").get().m;
 const getMeta = (db, k) => (db.prepare("SELECT value FROM meta WHERE key=?").get(k) || {}).value;
 const setMeta = (db, k, v) => db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)").run(k, v);
+function preserveEvidenceTransition(db, src, rel, dst, firstSeen, lastReinforced) {
+  if (!src || !dst || src === dst || !["sequence", "supersedes"].includes(rel)) return;
+  db.prepare(`
+    INSERT INTO evidence_transitions(src_sig,rel,dst_sig,first_seen,last_reinforced)
+    VALUES (?,?,?,?,?)
+    ON CONFLICT(src_sig,rel,dst_sig) DO UPDATE SET
+      first_seen=COALESCE(evidence_transitions.first_seen,excluded.first_seen),
+      last_reinforced=CASE
+        WHEN evidence_transitions.last_reinforced IS NULL THEN excluded.last_reinforced
+        WHEN excluded.last_reinforced IS NULL THEN evidence_transitions.last_reinforced
+        WHEN excluded.last_reinforced > evidence_transitions.last_reinforced THEN excluded.last_reinforced
+        ELSE evidence_transitions.last_reinforced
+      END
+  `).run(src, rel, dst, firstSeen || null, lastReinforced || null);
+}
 const getMetaInt = (db, k) => {
   const n = Number(getMeta(db, k));
   return Number.isSafeInteger(n) && n >= 0 ? n : 0;
@@ -286,6 +302,7 @@ function repairGraph(db) {
       droppedFactEdges += db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(s, s).changes;
       continue;
     }
+
     // A dangling ENTITY endpoint is a legitimate hub the weave referenced; resurrect it.
     const id = nextId(db);
     db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text)
@@ -293,6 +310,38 @@ function repairGraph(db) {
     restored += 1;
   }
   return restored;
+}
+
+function removeDependentChronicles(db, evidenceSig) {
+  const queue = [evidenceSig];
+  const seen = new Set();
+  const ordered = [];
+  while (queue.length) {
+    const sig = queue.shift();
+    for (const row of db.prepare("SELECT DISTINCT chronicle_sig FROM chronicle_evidence WHERE evidence_sig=?").all(sig)) {
+      if (seen.has(row.chronicle_sig)) continue;
+      seen.add(row.chronicle_sig);
+      ordered.push(row.chronicle_sig);
+      queue.push(row.chronicle_sig);
+    }
+  }
+  for (const sig of ordered.reverse()) {
+    const node = db.prepare("SELECT id FROM nodes WHERE signature=? AND kind='chronicle'").get(sig);
+    db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(sig, sig);
+    db.prepare("DELETE FROM chronicle_entry_entities WHERE chronicle_sig=?").run(sig);
+    db.prepare("DELETE FROM chronicle_evidence WHERE chronicle_sig=?").run(sig);
+    db.prepare("DELETE FROM chronicle_entries WHERE chronicle_sig=?").run(sig);
+    db.prepare("DELETE FROM chronicles WHERE node_sig=?").run(sig);
+    if (node) {
+      const rowid = BigInt(node.id);
+      db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(rowid);
+      db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(rowid);
+      db.prepare("DELETE FROM vec_chronicles WHERE rowid=?").run(rowid);
+      db.prepare("DELETE FROM vec_chronicles_archive WHERE rowid=?").run(rowid);
+      db.prepare("DELETE FROM nodes WHERE id=?").run(node.id);
+    }
+  }
+  return ordered.length;
 }
 
 const degreeMap = (db) => {
@@ -337,16 +386,16 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   // `ex` row is mutated on each write so a later duplicate memory_id sees prior tx state,
   // preserving the old transaction-visibility semantics.
   const exByMem = new Map();
-  for (const r of db.prepare("SELECT id, memory_id, fact, salience, notes, first_seen FROM nodes WHERE memory_id<>'' AND memory_id<>'live' ORDER BY id").all()) {
+  for (const r of db.prepare("SELECT id, memory_id, fact, salience, notes, first_seen, source_day FROM nodes WHERE memory_id<>'' AND memory_id<>'live' ORDER BY id").all()) {
     if (!exByMem.has(r.memory_id)) exByMem.set(r.memory_id, r);
   }
   const delVec = db.prepare("DELETE FROM vec_nodes WHERE rowid=?");
   const updChanged = db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END, dirty_seq=? WHERE id=?");
   const updRevive = db.prepare("UPDATE nodes SET salience=?, notes=NULL, dirty_seq=? WHERE id=?");
   const updSal = db.prepare("UPDATE nodes SET salience=? WHERE id=?");
-  const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=?, dirty_seq=? WHERE id=?");
-  const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
-        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)`);
+  const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=?, source_day=?, dirty_seq=? WHERE id=?");
+  const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,source_day,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
+        VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)`);
   const res = { harness_count: mems.length, created: 0, refreshed: 0, backfilled: 0, pruned: 0 };
   const harnessIds = new Set(mems.map((m) => m.id || m.memory_id).filter(Boolean));
   let ingestSeq = 0;
@@ -385,6 +434,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       // actually happened — falling back to the ingest clock only when it's absent/unparseable.
       const created = m.createdAt || m.created_at || m.first_seen;
       const fs = (created && !Number.isNaN(Date.parse(created))) ? new Date(created).toISOString() : now;
+      const sourceDay = fs.slice(0, 10);
       const ex = exByMem.get(mid);
       if (ex) {
         // Opt-in one-time repair (--backfill-dates): existing nodes stamped with an
@@ -393,8 +443,9 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
         // a later ingest date, and this direction also protects merged survivors whose
         // first_seen is the (earlier) min of their members from being pushed forward.
         if (backfillDates && created && !Number.isNaN(Date.parse(created)) && ex.first_seen && Date.parse(fs) < Date.parse(ex.first_seen)) {
-          updFirstSeen.run(fs, changedSeq(), ex.id);
+          updFirstSeen.run(fs, sourceDay, changedSeq(), ex.id);
           ex.first_seen = fs;
+          ex.source_day = sourceDay;
           res.backfilled += 1;
         }
         const newFact = fact || ex.fact;
@@ -427,7 +478,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       const sig = uniqueSig(db, `fact:${deriveSlug(fact)}`);
       const id = nextId(db);
       const seq = changedSeq();
-      insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], fs, now, now, "harness-ingest", fact, "", seq, seq);
+      insNode.run(id, sig, mid, "fact", cls, category, INIT[cls], fs, sourceDay, now, now, "harness-ingest", fact, "", seq, seq);
       exByMem.set(mid, { id, memory_id: mid, fact, salience: category, notes: "harness-ingest" });
       res.created += 1;
     }
@@ -439,6 +490,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       // retained detail the tiering promised to keep. Exclude them.
       const stale = db.prepare("SELECT id, signature, memory_id FROM nodes WHERE kind='fact' AND memory_id<>'' AND (notes IS NULL OR notes NOT IN ('detail','archive'))").all().filter((n) => !harnessIds.has(n.memory_id));
       for (const n of stale) {
+        removeDependentChronicles(db, n.signature);
         db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id, now, "pruned: left harness");
         // Delete the node's EDGES too. Without this, a sequence/supersedes/related_to edge
         // pointing at this pruned fact is left dangling, and the next repairGraph pass used
@@ -466,18 +518,18 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
 }
 
 // ---- REPAIR DATES FROM TEXT --------------------------------------------------
-// Last-resort first_seen repair for stores whose createdAt has become useless
+// Last-resort event-provenance repair for stores whose createdAt has become useless
 // (e.g. a host that rewrites createdAt on every rebuild, collapsing all dates
 // onto "today"). The real event date usually survives *inside the fact text*
 // ("raised 2026-06-26T18:15:02Z", "answered ... on 2026-07-01"), so we re-anchor
-// first_seen to the earliest explicit date found in each node's own text.
+// internal ordering plus source_day to the earliest explicit date found in text.
 // Scans EVERY fact node (including demoted Tier-2/3 rows absent from the flat
 // harness), so it needs no snapshot. Earlier-only by default (never pushes a
 // date forward — the failure mode we are undoing is dates jumping to "now");
 // pass allowLater to trust the text date unconditionally.
 function repairDatesFromText(db, { dryRun, allowLater } = {}) {
-  const rows = db.prepare("SELECT id, first_seen, fact FROM nodes WHERE kind='fact'").all();
-  const upd = db.prepare("UPDATE nodes SET first_seen=? WHERE id=?");
+  const rows = db.prepare("SELECT id, first_seen, notes, fact FROM nodes WHERE kind='fact'").all();
+  const upd = db.prepare("UPDATE nodes SET first_seen=?, source_day=? WHERE id=?");
   const res = { scanned: rows.length, matched: 0, updated: 0, no_date: 0, skipped_not_earlier: 0, dry_run: !!dryRun, allow_later: !!allowLater, sample: [] };
   const apply = db.transaction(() => {
     for (const n of rows) {
@@ -487,7 +539,7 @@ function repairDatesFromText(db, { dryRun, allowLater } = {}) {
       const older = !n.first_seen || Date.parse(td) < Date.parse(n.first_seen);
       if (!allowLater && !older) { res.skipped_not_earlier += 1; continue; }
       if (n.first_seen === td) continue;
-      if (!dryRun) upd.run(td, n.id);
+      if (!dryRun) upd.run(td, n.notes === "gist" ? null : td.slice(0, 10), n.id);
       res.updated += 1;
       if (res.sample.length < 8) res.sample.push({ id: n.id, from: n.first_seen, to: td, fact: (n.fact || "").slice(0, 80) });
     }
@@ -531,6 +583,11 @@ const SPOTLIGHT_COS = 0.6;                // ...and only semantically-related ne
 const SPOTLIGHT_WINDOW_MS = 24 * 3600 * 1000; // ...within a ±24h temporal window of the elevated fact
 const SPOTLIGHT_MAX_NEIGHBORS = 5;        // ...capped per elevated fact (idempotent via 'spotlight' edge)
 const SAL_REVIEW_MAX = 20;                // ≤ this many existing salient facts re-surfaced for downgrade/night
+const REACTIVATION_POOL_MAX = 10;
+const REACTIVATION_MEMBER_MAX = 30;
+const REACTIVATION_EVIDENCE_MAX = 40;
+const REACTIVATION_ARCHIVE_MIN_AGE = 7;
+const REACTIVATION_REVIEW_DELTA = 2;
 
 function computeSchemaFit(db) {
   const factCount = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c || 1;
@@ -550,6 +607,149 @@ function computeSchemaFit(db) {
 }
 // connectedness-weighted promotion threshold: 3 (isolated) -> 1 (fully schema-fit)
 const promoThreshold = (schemaNorm) => Math.max(1, Math.round(3 - 2 * schemaNorm));
+
+function specificHubState(db) {
+  const active = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c || 1;
+  const maxDegree = Math.max(8, Math.ceil(SCHEMA_UBIQUITOUS * active));
+  const degree = new Map(
+    db.prepare("SELECT dst, count(*) c FROM edges WHERE rel='mentions' GROUP BY dst").all()
+      .map((r) => [r.dst, r.c])
+  );
+  return { degree, maxDegree };
+}
+
+function pendingReactivationFamilies(db, limit = REACTIVATION_POOL_MAX * 4) {
+  return db.prepare(`
+    SELECT f.family_key hub_sig,
+           f.evidence_seq,
+           f.evidence_count,
+           COALESCE(r.reviewed_seq,-1) reviewed_seq,
+           f.evidence_count - COALESCE(r.reviewed_count,0) new_evidence
+    FROM reactivation_families f
+    LEFT JOIN reactivation_reviews r ON r.family_key=f.family_key
+    WHERE f.evidence_count - COALESCE(r.reviewed_count,0) >= ?
+    ORDER BY f.evidence_seq DESC, f.family_key
+    LIMIT ?
+  `).all(REACTIVATION_REVIEW_DELTA, limit);
+}
+
+function reactivationMemberStats(db, hubSig, limit = REACTIVATION_MEMBER_MAX) {
+  return db.prepare(`
+    SELECT member_sig sig, evidence_count, latest_seq
+    FROM reactivation_members
+    WHERE family_key=?
+    ORDER BY evidence_count DESC, latest_seq DESC, member_sig
+    LIMIT ?
+  `).all(hubSig, limit);
+}
+
+const REACTIVATION_EXAMPLE_CAP = 40;
+
+function recordReactivationEvidence(db, familyKey, oldSig, evidence, observedSeq, observedAt) {
+  if (!evidence || evidence.count <= 0) return;
+  db.prepare(`
+    INSERT INTO reactivation_families(family_key,evidence_seq,evidence_count,observed_at)
+    VALUES (?,?,?,?)
+    ON CONFLICT(family_key) DO UPDATE SET
+      evidence_seq=max(evidence_seq,excluded.evidence_seq),
+      evidence_count=evidence_count+excluded.evidence_count,
+      observed_at=CASE WHEN excluded.evidence_seq>=evidence_seq THEN excluded.observed_at ELSE observed_at END
+  `).run(familyKey, observedSeq, evidence.count, observedAt);
+  const upsertMember = db.prepare(`
+    INSERT INTO reactivation_members(family_key,member_sig,evidence_count,latest_seq,observed_at)
+    VALUES (?,?,?,?,?)
+    ON CONFLICT(family_key,member_sig) DO UPDATE SET
+      evidence_count=evidence_count+excluded.evidence_count,
+      latest_seq=max(latest_seq,excluded.latest_seq),
+      observed_at=CASE WHEN excluded.latest_seq>=latest_seq THEN excluded.observed_at ELSE observed_at END
+  `);
+  upsertMember.run(familyKey, oldSig, evidence.count, observedSeq, observedAt);
+  for (const sample of evidence.samples) {
+    upsertMember.run(familyKey, sample.newSig, 1, observedSeq, observedAt);
+    db.prepare(`
+      INSERT INTO reactivation_examples(family_key,new_sig,old_sig,observed_seq,observed_at)
+      VALUES (?,?,?,?,?)
+      ON CONFLICT(family_key,new_sig,old_sig) DO UPDATE SET
+        observed_seq=excluded.observed_seq,
+        observed_at=excluded.observed_at
+    `).run(familyKey, sample.newSig, oldSig, observedSeq, observedAt);
+  }
+  db.prepare(`
+    DELETE FROM reactivation_examples
+    WHERE family_key=? AND rowid NOT IN (
+      SELECT rowid FROM reactivation_examples
+      WHERE family_key=?
+      ORDER BY observed_seq DESC, rowid DESC
+      LIMIT ?
+    )
+  `).run(familyKey, familyKey, REACTIVATION_EXAMPLE_CAP);
+}
+
+function pendingSemanticSigs(db) {
+  const { degree, maxDegree } = specificHubState(db);
+  const pending = new Set();
+  for (const family of pendingReactivationFamilies(db)) {
+    if ((degree.get(family.hub_sig) || 0) > maxDegree) continue;
+    const members = reactivationMemberStats(db, family.hub_sig);
+    if (members.length < 3) continue;
+    for (const m of members) pending.add(m.sig);
+  }
+  return pending;
+}
+
+function maintainChronicleSkyline(db, now) {
+  const thresholds = { day: 14, week: 90, month: 730, quarter: 1460 };
+  const rank = { day: 0, week: 1, month: 2, quarter: 3, year: 4 };
+  const rows = db.prepare(`
+    SELECT n.id,n.signature,n.salience_score,c.resolution,c.period_start,c.period_end
+    FROM nodes n JOIN chronicles c ON c.node_sig=n.signature
+    WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive'
+  `).all();
+  let demoted = 0;
+  for (const row of rows) {
+    const limit = thresholds[row.resolution];
+    if (limit == null || (Number(row.salience_score) || 0) >= SAL_PROTECT) continue;
+    const age = Math.max(0, (now.getTime() - Date.parse(`${row.period_end}T23:59:59Z`)) / 86400000);
+    if (age <= limit) continue;
+    const parents = db.prepare(`
+      SELECT c.resolution
+      FROM chronicles c JOIN nodes n ON n.signature=c.node_sig
+      WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive'
+        AND c.period_start<=? AND c.period_end>=?
+    `).all(row.period_start, row.period_end);
+    const containingParent = parents.some((p) => (rank[p.resolution] ?? -1) > (rank[row.resolution] ?? 99));
+    const uncoveredChildren = db.prepare(`
+      SELECT count(*) c
+      FROM (SELECT DISTINCT evidence_sig FROM chronicle_evidence WHERE chronicle_sig=?) child
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM chronicle_evidence pe
+        JOIN chronicles pc ON pc.node_sig=pe.chronicle_sig
+        JOIN nodes pn ON pn.signature=pc.node_sig
+        WHERE pe.evidence_sig=child.evidence_sig
+          AND coalesce(pn.notes,'')<>'archive'
+          AND CASE pc.resolution
+            WHEN 'day' THEN 0 WHEN 'week' THEN 1 WHEN 'month' THEN 2
+            WHEN 'quarter' THEN 3 WHEN 'year' THEN 4 ELSE -1 END > ?
+      )
+    `).get(row.signature, rank[row.resolution] ?? 99).c;
+    const childCount = db.prepare("SELECT count(DISTINCT evidence_sig) c FROM chronicle_evidence WHERE chronicle_sig=?").get(row.signature).c;
+    if (!containingParent && !(childCount > 0 && uncoveredChildren === 0)) continue;
+    const blob = storedVecBlob(db, row.id);
+    db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(row.id));
+    db.prepare("DELETE FROM vec_chronicles WHERE rowid=?").run(BigInt(row.id));
+    if (blob) {
+      db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(row.id));
+      db.prepare("INSERT INTO vec_archive(rowid,embedding) VALUES (?,?)").run(BigInt(row.id), blob);
+      db.prepare("DELETE FROM vec_chronicles_archive WHERE rowid=?").run(BigInt(row.id));
+      db.prepare("INSERT INTO vec_chronicles_archive(rowid,embedding) VALUES (?,?)").run(BigInt(row.id), blob);
+    }
+    db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(row.signature, row.signature);
+    db.prepare("UPDATE nodes SET notes='archive',last_decayed=? WHERE id=?").run(now.toISOString(), row.id);
+    demoted += 1;
+  }
+  return demoted;
+}
 
 // ---- DREAM core: decay + auto-reactivate + evaporate + housekeeping ----------
 function dreamCoreImpl(db, flags) {
@@ -591,7 +791,12 @@ function dreamCoreImpl(db, flags) {
   // (x*1.0===x for finite x; malformed weights still normalize since the result differs).
   prof("dreamCore.decayEdges", () => {
   const updW = db.prepare("UPDATE edges SET weight=? WHERE rowid=?");
-  for (const e of db.prepare("SELECT rowid, rel, weight FROM edges").all()) {
+  // Skip rels whose decay factor is exactly 1.0 (mentions, supersedes, sequence): x*1.0===x
+  // is always a no-op, so there is no reason to read them at all. Unknown rels still decay
+  // via EDGE_DECAY.default (<1), so we exclude by rel-name rather than assume a known set.
+  const noDecayRels = Object.keys(EDGE_DECAY).filter((r) => r !== "default" && EDGE_DECAY[r] === 1);
+  const relFilter = noDecayRels.length ? ` WHERE rel NOT IN (${noDecayRels.map(() => "?").join(",")})` : "";
+  for (const e of db.prepare(`SELECT rowid, rel, weight FROM edges${relFilter}`).all(...noDecayRels)) {
     const f = EDGE_DECAY[e.rel] || EDGE_DECAY.default;
     const nw = clamp01(e.weight * f);
     if (nw !== e.weight) updW.run(nw, e.rowid);
@@ -608,49 +813,77 @@ function dreamCoreImpl(db, flags) {
     : db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND dirty_seq > ? AND dirty_seq <= ?`).all(lastDreamSeq, dreamInputSeq);
   const newIdSet = new Set(newFacts.map((n) => n.id));
   const triggers = new Map(); // sibling fact id -> count of distinct new facts that re-cued it
+  // old fact id -> hub -> bounded cue summary. Exact counters survive while
+  // pairwise examples stay capped in memory and on disk.
+  const triggerEvidence = new Map();
+  // Ubiquity guard on the reactivation hot path. A new fact touching a *ubiquitous connector*
+  // (the user, their team, "family", "personal-finance" — entities mentioned by a large
+  // fraction of ALL facts) shares that hub with ~everything, so fanning out to re-cue every
+  // sibling is both O(N²) (hub degree grows with the corpus) AND semantically empty (co-mention
+  // of a generic hub is not real recurrence). We reuse the same ubiquity cut the schema-fit /
+  // demotion paths already apply (specificHubState) so a hub above maxDegree is skipped as a cue.
+  const { degree: entDegree, maxDegree: ubiqDegree } = specificHubState(db);
   for (const nf of newFacts) {
-    const ents = db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(nf.signature).map((r) => r.dst);
+    const ents = db.prepare("SELECT dst FROM edges WHERE src=? AND rel='mentions'").all(nf.signature)
+      .map((r) => r.dst)
+      .filter((e) => (entDegree.get(e) || 0) <= ubiqDegree);
     const cued = new Set();
     for (const e of ents) {
-      for (const s of db.prepare("SELECT n.id FROM edges g JOIN nodes n ON n.signature=g.src WHERE g.dst=? AND g.rel='mentions' AND n.kind='fact'").all(e)) {
-        if (s.id !== nf.id && !newIdSet.has(s.id)) cued.add(s.id);
+      for (const s of db.prepare("SELECT n.id, n.signature FROM edges g JOIN nodes n ON n.signature=g.src WHERE g.dst=? AND g.rel='mentions' AND n.kind='fact'").all(e)) {
+        if (s.id !== nf.id && !newIdSet.has(s.id)) {
+          cued.add(s.id);
+          if (!triggerEvidence.has(s.id)) triggerEvidence.set(s.id, new Map());
+          const byHub = triggerEvidence.get(s.id);
+          if (!byHub.has(e)) byHub.set(e, { count: 0, seq: 0, samples: [] });
+          const evidence = byHub.get(e);
+          evidence.count += 1;
+          evidence.seq = Math.max(evidence.seq, Number(nf.dirty_seq) || dreamInputSeq);
+          evidence.samples.push({ newSig: nf.signature });
+          if (evidence.samples.length > 3) evidence.samples.shift();
+        }
       }
     }
     for (const id of cued) triggers.set(id, (triggers.get(id) || 0) + 1);
   }
   const reentered = new Set();
-  let promoSem = 0;
+  let semanticReady = 0;
   for (const [id, nTrig] of triggers) {
     const s = db.prepare("SELECT * FROM nodes WHERE id=?").get(id);
     if (!s) continue;
     const sf = schema.get(s.signature) || 0;
     const reacts = s.reactivations + 1; // exactly one per run
-    let cls = s.class;
-    // Repetition builds DURABILITY: episodic -> semantic (schema-accelerated). It does NOT
-    // confer IMPORTANCE: there is no auto path to 'salient' — salient is set ONLY by the dream's
-    // salience judgment (agent content-elevation: Sev1/2, security, exec decision, core
-    // identity/role, hard deadline). The ingest surface cannot assert it. Frequency != criticality.
-    if (cls === "episodic" && reacts >= promoThreshold(sf)) {
-      cls = "semantic"; promoSem += 1;
-      J("reinforce", s.signature, `PROMOTE episodic->semantic (reacts=${reacts}, schema=${sf.toFixed(2)}, thresh=${promoThreshold(sf)})`);
+    // Recurrence says "there may be something to learn"; it does not say what was
+    // learned. Keep the exact episode episodic and persist the cue family for the
+    // caller to extract a semantic gist through report/apply-synthesis.
+    const qualifies = s.class === "episodic" && reacts >= promoThreshold(sf);
+    if (qualifies) {
+      semanticReady += 1;
+      J("reinforce", s.signature, `SEMANTIC REVIEW READY (reacts=${reacts}, schema=${sf.toFixed(2)}, thresh=${promoThreshold(sf)})`);
     }
     // boost scales with schema fit and (capped) number of distinct re-cues this run
     const boost = 0.10 * (1 + 0.5 * sf) * Math.min(1.5, 1 + 0.15 * (nTrig - 1));
-    db.prepare("UPDATE nodes SET strength=?, reactivations=?, class=?, last_reactivated=? WHERE id=?").run(clamp01(s.strength + boost), reacts, cls, nowIso, s.id);
+    db.prepare("UPDATE nodes SET strength=?, reactivations=?, last_reactivated=? WHERE id=?")
+      .run(clamp01(s.strength + boost), reacts, nowIso, s.id);
+    if (qualifies) {
+      for (const [hubSig, evidence] of triggerEvidence.get(id) || []) {
+        recordReactivationEvidence(db, hubSig, s.signature, evidence, evidence.seq, nowIso);
+      }
+    }
     reentered.add(s.signature);
   }
-  if (reentered.size) J("reinforce", "", `REACTIVATE: ${reentered.size} facts via ${newFacts.length} new subjects; promoted ${promoSem} ->semantic`);
+  if (reentered.size) J("reinforce", "", `REACTIVATE: ${reentered.size} facts via ${newFacts.length} new subjects; ${semanticReady} ready for semantic review`);
 
   // EVAPORATE faded facts (decay-gated; not new AND not reactivated this run).
   // Episodic below the (pressure-adaptive) threshold always; weak re-derivable semantic only under pressure.
   // In TIERED mode we never physically delete a fact here — demotion (below) moves
   // overflow to Tier 3 instead, so faded facts stay recoverable by keyword. Archive nodes
   // are always excluded (they are inert and must never be deleted by decay).
-  const protectedSigs = new Set([...newFacts.map((n) => n.signature), ...reentered]);
+  const protectedSigs = new Set([...newFacts.map((n) => n.signature), ...reentered, ...pendingSemanticSigs(db)]);
   let evap = 0, evapSem = 0;
   if (!TIERED()) {
     for (const n of db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND class='episodic' AND strength < ?`).all(bp.forgetThreshold)) {
       if (protectedSigs.has(n.signature)) continue;
+      removeDependentChronicles(db, n.signature);
       db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id || "", nowIso, `S=${n.strength.toFixed(3)}<${bp.forgetThreshold} episodic`);
       db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
@@ -661,6 +894,7 @@ function dreamCoreImpl(db, flags) {
     if (bp.semanticFade > 0) {
       for (const n of db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT} AND class='semantic' AND strength < ?`).all(bp.semanticFade)) {
         if (protectedSigs.has(n.signature)) continue;
+        removeDependentChronicles(db, n.signature);
         db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id || "", nowIso, `S=${n.strength.toFixed(3)}<${bp.semanticFade} weak-semantic (over budget)`);
         db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
         db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
@@ -693,6 +927,7 @@ function dreamCoreImpl(db, flags) {
     // pass 2 (rare): still over → drop protected/salient weakest, since the cap is physical
     if (evict.length < over) { for (const n of cands) { if (evict.length >= over) break; if (evict.includes(n)) continue; evict.push(n); } }
     for (const n of evict) {
+      removeDependentChronicles(db, n.signature);
       db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id || "", nowIso, `evicted: over hard cap ${ENTRY_MAX} (S=${(n.strength||0).toFixed(3)})`);
       db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
@@ -746,6 +981,9 @@ function dreamCoreImpl(db, flags) {
       // Atomic: a crash mid-demotion must not leave an active node without its vector/edges.
       const txD = db.transaction(() => {
         for (const n of demote) {
+          for (const e of db.prepare("SELECT src,rel,dst,first_seen,last_reinforced FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(n.signature, n.signature)) {
+            preserveEvidenceTransition(db, e.src, e.rel, e.dst, e.first_seen, e.last_reinforced);
+          }
           db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
           // MOVE the embedding to vec_archive (principle 1 pay-once / principle 3 demote-
           // don't-delete): the cold fact stays reachable by SIMILARITY (recall.js tier-2c
@@ -774,6 +1012,9 @@ function dreamCoreImpl(db, flags) {
   let prunedHubs = 0;
   {
     const liveDst = new Set(db.prepare("SELECT DISTINCT dst FROM edges WHERE rel='mentions'").all().map((r) => r.dst));
+    for (const row of db.prepare("SELECT DISTINCT entity_sig FROM chronicle_entry_entities").all()) {
+      liveDst.add(row.entity_sig);
+    }
     const hubs = db.prepare("SELECT id, signature FROM nodes WHERE kind='entity'").all();
     const txP = db.transaction(() => {
       for (const h of hubs) {
@@ -797,16 +1038,17 @@ function dreamCoreImpl(db, flags) {
   repairGraph(db);
   setMeta(db, "last_dream", nowIso);
   setMeta(db, "last_dream_seq", String(dreamInputSeq));
+  const chronicleDemoted = maintainChronicleSkyline(db, now);
   const final = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
   const archivedNow = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND notes='archive'").get().c;
   const after = budgetParams(final);
   const overBy = Math.max(0, final - ENTRY_TARGET);
-  const summary = `RUN ${runId}: active facts ${facts.length}->${final} (target ${ENTRY_TARGET}, status ${after.status}); reactivated ${reentered.size} (promoted ${promoSem}->sem), evaporated ${evap}+${evapSem}sem, demoted ${demoted}, pruned ${prunedHubs} hubs; archive=${archivedNow}.`;
+  const summary = `RUN ${runId}: active facts ${facts.length}->${final} (target ${ENTRY_TARGET}, status ${after.status}); reactivated ${reentered.size} (${semanticReady} semantic-review candidates), evaporated ${evap}+${evapSem}sem, demoted ${demoted}, chronicle-demoted ${chronicleDemoted}, pruned ${prunedHubs} hubs; archive=${archivedNow}.`;
   J("keep", "", summary);
   const ins = db.prepare(`INSERT INTO dream_journal(dreamed_at,run_id,op,memory_id,signature,category,original_fact,result_fact,reason)
     VALUES (@dreamed_at,@run_id,@op,@memory_id,@signature,@category,@original_fact,@result_fact,@reason)`);
   db.transaction(() => journal.forEach((j) => ins.run(j)))();
-  const result = { runId, summary, facts: final, archived: archivedNow, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, pruned_hubs: prunedHubs, reactivated: reentered.size, promoted_semantic: promoSem };
+  const result = { runId, summary, facts: final, archived: archivedNow, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, chronicles_demoted: chronicleDemoted, pruned_hubs: prunedHubs, reactivated: reentered.size, promoted_semantic: 0, semantic_review_candidates: semanticReady };
   if (overBy > 0) result.action_needed = `Still ${overBy} over target. Run 'consolidate' and merge the reported clusters (agent) to reduce entry count.`;
   return result;
 }
@@ -884,6 +1126,11 @@ function mergeEntityHub(db, canonicalSig, aliasSig) {
     if (dup || e.src === canonicalSig) db.prepare("DELETE FROM edges WHERE rowid=?").run(e.rowid);
     else db.prepare("UPDATE edges SET dst=? WHERE rowid=?").run(canonicalSig, e.rowid);
   }
+  db.prepare(`
+    INSERT OR IGNORE INTO chronicle_entry_entities(chronicle_sig,entry_ordinal,entity_sig)
+    SELECT chronicle_sig,entry_ordinal,? FROM chronicle_entry_entities WHERE entity_sig=?
+  `).run(canonicalSig, aliasSig);
+  db.prepare("DELETE FROM chronicle_entry_entities WHERE entity_sig=?").run(aliasSig);
   db.prepare("DELETE FROM edges WHERE src=?").run(aliasSig);
   db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(al.id));
   db.prepare("DELETE FROM nodes WHERE id=?").run(al.id);
@@ -976,7 +1223,13 @@ async function weave(db, opts) {
   //    that textually mention them (scoped to those hubs' forms — an index-free LIKE over
   //    active facts, bounded by #new-hubs, not a full O(N) re-scan).
   const hasEdge = db.prepare("SELECT 1 FROM edges WHERE src=? AND dst=? AND rel=?");
-  const addEdge = (src, rel, dst, w) => { if (src === dst) return; if (!hasEdge.get(src, dst, rel)) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(src, rel, dst, w, now, now); };
+  const addEdge = (src, rel, dst, w) => {
+    if (src === dst) return;
+    if (!hasEdge.get(src, dst, rel)) {
+      db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(src, rel, dst, w, now, now);
+    }
+    preserveEvidenceTransition(db, src, rel, dst, now, now);
+  };
   let mentionEdges = 0;
   const tx2 = db.transaction(() => {
     for (const f of factRows) {
@@ -1065,7 +1318,7 @@ async function weave(db, opts) {
   // Every currently-valid creation path requires at least this lexical floor.
   let supersedeEdgesPruned = 0;
   for (const e of db.prepare(`
-    SELECT e.rowid, s.fact src_fact, d.fact dst_fact
+    SELECT e.rowid, e.src, e.dst, s.fact src_fact, d.fact dst_fact
     FROM edges e
     JOIN nodes s ON s.signature=e.src AND s.kind='fact'
     JOIN nodes d ON d.signature=e.dst AND d.kind='fact'
@@ -1073,6 +1326,7 @@ async function weave(db, opts) {
   `).all()) {
     if (jaccard(toks(e.src_fact), toks(e.dst_fact)) < 0.12) {
       supersedeEdgesPruned += db.prepare("DELETE FROM edges WHERE rowid=?").run(e.rowid).changes;
+      db.prepare("DELETE FROM evidence_transitions WHERE src_sig=? AND rel='supersedes' AND dst_sig=?").run(e.src, e.dst);
     }
   }
 
@@ -1847,7 +2101,33 @@ async function reportMerges(db, opts = {}) {
   const lastReflectSeqRaw = incrementalR ? getMeta(db, "last_reflect_seq") : null;
   const lastReflectSeq = incrementalR && lastReflectSeqRaw != null ? getMetaInt(db, "last_reflect_seq") : null;
   const cons = await consolidate(db, { sim: (opts && opts.sim) || 0, excludeDetail: true, seedAfterSeq: incrementalR ? lastReflectSeq : null });
-  const clusters = cons.clusters || [];
+  const spanStmt = db.prepare(`
+    SELECT min(n.source_day) evidence_start,
+           max(n.source_day) evidence_end,
+           count(*) detail_count
+    FROM detail_of d
+    JOIN nodes n ON n.signature=d.detail_sig
+    WHERE d.gist_sig=?
+  `);
+  const clusters = (cons.clusters || []).map((cluster) => cluster
+    .map((m) => {
+      const n = db.prepare("SELECT source_day,first_seen,notes,temporal_form,memory_family FROM nodes WHERE signature=?").get(m.sig) || {};
+      const isGist = n.notes && /\bgist\b/.test(n.notes);
+      const span = isGist ? (spanStmt.get(m.sig) || {}) : {};
+      return {
+        ...m,
+        sourceDay: isGist ? null : (n.source_day || String(n.first_seen || "").slice(0, 10) || null),
+        tier: isGist ? "gist" : (n.notes === "detail" ? "detail" : "episodic"),
+        evidenceStart: span.evidence_start || null,
+        evidenceEnd: span.evidence_end || null,
+        latestEvidenceDay: span.evidence_end || n.source_day || String(n.first_seen || "").slice(0, 10) || null,
+        detailCount: Number(span.detail_count) || 0,
+        temporalForm: n.temporal_form || null,
+        memoryFamily: n.memory_family || m.sig,
+      };
+    })
+    .sort((a, b) => String(a.sourceDay || a.evidenceStart || "").localeCompare(String(b.sourceDay || b.evidenceStart || ""))
+      || a.sig.localeCompare(b.sig)));
   const basisSeq = maxDirtySeq(db);
   const identity = {
     basis_seq: basisSeq,
@@ -1881,6 +2161,8 @@ function validateMergeDecisions(db, raw, reportedClusters = null) {
     : null;
   const candidates = [];
   const rejected = [];
+  const validForms = new Set(["atemporal", "trajectory", "recurring", "period-bound"]);
+  const validRoles = new Set(["before", "change", "current"]);
   for (let index = 0; index < raw.length; index += 1) {
     const dec = raw[index];
     if (dec == null) continue;
@@ -1905,7 +2187,30 @@ function validateMergeDecisions(db, raw, reportedClusters = null) {
       rejected.push({ index, reason: "cross_cluster", memberSigs });
       continue;
     }
-    candidates.push({ index, fact: dec.fact.trim(), survivorSig, memberSigs });
+    const temporalForm = typeof dec.temporalForm === "string"
+      ? dec.temporalForm.trim().toLowerCase()
+      : (typeof dec.form === "string" ? dec.form.trim().toLowerCase() : "atemporal");
+    if (!validForms.has(temporalForm)) {
+      rejected.push({ index, reason: "invalid_temporal_form", memberSigs });
+      continue;
+    }
+    const landmarks = [];
+    const rawLandmarks = dec.landmarks && typeof dec.landmarks === "object" ? dec.landmarks : {};
+    let malformedLandmark = false;
+    for (const role of validRoles) {
+      const sigs = rawLandmarks[role] == null ? [] : rawLandmarks[role];
+      if (!Array.isArray(sigs)) { malformedLandmark = true; break; }
+      for (const sig of [...new Set(sigs)]) {
+        if (typeof sig !== "string" || !memberSigs.includes(sig)) { malformedLandmark = true; break; }
+        landmarks.push({ role, evidenceSig: sig });
+      }
+      if (malformedLandmark) break;
+    }
+    if (malformedLandmark) {
+      rejected.push({ index, reason: "invalid_landmark", memberSigs });
+      continue;
+    }
+    candidates.push({ index, fact: dec.fact.trim(), survivorSig, memberSigs, temporalForm, landmarks });
   }
 
   const owners = new Map();
@@ -2039,6 +2344,11 @@ async function applyMerges(db, raw, opts = {}) {
       if (!survivor) continue;
       const members = dec.memberSigs.map((sig) => db.prepare("SELECT * FROM nodes WHERE signature=? AND kind='fact'").get(sig)).filter(Boolean);
       if (members.length < 2) continue;
+      const survivorTransitions = db.prepare(`
+        SELECT src,rel,dst,weight,first_seen,last_reinforced
+        FROM edges
+        WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')
+      `).all(survivor.signature, survivor.signature);
       const maxStrength = Math.max(...members.map((m) => m.strength || 0));
       // Importance propagates through consolidation as a SCORE (P12), not a class: the gist
       // inherits the max salience_score of its members. Durability (class) stays episodic/semantic.
@@ -2057,22 +2367,45 @@ async function applyMerges(db, raw, opts = {}) {
       // but its ORIGINAL verbatim is NEVER lost: we clone it into a Tier-2 'detail'
       // (exactly like every other member) so completed-action / state-transition
       // facts (e.g. "I sent X" vs "do not send X until approved") stay recoverable.
-      const survOrig = { fact: survivor.fact, text: survivor.text || survivor.fact, class: (survivor.class === "salient" ? "semantic" : (survivor.class || "semantic")), salience: survivor.salience || "", salience_score: Number(survivor.salience_score) || 0, strength: survivor.strength || 0, reactivations: survivor.reactivations || 0, first_seen: survivor.first_seen };
-      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, salience_score=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, notes='gist', dirty_seq=? WHERE id=?")
+      const survOrig = { fact: survivor.fact, text: survivor.text || survivor.fact, class: (survivor.class === "salient" ? "semantic" : (survivor.class || "semantic")), salience: survivor.salience || "", salience_score: Number(survivor.salience_score) || 0, strength: survivor.strength || 0, reactivations: survivor.reactivations || 0, first_seen: survivor.first_seen, source_day: survivor.source_day };
+      db.prepare("UPDATE nodes SET fact=?, text=?, class=?, salience=?, salience_score=?, strength=?, reactivations=?, last_reactivated=?, first_seen=?, source_day=NULL, notes='gist', temporal_form=?, memory_family=COALESCE(memory_family,?), dirty_seq=? WHERE id=?")
         .run(dec.fact, dec.fact, survClass,
-          salient ? "decision" : (survivor.salience || ""), maxSal, clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen, mergeSeq, survivor.id);
+          salient ? "decision" : (survivor.salience || ""), maxSal, clamp01(maxStrength + 0.05), maxReacts, now, survFirstSeen,
+          dec.temporalForm, survivor.signature, mergeSeq, survivor.id);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(survivor.id));
       db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(survivor.id), gistVecBySurvivor.get(dec.survivorSig));
       // Preserve the survivor's own pre-merge verbatim as a detail of the new gist
       // (memory_id='' — details are archival, not projected to the flat harness).
       const survCloneSig = uniqueSig(db, `fact:${deriveSlug(survOrig.fact || survivor.signature)}`);
-      db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,salience_score,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.salience_score, survOrig.strength, survOrig.reactivations, survOrig.first_seen, now, now, "detail", survOrig.fact, survOrig.text, mergeSeq, mergeSeq);
+      db.prepare(`INSERT INTO nodes(signature,memory_id,kind,class,salience,salience_score,strength,reactivations,first_seen,source_day,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(survCloneSig, "", "fact", survOrig.class, survOrig.salience, survOrig.salience_score, survOrig.strength, survOrig.reactivations, survOrig.first_seen, survOrig.source_day, now, now, "detail", survOrig.fact, survOrig.text, mergeSeq, mergeSeq);
       const cloneId = db.prepare("SELECT id FROM nodes WHERE signature=?").get(survCloneSig).id;
       db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(cloneId), originalVecBySurvivor.get(dec.survivorSig));
+      // The survivor identity now names the semantic gist. Move its original
+      // evidence chronology onto the retained verbatim clone instead of leaving
+      // sequence/correction edges attached to rewritten prose.
+      for (const e of survivorTransitions) {
+        const nsrc = e.src === survivor.signature ? survCloneSig : e.src;
+        const ndst = e.dst === survivor.signature ? survCloneSig : e.dst;
+        if (nsrc === ndst) continue;
+        preserveEvidenceTransition(db, nsrc, e.rel, ndst, e.first_seen, e.last_reinforced);
+        db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)")
+          .run(nsrc, e.rel, ndst, e.weight, e.first_seen || now, e.last_reinforced || now);
+      }
+      db.prepare("DELETE FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").run(survivor.signature, survivor.signature);
+      db.prepare("DELETE FROM evidence_transitions WHERE src_sig=? OR dst_sig=?").run(survivor.signature, survivor.signature);
       db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "related_to", survCloneSig, 0.6, now, now);
       db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(survCloneSig, survivor.signature, survOrig.first_seen);
+      db.prepare("DELETE FROM gist_landmarks WHERE gist_sig=?").run(survivor.signature);
+      const landmarkOrdinal = new Map();
+      for (const lm of dec.landmarks || []) {
+        const evidenceSig = lm.evidenceSig === survivor.signature ? survCloneSig : lm.evidenceSig;
+        const ordinal = landmarkOrdinal.get(lm.role) || 0;
+        db.prepare("INSERT INTO gist_landmarks(gist_sig,role,ordinal,evidence_sig) VALUES (?,?,?,?)")
+          .run(survivor.signature, lm.role, ordinal, evidenceSig);
+        landmarkOrdinal.set(lm.role, ordinal + 1);
+      }
       retained += 1;
       for (const m of members) {
         if (m.id === survivor.id) continue;
@@ -2080,14 +2413,9 @@ async function applyMerges(db, raw, opts = {}) {
           const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='mentions' AND dst=?").get(survivor.signature, e.dst);
           if (!dup && survivor.signature !== e.dst) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(survivor.signature, "mentions", e.dst, e.weight, now, now);
         }
-        for (const e of db.prepare("SELECT src, rel, dst, weight FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(m.signature, m.signature)) {
-          const nsrc = e.src === m.signature ? survivor.signature : e.src;
-          const ndst = e.dst === m.signature ? survivor.signature : e.dst;
-          if (nsrc === ndst) continue;
-          const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel=? AND dst=?").get(nsrc, e.rel, ndst);
-          if (!dup) db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)").run(nsrc, e.rel, ndst, e.weight, now, now);
+        for (const e of db.prepare("SELECT src,rel,dst,first_seen,last_reinforced FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(m.signature, m.signature)) {
+          preserveEvidenceTransition(db, e.src, e.rel, e.dst, e.first_seen, e.last_reinforced);
         }
-        db.prepare("DELETE FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").run(m.signature, m.signature);
         // Always demote members to Tier-2 'detail' (never delete): full-fidelity invariant.
         db.prepare("UPDATE nodes SET notes='detail', last_reactivated=? WHERE id=?").run(now, m.id);
         const dup = db.prepare("SELECT 1 FROM edges WHERE src=? AND rel='related_to' AND dst=?").get(survivor.signature, m.signature);
@@ -2131,14 +2459,94 @@ async function applyMerges(db, raw, opts = {}) {
   };
 }
 
-function reportSynthesis(db, opts = {}) {
-  const cand = emitCandidates(db, { ...(opts.detect || {}), asOf: opts.asOf });
-  return { surface: "synthesis", pools: cand.pools || [] };
+function emitReactivationCandidates(db, opts = {}) {
+  const now = opts.asOf ? Date.parse(opts.asOf) : Date.now();
+  const ageD = (iso) => (iso ? Math.max(0, (now - Date.parse(iso)) / 86400000) : 0);
+  const { degree, maxDegree } = specificHubState(db);
+  const generalized = new Set(db.prepare("SELECT detail_sig FROM detail_of").all().map((r) => r.detail_sig));
+  const pools = [];
+  for (const family of pendingReactivationFamilies(db)) {
+    const hubSig = family.hub_sig;
+    if ((degree.get(hubSig) || 0) > maxDegree) continue;
+    const memberStats = reactivationMemberStats(db, hubSig);
+    const sigs = memberStats.map((m) => m.sig);
+    if (!sigs.length) continue;
+    const ph = sigs.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT signature, class, strength, reactivations, first_seen, notes, fact
+      FROM nodes
+      WHERE signature IN (${ph}) AND kind='fact' AND (notes IS NULL OR notes<>'archive')
+    `).all(...sigs).filter((n) => n.notes !== "gist" && !generalized.has(n.signature));
+    const eventCount = new Map(memberStats.map((m) => [m.sig, Number(m.evidence_count) || 0]));
+    const members = rows
+      .sort((a, b) => (eventCount.get(b.signature) || 0) - (eventCount.get(a.signature) || 0)
+        || Date.parse(a.first_seen || "") - Date.parse(b.first_seen || ""))
+      .slice(0, REACTIVATION_MEMBER_MAX)
+      .map((n) => ({
+        sig: n.signature,
+        fact: n.fact || "",
+        class: n.class,
+        strength: Number((n.strength || 0).toFixed(3)),
+        reactivations: n.reactivations || 0,
+        sourceDay: n.source_day || (n.first_seen || "").slice(0, 10) || null,
+        ageDays: Math.round(ageD(n.first_seen)),
+        archiveEligible: ageD(n.first_seen) >= REACTIVATION_ARCHIVE_MIN_AGE,
+        evidenceCount: eventCount.get(n.signature) || 0,
+      }));
+    if (members.length < 3 || members.filter((m) => m.archiveEligible).length < 2) continue;
+    const evidence = db.prepare(`
+      SELECT new_sig, old_sig, observed_seq, observed_at
+      FROM reactivation_examples
+      WHERE family_key=?
+      ORDER BY observed_seq DESC, old_sig, new_sig
+      LIMIT ?
+    `).all(hubSig, REACTIVATION_EVIDENCE_MAX);
+    const evidenceSeq = Number(family.evidence_seq) || 0;
+    pools.push({
+      poolId: `reactivation-${crypto.createHash("sha256").update(hubSig).digest("hex").slice(0, 12)}`,
+      mode: "reactivation",
+      familyKey: hubSig,
+      evidenceSeq,
+      evidenceCount: Number(family.evidence_count) || 0,
+      reviewedSeq: Number(family.reviewed_seq) || 0,
+      hub: { sig: hubSig, degree: degree.get(hubSig) || 0 },
+      members,
+      evidence: evidence.map((e) => ({
+        newSig: e.new_sig, oldSig: e.old_sig, hubSig,
+        observedSeq: Number(e.observed_seq) || 0, observedAt: e.observed_at,
+      })),
+    });
+  }
+  const ranked = pools
+    .sort((a, b) => b.evidenceSeq - a.evidenceSeq || a.hub.degree - b.hub.degree || a.familyKey.localeCompare(b.familyKey))
+    .slice(0, REACTIVATION_POOL_MAX);
+  // A fact can recur through several hubs. Keep it as context in every pool, but
+  // make it archive-selectable in exactly one (the newest, most-specific family)
+  // so independently judged pools can never submit overlapping demotions.
+  const selectable = new Set();
+  for (const pool of ranked) {
+    for (const member of pool.members) {
+      if (!member.archiveEligible) continue;
+      if (selectable.has(member.sig)) member.archiveEligible = false;
+      else selectable.add(member.sig);
+    }
+  }
+  return ranked.filter((pool) => pool.members.filter((m) => m.archiveEligible).length >= 2);
 }
 
-function cleanSynthesisDecisions(db, raw, opts = {}) {
+function reportSynthesis(db, opts = {}) {
+  const cand = emitCandidates(db, { ...(opts.detect || {}), asOf: opts.asOf });
+  const pools = cand.pools || [];
+  const reactivationPools = emitReactivationCandidates(db, opts);
+  const basisSeq = maxDirtySeq(db);
+  const identity = { basisSeq, pools, reactivationPools };
+  const reportId = crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return { surface: "synthesis", report_id: reportId, basis_seq: basisSeq, pools, reactivation_pools: reactivationPools };
+}
+
+function cleanSynthesisDecisions(db, raw, opts = {}, reportedPools) {
   if (!Array.isArray(raw)) return [];
-  const pools = reportSynthesis(db, opts).pools;
+  const pools = reportedPools || reportSynthesis(db, opts).pools;
   const byPool = new Map(pools.map((p) => [p.poolId, p]));
   const out = [];
   for (const obj of raw) {
@@ -2159,8 +2567,83 @@ function cleanSynthesisDecisions(db, raw, opts = {}) {
   return out;
 }
 
+function normalizeSynthesisInput(raw) {
+  if (Array.isArray(raw)) return { legacy: true, reportId: null, decisions: raw, reactivationReviews: [] };
+  if (raw && typeof raw === "object") {
+    return {
+      legacy: false,
+      reportId: typeof raw.report_id === "string" ? raw.report_id : "",
+      decisions: Array.isArray(raw.decisions) ? raw.decisions : [],
+      reactivationReviews: Array.isArray(raw.reactivation_reviews) ? raw.reactivation_reviews : [],
+    };
+  }
+  return { legacy: false, reportId: "", decisions: [], reactivationReviews: [] };
+}
+
+function validateReactivationReviews(raw, pools) {
+  const byPool = new Map(pools.map((p) => [p.poolId, p]));
+  const reviews = [];
+  const rejected = [];
+  const seenPools = new Set();
+  const claimed = new Set();
+  for (let index = 0; index < raw.length; index += 1) {
+    const r = raw[index];
+    if (!r || typeof r.poolId !== "string" || typeof r.action !== "string") {
+      rejected.push({ index, reason: "malformed_reactivation_review" }); continue;
+    }
+    const pool = byPool.get(r.poolId);
+    if (!pool) { rejected.push({ index, reason: "pool_not_in_report", poolId: r.poolId }); continue; }
+    if (seenPools.has(r.poolId)) { rejected.push({ index, reason: "duplicate_pool", poolId: r.poolId }); continue; }
+    seenPools.add(r.poolId);
+    const action = r.action.trim().toLowerCase();
+    if (action === "reject") {
+      reviews.push({ pool, action, groups: [] });
+      continue;
+    }
+    if (action !== "synthesize" || !Array.isArray(r.groups)) {
+      rejected.push({ index, reason: "invalid_action", poolId: r.poolId }); continue;
+    }
+    const eligible = new Set(pool.members.filter((m) => m.archiveEligible).map((m) => m.sig));
+    const groups = [];
+    for (const g of r.groups) {
+      if (!g || typeof g.concept !== "string" || g.concept.trim().length < 12
+        || typeof g.span !== "string" || !g.span.trim()
+        || typeof g.scale !== "string" || !g.scale.trim()
+        || !Array.isArray(g.memberSigs)) continue;
+      const memberSigs = [...new Set(g.memberSigs)];
+      if (memberSigs.length < 2 || memberSigs.some((sig) => !eligible.has(sig) || claimed.has(sig))) continue;
+      memberSigs.forEach((sig) => claimed.add(sig));
+      groups.push({ concept: g.concept.trim(), memberSigs, span: g.span.trim(), scale: g.scale.trim() });
+    }
+    if (!groups.length) { rejected.push({ index, reason: "no_valid_groups", poolId: r.poolId }); continue; }
+    reviews.push({ pool, action, groups });
+  }
+  return { reviews, rejected };
+}
+
 async function applySynthesis(db, raw, opts = {}) {
-  const decisions = cleanSynthesisDecisions(db, raw, opts);
+  const input = normalizeSynthesisInput(raw);
+  const currentReport = reportSynthesis(db, opts);
+  if (!input.legacy && input.reportId !== currentReport.report_id) {
+    return {
+      surface: "synthesis", complete: false, reviewed: false,
+      decisions: 0, concepts_created: 0, members_demoted: 0, applied: [],
+      rejected: [{
+        reason: input.reportId ? "report_stale" : "missing_report_id",
+        expected_report_id: currentReport.report_id,
+        supplied_report_id: input.reportId || null,
+      }],
+    };
+  }
+  const decisions = cleanSynthesisDecisions(db, input.decisions, opts, currentReport.pools);
+  const reactivationValidation = validateReactivationReviews(input.reactivationReviews, currentReport.reactivation_pools);
+  if (reactivationValidation.rejected.length) {
+    return {
+      surface: "synthesis", complete: false, reviewed: false,
+      decisions: 0, concepts_created: 0, members_demoted: 0, applied: [],
+      rejected: reactivationValidation.rejected,
+    };
+  }
   let conceptsCreated = 0, membersDemoted = 0;
   const applied = [];
   for (const dec of decisions) {
@@ -2169,9 +2652,411 @@ async function applySynthesis(db, raw, opts = {}) {
       if (r.applied) { conceptsCreated += 1; membersDemoted += r.demoted; applied.push({ poolId: dec.poolId, concept: r.concept_sig, demoted: r.demoted }); }
     }
   }
+  const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
+  const upsertReview = db.prepare(`
+    INSERT INTO reactivation_reviews(family_key,decision,gist_sigs,reviewed_seq,reviewed_count,reviewed_at,report_id)
+    VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(family_key) DO UPDATE SET
+      decision=excluded.decision, gist_sigs=excluded.gist_sigs,
+      reviewed_seq=excluded.reviewed_seq, reviewed_count=excluded.reviewed_count,
+      reviewed_at=excluded.reviewed_at,
+      report_id=excluded.report_id
+  `);
+  let reactivationReviewed = 0;
+  for (const review of reactivationValidation.reviews) {
+    const gistSigs = [];
+    if (review.action === "synthesize") {
+      for (const group of review.groups) {
+        const r = await applyConcept(db, group, { asOf: opts.asOf });
+        if (r.applied) {
+          conceptsCreated += 1;
+          membersDemoted += r.demoted;
+          gistSigs.push(r.concept_sig);
+          applied.push({ poolId: review.pool.poolId, mode: "reactivation", concept: r.concept_sig, demoted: r.demoted });
+        }
+      }
+    }
+    if (review.action === "reject" || gistSigs.length) {
+      upsertReview.run(
+        review.pool.familyKey,
+        review.action === "synthesize" ? "accepted" : "rejected",
+        JSON.stringify(gistSigs),
+        review.pool.evidenceSeq,
+        review.pool.evidenceCount,
+        now,
+        currentReport.report_id
+      );
+      reactivationReviewed += 1;
+    }
+  }
   const weaveResult = conceptsCreated ? await weave(db, { asOf: opts.asOf }) : null;
   repairGraph(db);
-  return { surface: "synthesis", decisions: decisions.length, concepts_created: conceptsCreated, members_demoted: membersDemoted, applied, weave: weaveResult };
+  return {
+    surface: "synthesis", complete: true, reviewed: input.legacy ? decisions.length > 0 : true,
+    decisions: decisions.length, reactivation_reviewed: reactivationReviewed,
+    concepts_created: conceptsCreated, members_demoted: membersDemoted,
+    applied, rejected: [], weave: weaveResult,
+  };
+}
+
+// ---- CHRONICLES: caller-judged temporal consolidation ----------------------
+const CHRONICLE_RESOLUTIONS = ["day", "week", "month", "quarter", "year"];
+const CHRONICLE_CHANGE_KINDS = new Set(["continuity", "introduced", "changed", "resolved", "reversed", "completed"]);
+const dayMs = 86400000;
+const isoDay = (v) => {
+  const d = new Date(v);
+  return Number.isFinite(d.getTime()) ? d.toISOString().slice(0, 10) : null;
+};
+const addUtcDays = (day, count) => new Date(Date.parse(`${day}T00:00:00Z`) + count * dayMs).toISOString().slice(0, 10);
+function chronicleBounds(resolution, day) {
+  const d = new Date(`${day}T00:00:00Z`);
+  if (!Number.isFinite(d.getTime())) return null;
+  if (resolution === "day") return { start: day, end: day };
+  if (resolution === "week") {
+    const mondayOffset = (d.getUTCDay() + 6) % 7;
+    const start = addUtcDays(day, -mondayOffset);
+    return { start, end: addUtcDays(start, 6) };
+  }
+  if (resolution === "month") {
+    const y = d.getUTCFullYear(), m = d.getUTCMonth();
+    const start = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10);
+    const end = new Date(Date.UTC(y, m + 1, 0)).toISOString().slice(0, 10);
+    return { start, end };
+  }
+  if (resolution === "quarter") {
+    const y = d.getUTCFullYear(), q = Math.floor(d.getUTCMonth() / 3);
+    const start = new Date(Date.UTC(y, q * 3, 1)).toISOString().slice(0, 10);
+    const end = new Date(Date.UTC(y, q * 3 + 3, 0)).toISOString().slice(0, 10);
+    return { start, end };
+  }
+  if (resolution === "year") {
+    const y = d.getUTCFullYear();
+    return { start: `${y}-01-01`, end: `${y}-12-31` };
+  }
+  return null;
+}
+function latestChronicleRows(db, resolution, start, end) {
+  return db.prepare(`
+    SELECT n.signature sig,
+      CASE WHEN instr(n.fact,char(10))>0 THEN substr(n.fact,1,instr(n.fact,char(10))-1) ELSE n.fact END fact,
+      n.notes,n.first_seen,c.*
+    FROM chronicles c JOIN nodes n ON n.signature=c.node_sig
+    WHERE c.resolution=? AND c.period_start>=? AND c.period_end<=?
+      AND c.version=(
+        SELECT max(c2.version) FROM chronicles c2
+        WHERE c2.resolution=c.resolution
+          AND c2.period_start=c.period_start
+          AND c2.period_end=c.period_end
+      )
+    ORDER BY c.period_start,c.period_end
+  `).all(resolution, start, end);
+}
+function chronicleEntitiesForMembers(db, rows) {
+  const bySig = new Map(rows.map((row) => [row.sig, []]));
+  const load = (sigs, sql, sigCol, entityCol) => {
+    for (let i = 0; i < sigs.length; i += 500) {
+      const chunk = sigs.slice(i, i + 500);
+      const found = db.prepare(sql.replace("/*SIGS*/", chunk.map(() => "?").join(","))).all(...chunk);
+      for (const row of found) {
+        if (!bySig.has(row[sigCol])) bySig.set(row[sigCol], []);
+        bySig.get(row[sigCol]).push(row[entityCol]);
+      }
+    }
+  };
+  load(
+    rows.filter((row) => row.memberKind === "fact").map((row) => row.sig),
+    "SELECT src,dst FROM edges WHERE rel='mentions' AND src IN (/*SIGS*/) ORDER BY src,dst",
+    "src",
+    "dst"
+  );
+  load(
+    rows.filter((row) => row.memberKind === "chronicle").map((row) => row.sig),
+    `SELECT DISTINCT ce.chronicle_sig,ce.entity_sig
+     FROM chronicle_entry_entities ce JOIN nodes n ON n.signature=ce.entity_sig AND n.kind='entity'
+     WHERE ce.chronicle_sig IN (/*SIGS*/) ORDER BY ce.chronicle_sig,ce.entity_sig`,
+    "chronicle_sig",
+    "entity_sig"
+  );
+  return bySig;
+}
+function chronicleCandidates(db, opts = {}) {
+  const asOf = isoDay(opts.asOf || new Date().toISOString());
+  if (!asOf) return [];
+  const maxCandidates = Math.max(1, Number(opts.maxCandidates) || 32);
+  const periods = [];
+  const sourceDays = db.prepare(`
+    SELECT DISTINCT source_day day
+    FROM nodes
+    WHERE kind='fact' AND source_day IS NOT NULL AND source_day<=?
+      AND coalesce(notes,'')<>'gist'
+    ORDER BY source_day
+  `).all(asOf).map((r) => r.day);
+  for (const day of sourceDays) periods.push({ resolution: "day", ...chronicleBounds("day", day) });
+  for (const resolution of ["week", "month", "quarter", "year"]) {
+    const seen = new Set();
+    for (const day of sourceDays) {
+      const bounds = chronicleBounds(resolution, day);
+      if (!bounds || bounds.end > asOf) continue;
+      const key = `${resolution}:${bounds.start}`;
+      if (!seen.has(key)) { seen.add(key); periods.push({ resolution, ...bounds }); }
+    }
+  }
+  const candidates = [];
+  for (const period of periods.sort((a, b) => a.end.localeCompare(b.end)
+    || CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution))) {
+    let rows;
+    if (period.resolution === "day") {
+      rows = db.prepare(`
+        SELECT signature sig,fact,source_day sourceDay,dirty_seq coverageSeq,'fact' memberKind
+        FROM nodes
+        WHERE kind='fact' AND source_day=?
+          AND coalesce(notes,'')<>'gist' AND fact IS NOT NULL AND trim(fact)<>''
+        ORDER BY first_seen,signature
+      `).all(period.start);
+    } else {
+      const childResolution = period.resolution === "week" || period.resolution === "month"
+        ? "day"
+        : (period.resolution === "quarter" ? "month" : "quarter");
+      rows = latestChronicleRows(db, childResolution, period.start, period.end).map((r) => ({
+        sig: r.sig,
+        fact: r.fact,
+        sourceDay: null,
+        periodStart: r.period_start,
+        periodEnd: r.period_end,
+        coverageSeq: Number(r.coverage_seq) || 0,
+        memberKind: "chronicle",
+      }));
+    }
+    if (!rows.length) continue;
+    const coverageSeq = Math.max(0, ...rows.map((r) => Number(r.coverageSeq) || 0));
+    const current = db.prepare(`
+      SELECT max(version) version,max(coverage_seq) coverage_seq
+      FROM chronicles WHERE resolution=? AND period_start=? AND period_end=?
+    `).get(period.resolution, period.start, period.end);
+    if (current && Number(current.version) > 0 && Number(current.coverage_seq) >= coverageSeq) continue;
+    const entitiesBySig = chronicleEntitiesForMembers(db, rows);
+    const members = rows.map((r) => ({
+      sig: r.sig,
+      kind: r.memberKind,
+      fact: r.fact,
+      sourceDay: r.sourceDay || null,
+      periodStart: r.periodStart || null,
+      periodEnd: r.periodEnd || null,
+      entitySigs: entitiesBySig.get(r.sig) || [],
+    }));
+    candidates.push({
+      periodId: `${period.resolution}:${period.start}:${period.end}`,
+      resolution: period.resolution,
+      periodStart: period.start,
+      periodEnd: period.end,
+      nextVersion: (Number(current && current.version) || 0) + 1,
+      coverageSeq,
+      members,
+    });
+    if (candidates.length >= maxCandidates) break;
+  }
+  return candidates;
+}
+function reportChronicles(db, opts = {}) {
+  const candidates = chronicleCandidates(db, opts);
+  const basisSeq = maxDirtySeq(db);
+  const identity = {
+    basisSeq,
+    candidates: candidates.map((c) => ({
+      periodId: c.periodId,
+      nextVersion: c.nextVersion,
+      coverageSeq: c.coverageSeq,
+      memberSigs: c.members.map((m) => m.sig),
+      entitySigs: [...new Set(c.members.flatMap((m) => m.entitySigs || []))].sort(),
+    })),
+  };
+  const reportId = crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return { surface: "chronicles", report_id: reportId, basis_seq: basisSeq, candidates };
+}
+function normalizeChronicleInput(raw) {
+  if (!raw || typeof raw !== "object") return { reportId: "", decisions: null };
+  return {
+    reportId: typeof raw.report_id === "string" ? raw.report_id : "",
+    decisions: Array.isArray(raw.decisions) ? raw.decisions : null,
+  };
+}
+function validateChronicleDecisions(db, raw, candidates) {
+  if (!Array.isArray(raw)) return { decisions: [], rejected: [{ index: null, reason: "malformed_decision_file" }] };
+  const byPeriod = new Map(candidates.map((c) => [c.periodId, c]));
+  const seen = new Set();
+  const accepted = new Set();
+  const decisions = [];
+  const rejected = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const dec = raw[index];
+    if (dec == null) continue;
+    if (!dec || typeof dec !== "object" || typeof dec.periodId !== "string" || typeof dec.summary !== "string"
+      || dec.summary.trim().length < 8 || !Array.isArray(dec.entries)) {
+      rejected.push({ index, reason: "malformed_decision" }); continue;
+    }
+    const cand = byPeriod.get(dec.periodId);
+    if (!cand) { rejected.push({ index, reason: "period_not_in_report", periodId: dec.periodId }); continue; }
+    if (seen.has(dec.periodId)) { rejected.push({ index, reason: "duplicate_period", periodId: dec.periodId }); continue; }
+    seen.add(dec.periodId);
+    const validMembers = new Set(cand.members.map((m) => m.sig));
+    const candidateEntities = [...new Set(cand.members.flatMap((m) => m.entitySigs || []))];
+    const allowedEntities = new Set();
+    for (let i = 0; i < candidateEntities.length; i += 500) {
+      const chunk = candidateEntities.slice(i, i + 500);
+      for (const row of db.prepare(`
+        SELECT signature FROM nodes
+        WHERE kind='entity' AND signature IN (${chunk.map(() => "?").join(",")})
+      `).all(...chunk)) allowedEntities.add(row.signature);
+    }
+    const covered = new Set();
+    const entries = [];
+    let malformed = false;
+    for (const entry of dec.entries) {
+      if (!entry || typeof entry.slot !== "string" || !entry.slot.trim()
+        || typeof entry.summary !== "string" || entry.summary.trim().length < 4
+        || typeof entry.changeKind !== "string" || !CHRONICLE_CHANGE_KINDS.has(entry.changeKind)
+        || !Array.isArray(entry.evidenceSigs)) { malformed = true; break; }
+      const evidenceSigs = [...new Set(entry.evidenceSigs)];
+      if (!evidenceSigs.length || evidenceSigs.some((sig) => !validMembers.has(sig))) { malformed = true; break; }
+      evidenceSigs.forEach((sig) => covered.add(sig));
+      const entitySigs = [...new Set(Array.isArray(entry.entitySigs) ? entry.entitySigs : [])];
+      if (entitySigs.some((sig) => !allowedEntities.has(sig))) { malformed = true; break; }
+      entries.push({
+        slot: entry.slot.trim(),
+        summary: entry.summary.trim(),
+        changeKind: entry.changeKind,
+        stateLabel: typeof entry.stateLabel === "string" ? entry.stateLabel.trim().slice(0, 80) : "",
+        aspect: typeof entry.aspect === "string" ? entry.aspect.trim().slice(0, 120) : "",
+        entitySigs,
+        evidenceSigs,
+      });
+    }
+    if (malformed || !entries.length) { rejected.push({ index, reason: "invalid_entries", periodId: dec.periodId }); continue; }
+    const missing = [...validMembers].filter((sig) => !covered.has(sig));
+    if (missing.length) { rejected.push({ index, reason: "incomplete_coverage", periodId: dec.periodId, missing }); continue; }
+    decisions.push({ candidate: cand, summary: dec.summary.trim(), entries });
+    accepted.add(dec.periodId);
+  }
+  for (const candidate of candidates) {
+    if (accepted.has(candidate.periodId) || rejected.some((row) => row.periodId === candidate.periodId)) continue;
+    rejected.push({ index: null, reason: "period_missing", periodId: candidate.periodId });
+  }
+  return { decisions, rejected };
+}
+async function applyChronicles(db, raw, opts = {}) {
+  const input = normalizeChronicleInput(raw);
+  const currentReport = reportChronicles(db, opts);
+  if (input.reportId !== currentReport.report_id) {
+    return {
+      surface: "chronicles", complete: false, reviewed: false, chronicles_created: 0,
+      rejected: [{
+        reason: input.reportId ? "report_stale" : "missing_report_id",
+        expected_report_id: currentReport.report_id,
+        supplied_report_id: input.reportId || null,
+      }],
+    };
+  }
+  const validation = validateChronicleDecisions(db, input.decisions, currentReport.candidates);
+  if (validation.rejected.length) {
+    return { surface: "chronicles", complete: false, reviewed: false, chronicles_created: 0, rejected: validation.rejected };
+  }
+  const prepared = [];
+  for (const dec of validation.decisions) {
+    const text = `${dec.summary}\n${dec.entries.map((e) => `${e.slot}: ${e.summary}`).join("\n")}`;
+    prepared.push({ ...dec, text, vector: toVecBlob(await embedOne(text)) });
+  }
+  const now = opts.asOf ? new Date(opts.asOf).toISOString() : new Date().toISOString();
+  const created = [];
+  db.transaction(() => {
+    for (const dec of prepared) {
+      const c = dec.candidate;
+      const sig = `chronicle:${c.resolution}:${c.periodStart}:v${c.nextVersion}`;
+      const previous = db.prepare(`
+        SELECT n.id,n.signature
+        FROM chronicles ch JOIN nodes n ON n.signature=ch.node_sig
+        WHERE ch.resolution=? AND ch.period_start=? AND ch.period_end=?
+        ORDER BY ch.version DESC LIMIT 1
+      `).get(c.resolution, c.periodStart, c.periodEnd);
+      if (previous) {
+        const blob = storedVecBlob(db, previous.id);
+        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(previous.id));
+        db.prepare("DELETE FROM vec_chronicles WHERE rowid=?").run(BigInt(previous.id));
+        if (blob) {
+          db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(previous.id));
+          db.prepare("INSERT INTO vec_archive(rowid,embedding) VALUES (?,?)").run(BigInt(previous.id), blob);
+          db.prepare("DELETE FROM vec_chronicles_archive WHERE rowid=?").run(BigInt(previous.id));
+          db.prepare("INSERT INTO vec_chronicles_archive(rowid,embedding) VALUES (?,?)").run(BigInt(previous.id), blob);
+        }
+        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(previous.signature, previous.signature);
+        db.prepare("UPDATE nodes SET notes='archive',last_decayed=? WHERE id=?").run(now, previous.id);
+      }
+      const vmax = (table) => {
+        try { return db.prepare(`SELECT COALESCE(MAX(rowid),0)+1 m FROM ${table}`).get().m; } catch { return 0; }
+      };
+      const id = Math.max(
+        nextId(db),
+        vmax("vec_nodes"),
+        vmax("vec_archive"),
+        vmax("vec_chronicles"),
+        vmax("vec_chronicles_archive"),
+      );
+      const memberSigs = c.members.map((m) => m.sig);
+      const evidenceRows = memberSigs.length
+        ? db.prepare(`SELECT strength,salience_score FROM nodes WHERE signature IN (${memberSigs.map(() => "?").join(",")})`).all(...memberSigs)
+        : [];
+      const strength = evidenceRows.reduce((m, r) => Math.max(m, Number(r.strength) || 0), 0.45);
+      const salience = evidenceRows.reduce((m, r) => Math.max(m, Number(r.salience_score) || 0), 0);
+      db.prepare(`
+        INSERT INTO nodes(id,signature,memory_id,kind,class,salience,salience_score,strength,reactivations,
+          first_seen,source_day,last_reactivated,last_decayed,notes,fact,text,temporal_form,memory_family,ingested_seq,dirty_seq)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(id, sig, "", "chronicle", "semantic", "", salience, strength, 0,
+        `${c.periodEnd}T23:59:59.999Z`, null, now, now, "chronicle", dec.summary, dec.text,
+        "period-bound", `timeline:${c.resolution}:${c.periodStart}`, c.coverageSeq, c.coverageSeq);
+      db.prepare("INSERT INTO vec_nodes(rowid,embedding) VALUES (?,?)").run(BigInt(id), dec.vector);
+      db.prepare("INSERT INTO vec_chronicles(rowid,embedding) VALUES (?,?)").run(BigInt(id), dec.vector);
+      db.prepare(`
+        INSERT INTO chronicles(node_sig,resolution,period_start,period_end,version,compression_level,
+          covered_event_count,omitted_event_count,latest_event_day,coverage_seq,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `).run(sig, c.resolution, c.periodStart, c.periodEnd, c.nextVersion,
+        CHRONICLE_RESOLUTIONS.indexOf(c.resolution), c.members.length, 0,
+        c.members.map((m) => m.sourceDay || m.periodEnd || "").filter(Boolean).sort().at(-1) || c.periodEnd,
+        c.coverageSeq, now);
+      dec.entries.forEach((entry, ordinal) => {
+        db.prepare(`
+          INSERT INTO chronicle_entries(chronicle_sig,ordinal,slot_label,summary,change_kind,state_label,aspect)
+          VALUES (?,?,?,?,?,?,?)
+        `).run(sig, ordinal, entry.slot, entry.summary, entry.changeKind, entry.stateLabel || null, entry.aspect || null);
+        for (const entitySig of entry.entitySigs) {
+          db.prepare("INSERT INTO chronicle_entry_entities(chronicle_sig,entry_ordinal,entity_sig) VALUES (?,?,?)")
+            .run(sig, ordinal, entitySig);
+          db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)")
+            .run(sig, "mentions", entitySig, 0.8, now, now);
+        }
+        for (const evidenceSig of entry.evidenceSigs) {
+          db.prepare("INSERT INTO chronicle_evidence(chronicle_sig,entry_ordinal,evidence_sig) VALUES (?,?,?)")
+            .run(sig, ordinal, evidenceSig);
+        }
+      });
+      const priorPeriod = db.prepare(`
+        SELECT ch.node_sig
+        FROM chronicles ch JOIN nodes n ON n.signature=ch.node_sig
+        WHERE ch.resolution=? AND ch.period_end<? AND coalesce(n.notes,'')<>'archive'
+        ORDER BY ch.period_end DESC,ch.version DESC LIMIT 1
+      `).get(c.resolution, c.periodStart);
+      if (priorPeriod) {
+        db.prepare("INSERT OR IGNORE INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,?,?,?,?,?)")
+          .run(priorPeriod.node_sig, "next_period", sig, 0.8, now, now);
+      }
+      created.push(sig);
+    }
+  })();
+  return {
+    surface: "chronicles", complete: true, reviewed: true,
+    decisions: validation.decisions.length, chronicles_created: created.length,
+    created, rejected: [],
+  };
 }
 // ---- CONSOLIDATE (report merge candidates; pressure-aware threshold) --------
 async function consolidate(db, opts) {
@@ -2322,8 +3207,8 @@ async function applyConcept(db, group, opts = {}) {
     const vmax = (t) => { try { return db.prepare(`SELECT COALESCE(MAX(rowid),0)+1 m FROM ${t}`).get().m; } catch { return 0; } };
     const cid = Math.max(nextId(db), vmax("vec_nodes"), vmax("vec_archive"));
     const csig = uniqueSig(db, `fact:${deriveSlug(conceptText)}`);
-    db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
-      VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)`).run(cid, csig, "", "fact", "semantic", "fact", 0.62, conceptFirstSeen, now, now, "gist", conceptText, conceptText, conceptSeq, conceptSeq);
+    db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,source_day,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
+      VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)`).run(cid, csig, "", "fact", "semantic", "fact", 0.62, conceptFirstSeen, null, now, now, "gist", conceptText, conceptText, conceptSeq, conceptSeq);
     db.prepare("INSERT INTO vec_nodes(rowid, embedding) VALUES (?, ?)").run(BigInt(cid), blob);
     for (const m of fresh) {
       // connect the concept to the entity hubs the member mentioned (keeps it non-island +
@@ -2335,6 +3220,9 @@ async function applyConcept(db, group, opts = {}) {
       db.prepare("INSERT OR IGNORE INTO detail_of(detail_sig, gist_sig, first_seen) VALUES (?,?,?)").run(m.signature, csig, now);
       const rid = BigInt(m.id);
       const vblob = storedVecBlob(db, m.id);
+      for (const e of db.prepare("SELECT src,rel,dst,first_seen,last_reinforced FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(m.signature, m.signature)) {
+        preserveEvidenceTransition(db, e.src, e.rel, e.dst, e.first_seen, e.last_reinforced);
+      }
       db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(m.signature, m.signature);
       db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(rid);
       if (vblob) { db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(rid); db.prepare("INSERT INTO vec_archive(rowid, embedding) VALUES (?, ?)").run(rid, vblob); }
@@ -2405,6 +3293,116 @@ function doctor(db) {
       GROUP BY memory_id HAVING count(*) > 1
     )
   `).get().c;
+  const reactivationExampleOverflow = db.prepare(`
+    SELECT count(*) c FROM (
+      SELECT family_key FROM reactivation_examples
+      GROUP BY family_key HAVING count(*) > ?
+    )
+  `).get(REACTIVATION_EXAMPLE_CAP).c;
+  const danglingLandmarks = db.prepare(`
+    SELECT count(*) c FROM gist_landmarks l
+    LEFT JOIN nodes g ON g.signature=l.gist_sig
+    LEFT JOIN nodes e ON e.signature=l.evidence_sig
+    WHERE g.signature IS NULL OR e.signature IS NULL
+  `).get().c;
+  const invalidEvidenceTransitions = db.prepare(`
+    SELECT count(*) c FROM evidence_transitions t
+    LEFT JOIN nodes s ON s.signature=t.src_sig
+    LEFT JOIN nodes d ON d.signature=t.dst_sig
+    WHERE t.src_sig=t.dst_sig OR s.signature IS NULL OR d.signature IS NULL
+  `).get().c;
+  const danglingChronicleEvidence = db.prepare(`
+    SELECT count(*) c FROM chronicle_evidence e
+    LEFT JOIN nodes c ON c.signature=e.chronicle_sig
+    LEFT JOIN chronicle_entries ce ON ce.chronicle_sig=e.chronicle_sig AND ce.ordinal=e.entry_ordinal
+    LEFT JOIN nodes n ON n.signature=e.evidence_sig
+    WHERE c.signature IS NULL OR c.kind<>'chronicle' OR ce.chronicle_sig IS NULL OR n.signature IS NULL
+  `).get().c;
+  const danglingChronicleEntities = db.prepare(`
+    SELECT count(*) c FROM chronicle_entry_entities e
+    LEFT JOIN chronicle_entries ce ON ce.chronicle_sig=e.chronicle_sig AND ce.ordinal=e.entry_ordinal
+    LEFT JOIN nodes n ON n.signature=e.entity_sig AND n.kind='entity'
+    WHERE ce.chronicle_sig IS NULL OR n.signature IS NULL
+  `).get().c;
+  const invalidChronicleMetadata = db.prepare(`
+    SELECT
+      (SELECT count(*) FROM chronicles c LEFT JOIN nodes n ON n.signature=c.node_sig
+       WHERE n.signature IS NULL OR n.kind<>'chronicle')
+      +
+      (SELECT count(*) FROM nodes n LEFT JOIN chronicles c ON c.node_sig=n.signature
+       WHERE n.kind='chronicle' AND c.node_sig IS NULL)
+      +
+      (SELECT count(*) FROM chronicle_entries e LEFT JOIN chronicles c ON c.node_sig=e.chronicle_sig
+       WHERE c.node_sig IS NULL) c
+  `).get().c;
+  const incompleteChronicles = db.prepare(`
+    SELECT count(*) c FROM (
+      SELECT ch.node_sig,ch.covered_event_count,count(DISTINCT e.evidence_sig) covered
+      FROM chronicles ch LEFT JOIN chronicle_evidence e ON e.chronicle_sig=ch.node_sig
+      GROUP BY ch.node_sig,ch.covered_event_count
+      HAVING covered<>ch.covered_event_count
+    )
+  `).get().c;
+  const derivedWithoutEvidence = db.prepare(`
+    SELECT
+      (SELECT count(*) FROM nodes n
+       WHERE n.kind='fact' AND n.notes='gist'
+         AND NOT EXISTS (SELECT 1 FROM gist_landmarks l WHERE l.gist_sig=n.signature)
+         AND NOT EXISTS (SELECT 1 FROM detail_of d WHERE d.gist_sig=n.signature))
+      +
+      (SELECT count(*) FROM nodes n
+       WHERE n.kind='chronicle'
+         AND NOT EXISTS (SELECT 1 FROM chronicle_evidence e WHERE e.chronicle_sig=n.signature)) c
+  `).get().c;
+  const outOfPeriodChronicleEvidence = db.prepare(`
+    SELECT count(*) c
+    FROM chronicle_evidence e
+    JOIN chronicles parent ON parent.node_sig=e.chronicle_sig
+    JOIN nodes n ON n.signature=e.evidence_sig
+    LEFT JOIN chronicles child ON child.node_sig=e.evidence_sig
+    WHERE (n.kind='fact' AND n.source_day IS NOT NULL
+           AND (n.source_day<parent.period_start OR n.source_day>parent.period_end))
+       OR (n.kind='chronicle'
+           AND (child.period_start<parent.period_start OR child.period_end>parent.period_end))
+  `).get().c;
+  const staleActiveChronicleVersions = db.prepare(`
+    SELECT count(*) c
+    FROM chronicles ch JOIN nodes n ON n.signature=ch.node_sig
+    JOIN (
+      SELECT resolution,period_start,period_end,max(version) max_version
+      FROM chronicles GROUP BY resolution,period_start,period_end
+    ) latest ON latest.resolution=ch.resolution AND latest.period_start=ch.period_start
+      AND latest.period_end=ch.period_end
+    WHERE ch.version<latest.max_version AND coalesce(n.notes,'')<>'archive'
+  `).get().c;
+  const chronicleVectorMismatches = db.prepare(`
+    SELECT
+      (SELECT count(*) FROM nodes n LEFT JOIN vec_nodes v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive' AND v.rowid IS NULL)
+      +
+      (SELECT count(*) FROM nodes n JOIN vec_nodes v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND n.notes='archive')
+      +
+      (SELECT count(*) FROM nodes n LEFT JOIN vec_archive v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND n.notes='archive' AND v.rowid IS NULL)
+      +
+      (SELECT count(*) FROM nodes n JOIN vec_archive v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive') c
+  `).get().c;
+  const chronicleDedicatedVectorMismatches = db.prepare(`
+    SELECT
+      (SELECT count(*) FROM nodes n LEFT JOIN vec_chronicles v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive' AND v.rowid IS NULL)
+      +
+      (SELECT count(*) FROM nodes n LEFT JOIN vec_chronicles_archive v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND n.notes='archive' AND v.rowid IS NULL)
+      +
+      (SELECT count(*) FROM nodes n JOIN vec_chronicles v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND n.notes='archive')
+      +
+      (SELECT count(*) FROM nodes n JOIN vec_chronicles_archive v ON v.rowid=n.id
+       WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive') c
+  `).get().c;
   const healthy = islands.length === 0
     && dangling === 0
     && activeMissingVectors === 0
@@ -2413,7 +3411,19 @@ function doctor(db) {
     && orphanArchiveVectors === 0
     && badVectorDimensions === 0
     && duplicateEdges === 0
-    && duplicateMemoryIds === 0;
+    && duplicateMemoryIds === 0
+    && reactivationExampleOverflow === 0
+    && danglingLandmarks === 0
+    && invalidEvidenceTransitions === 0
+    && danglingChronicleEvidence === 0
+    && danglingChronicleEntities === 0
+    && invalidChronicleMetadata === 0
+    && incompleteChronicles === 0
+    && derivedWithoutEvidence === 0
+    && outOfPeriodChronicleEvidence === 0
+    && staleActiveChronicleVersions === 0
+    && chronicleVectorMismatches === 0
+    && chronicleDedicatedVectorMismatches === 0;
   return {
     facts, tier3_archived: archived, entities, edges,
     fact_islands: islands.length, islands: islands.slice(0, 20),
@@ -2425,6 +3435,18 @@ function doctor(db) {
     bad_vector_dimensions: badVectorDimensions,
     duplicate_edges: duplicateEdges,
     duplicate_memory_ids: duplicateMemoryIds,
+    reactivation_example_overflow: reactivationExampleOverflow,
+    dangling_landmarks: danglingLandmarks,
+    invalid_evidence_transitions: invalidEvidenceTransitions,
+    dangling_chronicle_evidence: danglingChronicleEvidence,
+    dangling_chronicle_entities: danglingChronicleEntities,
+    invalid_chronicle_metadata: invalidChronicleMetadata,
+    incomplete_chronicles: incompleteChronicles,
+    derived_without_evidence: derivedWithoutEvidence,
+    out_of_period_chronicle_evidence: outOfPeriodChronicleEvidence,
+    stale_active_chronicle_versions: staleActiveChronicleVersions,
+    chronicle_vector_mismatches: chronicleVectorMismatches,
+    chronicle_dedicated_vector_mismatches: chronicleDedicatedVectorMismatches,
     avg_degree: edges ? Number((degsum / (facts + entities)).toFixed(2)) : 0,
     healthy,
   };
@@ -2482,25 +3504,69 @@ function exportHarness(db, asOf) {
     .sort((a, b) => rank(b) - rank(a) || (b.strength || 0) - (a.strength || 0) || a.signature.localeCompare(b.signature));
   const episodic = facts.filter((n) => !isGist(n))
     .sort((a, b) => (Date.parse(a.first_seen || "") || 0) - (Date.parse(b.first_seen || "") || 0) || a.signature.localeCompare(b.signature));
+  const chronicleRows = db.prepare(`
+    SELECT n.*,c.resolution,c.period_start,c.period_end,c.compression_level
+    FROM nodes n JOIN chronicles c ON c.node_sig=n.signature
+    WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive'
+  `).all();
+  const desiredResolution = (age) => age <= 14 ? "day" : age <= 90 ? "week" : age <= 730 ? "month" : age <= 1460 ? "quarter" : "year";
+  const chronicle = chronicleRows
+    .filter((n) => {
+      const age = Math.max(0, (nowRef.getTime() - Date.parse(`${n.period_end}T23:59:59Z`)) / dayMs);
+      return n.resolution === desiredResolution(age);
+    })
+    .sort((a, b) => (Date.parse(b.period_end || "") || 0) - (Date.parse(a.period_end || "") || 0)
+      || a.signature.localeCompare(b.signature));
+
+  const totalSlots = Math.max(1, ENTRY_MAX - 1);
+  const temporalSlots = chronicle.length ? Math.min(chronicle.length, Math.floor(totalSlots * 0.2)) : 0;
+  const factSlots = totalSlots - temporalSlots;
+  const projectedFacts = [...gist, ...episodic].slice(0, factSlots);
+  const projectedChronicles = chronicle.slice(0, temporalSlots);
 
   const rec = (n, tier) => {
     const d = ageDays(n.first_seen, nowRef);
     const tag = tier === "episodic" ? ageTag(d) : null;
+    const rendered = tier === "gist" ? renderNodeEnvelope(db, n) : (n.fact || "").trim();
     return {
       memory_id: n.memory_id, signature: n.signature,
       category: n.salience || ((Number(n.salience_score) || 0) >= SAL_PROTECT ? "decision" : CLASS2CAT[n.class]) || "fact",
       tier, strength: Number((n.strength || 0).toFixed(3)),
-      first_seen: n.first_seen || null, age: tag,
-      fact: (n.fact || "").trim(),
+      first_seen: tier === "gist" ? null : (n.first_seen || null),
+      source_day: tier === "gist" ? null : (n.source_day || (n.first_seen || "").slice(0, 10) || null),
+      age: tag,
+      fact: rendered,
       // Ready-to-inject line: episodic facts are prefixed with their fuzzy age so the
       // temporal key survives into the host's context; gist facts stay timeless.
-      display: tier === "episodic" ? `[${tag}] ${(n.fact || "").trim()}` : (n.fact || "").trim(),
+      display: tier === "episodic" ? `[${tag}] ${(n.fact || "").trim()}` : rendered,
+    };
+  };
+  const chronicleRec = (n) => {
+    const rendered = renderNodeEnvelope(db, n, { maxEntries: 4, maxSummaryChars: 600, maxEntryChars: 140 });
+    return {
+      memory_id: n.memory_id || "",
+      signature: n.signature,
+      category: "timeline",
+      tier: "chronicle",
+      strength: Number((n.strength || 0).toFixed(3)),
+      first_seen: null,
+      source_day: null,
+      age: null,
+      period_start: n.period_start,
+      period_end: n.period_end,
+      resolution: n.resolution,
+      fact: rendered,
+      display: rendered,
     };
   };
 
   // Gist first (primacy for standing facts), then the episodic timeline in order.
   // The engine-owned anchor memory always leads (channel E).
-  return [anchorRecord(db), ...gist.map((n) => rec(n, "gist")), ...episodic.map((n) => rec(n, "episodic"))];
+  return [
+    anchorRecord(db),
+    ...projectedFacts.map((n) => rec(n, isGist(n) ? "gist" : "episodic")),
+    ...projectedChronicles.map(chronicleRec),
+  ];
 }
 
 function recordProjection(db, file) {
@@ -2651,7 +3717,9 @@ async function main() {
     else if (cmd === "report-merges" || cmd === "consolidate") r = await reportMerges(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
     else if (cmd === "apply-merges") { r = await applyMerges(db, readDecisionFile(flags.file), { asOf: flags["as-of"], sim: Number(flags.sim) || 0 }); gate = r.complete === false; }
     else if (cmd === "report-synthesis") r = reportSynthesis(db, { asOf: flags["as-of"] });
-    else if (cmd === "apply-synthesis") r = await applySynthesis(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "apply-synthesis") { r = await applySynthesis(db, readDecisionFile(flags.file), { asOf: flags["as-of"] }); gate = r.complete === false; }
+    else if (cmd === "report-chronicles") r = reportChronicles(db, { asOf: flags["as-of"] });
+    else if (cmd === "apply-chronicles") { r = await applyChronicles(db, readDecisionFile(flags.file), { asOf: flags["as-of"] }); gate = r.complete === false; }
     else if (cmd === "apply-concept") { const g = JSON.parse(fs.readFileSync(flags.file, "utf8")); r = await applyConcept(db, g, { asOf: flags["as-of"] }); repairGraph(db); }
     else if (cmd === "budget") r = await budget(db);
     else if (cmd === "doctor") { r = doctor(db); gate = !r.healthy; }
@@ -2660,7 +3728,7 @@ async function main() {
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
     else if (cmd === "config") r = configCmd(process.argv);
-    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|repair-dates|dream|weave|report-entities|apply-entities|report-aliases|apply-aliases|report-merges|apply-merges|report-salience|apply-salience|report-synthesis|apply-synthesis|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
+    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|repair-dates|dream|weave|report-entities|apply-entities|report-aliases|apply-aliases|report-merges|apply-merges|report-salience|apply-salience|report-synthesis|apply-synthesis|report-chronicles|apply-chronicles|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
     console.log(JSON.stringify(r, null, 2));
     if (gate) process.exitCode = 3;
   } finally { db.close(); }
@@ -2669,4 +3737,26 @@ if (require.main === module) {
   main().catch((e) => { console.error("ERROR:", e); process.exit(1); });
 }
 
-module.exports = { emitCandidates, applyConcept, reportEntities, reportAliases, reportMerges, reportSalience, reportSynthesis, applyEntities, applyAliases, applyMerges, applySalience, applySynthesis, repairGraph, dreamCore, doctor, projectEmbeddings3D };
+module.exports = {
+  emitCandidates,
+  emitReactivationCandidates,
+  pendingSemanticSigs,
+  applyConcept,
+  reportEntities,
+  reportAliases,
+  reportMerges,
+  reportSalience,
+  reportSynthesis,
+  reportChronicles,
+  applyEntities,
+  applyAliases,
+  applyMerges,
+  applySalience,
+  applySynthesis,
+  applyChronicles,
+  repairGraph,
+  dreamCore,
+  doctor,
+  exportHarness,
+  projectEmbeddings3D,
+};

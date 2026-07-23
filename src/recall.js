@@ -12,6 +12,8 @@ const { embedOne, toVecBlob } = require("./embed");
 const { ageDays, ageTag } = require("./timeline");
 const cfg = require("../config");
 const langsvc = require("./langsvc");
+const { chronicleMetadata, renderNodeEnvelope } = require("./memory-render");
+const { describeDerived, loadSupersededBy, reserveDerivedEvidence } = require("./derived-memory");
 
 // Resolve the pluggable language service (see langsvc.js). recall.js NEVER
 // hard-codes English temporal parsing, tokenization, or query-shape judgment
@@ -87,30 +89,8 @@ function dot(a, b) {
   return s;
 }
 
-function loadSupersededBy(db, signatures) {
-  const sigs = [...new Set(signatures)].filter(Boolean);
-  const out = new Map();
-  if (!sigs.length) return out;
-  const json = JSON.stringify(sigs);
-  const rows = db.prepare(`
-    SELECT src, dst, first_seen
-    FROM edges
-    WHERE rel='supersedes'
-      AND (
-        src IN (SELECT value FROM json_each(?))
-        OR dst IN (SELECT value FROM json_each(?))
-      )
-  `).all(json, json);
-  for (const e of rows) {
-    const prev = out.get(e.dst);
-    const t = Date.parse(e.first_seen || "") || 0;
-    if (!prev || t >= prev.t) out.set(e.dst, { survivor: e.src, t });
-  }
-  return out;
-}
-
 function parseArgs(argv) {
-  const args = { query: "", maxHops: 2, seedLimit: 4, k: 12, nodeLimit: 80, asOf: "" };
+  const args = { query: "", maxHops: 2, seedLimit: 4, k: 12, nodeLimit: 80, asOf: "", timeline: false };
   for (let i = 2; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--query") args.query = argv[++i] || "";
@@ -119,6 +99,7 @@ function parseArgs(argv) {
     else if (a === "--k") args.k = Number(argv[++i]);
     else if (a === "--node-limit") args.nodeLimit = Number(argv[++i]);
     else if (a === "--as-of") args.asOf = argv[++i] || "";
+    else if (a === "--timeline") args.timeline = true;
     else if (!a.startsWith("--")) args.query += `${args.query ? " " : ""}${a}`;
   }
   args.maxHops = Math.max(1, Math.min(3, args.maxHops || 2));
@@ -308,13 +289,25 @@ async function main() {
       )
       SELECT w.sig AS signature, MIN(w.hops) AS hops,
              COALESCE(n.strength, 0) AS strength, n.class AS class, n.fact AS fact, n.kind AS kind,
-             n.first_seen AS first_seen, n.notes AS notes, n.vagueness AS vagueness
+             n.first_seen AS first_seen, n.source_day AS source_day, n.notes AS notes,
+             n.vagueness AS vagueness, n.temporal_form AS temporal_form,
+             n.memory_family AS memory_family
       FROM walk w LEFT JOIN nodes n ON n.signature = w.sig
       GROUP BY w.sig
       ORDER BY hops ASC, strength DESC, signature ASC
       LIMIT ?
     `).all(seedsJson, args.maxHops, args.maxHops, args.nodeLimit);
   }
+
+  // INVARIANT: chronicles are a SEPARATE temporal axis (out.temporalRoutes / --timeline), they
+  // "never enter semantic fact clustering" (see the temporal route lane below). But the undirected
+  // graph walk above reaches a chronicle node THROUGH its chronicle->evidence edges whenever an
+  // evidence fact is a seed, which would silently readmit a lossy period overview into the default
+  // semantic cluster and displace the single precise dated fact that "what changed / attribution"
+  // questions depend on. Drop chronicle nodes from the walk RESULT here (traversal-through is
+  // preserved, so evidence facts on the far side of a chronicle are still reachable). They re-enter
+  // cluster.nodes ONLY under --timeline via the temporalRoutes append.
+  clusterRows = clusterRows.filter((r) => r.kind !== "chronicle");
 
   // 1b) SEQUENCE-CHAIN EXPANSION. A `sequence` edge records the temporally-ordered evolution of
   // ONE standing statement (built nightly in dream.js). The bounded graph walk above only reaches
@@ -356,6 +349,10 @@ async function main() {
         SELECT e.dst FROM walk JOIN edges e ON e.src=walk.sig WHERE e.rel='sequence'
         UNION
         SELECT e.src FROM walk JOIN edges e ON e.dst=walk.sig WHERE e.rel='sequence'
+        UNION
+        SELECT e.dst_sig FROM walk JOIN evidence_transitions e ON e.src_sig=walk.sig WHERE e.rel='sequence'
+        UNION
+        SELECT e.src_sig FROM walk JOIN evidence_transitions e ON e.dst_sig=walk.sig WHERE e.rel='sequence'
       )
       SELECT sig FROM walk LIMIT ?
     `);
@@ -374,7 +371,8 @@ async function main() {
     if (chainSigs.size) {
       const ph = [...chainSigs].map(() => "?").join(",");
       const rows = db.prepare(
-        `SELECT signature, COALESCE(strength,0) AS strength, class, fact, kind, first_seen, notes, vagueness
+        `SELECT signature, COALESCE(strength,0) AS strength, class, fact, kind, first_seen, source_day,
+                notes, vagueness, temporal_form, memory_family
          FROM nodes WHERE kind='fact' AND signature IN (${ph})`
       ).all(...chainSigs);
       for (const r of rows) if (sharesQueryTopic(r.fact)) clusterRows.push({ ...r, hops: 1, via: "sequence" });
@@ -426,16 +424,14 @@ async function main() {
   for (let i = 0; i < terms.length - 2; i += 1) phrases.push(`${terms[i]} ${terms[i + 1]} ${terms[i + 2]}`);
 
   // 2a) R2 — PARENT-FIRST DETAIL SIDECAR.
-  // A retrieved GIST is an instinct; R2 may drill down to archived atomic details only
-  // when the parent is strong and the detail is genuinely unreachable. These sidecars
-  // are globally budgeted/collapsed so they add dated specifics without flooding or
-  // displacing the primary seed/gist/graph cluster.
+  // A retrieved GIST is a routing index, never final evidence. R2 therefore drills
+  // into both hot detail and cold archive children. Sidecars remain globally
+  // budgeted/collapsed so large families cannot flood the result.
   const enumerative = L.isEnumerativeQuery(args.query);
   const detailBudget = enumerative ? 5 : 4;
   const parentLimit = enumerative ? 5 : 4;
   const seedSet = new Set(seeds);
   const seedRank = new Map(seeds.map((s, i) => [s, i]));
-  const minTermHits = terms.length <= 1 ? 1 : 2;
   const strongGists = clusterRows
     .filter((r) => r.notes && /\bgist\b/.test(r.notes))
     .filter((r) => seedSet.has(r.signature) || (r.hops <= 1 && (r.strength || 0) >= 0.55))
@@ -451,9 +447,10 @@ async function main() {
     try {
       detailStmt = db.prepare(
         `SELECT n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
+                n.source_day AS source_day,
                 n.strength AS strength, n.class AS class, n.notes AS notes
          FROM detail_of d JOIN nodes n ON n.signature = d.detail_sig
-         WHERE d.gist_sig = ? AND n.kind='fact' AND n.notes='archive'`
+         WHERE d.gist_sig = ? AND n.kind='fact' AND n.notes IN ('detail','archive')`
       );
     } catch (e) { detailStmt = null; /* pre-migration DB without detail_of */ }
     if (detailStmt) {
@@ -464,9 +461,6 @@ async function main() {
           const hay = `${L.normalizeForMatch(r.fact)} ${String(r.first_seen || "").toLowerCase()}`;
           const hits = terms.reduce((a, t) => a + (hay.includes(t) ? 1 : 0), 0);
           const ph = phraseHits(hay, phrases);
-          // Tight relevance gate: require a phrase hit or multi-term evidence (unless
-          // enumerative). This keeps broad daily standing-intent atoms out.
-          if (!enumerative && !(ph > 0 || hits >= minTermHits)) continue;
           const cand = {
             ...r,
             hits,
@@ -583,11 +577,11 @@ async function main() {
       try {
         const rows = db.prepare(`
           SELECT n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
-                 n.strength AS strength, n.class AS class
+                 n.source_day AS source_day, n.strength AS strength, n.class AS class
           FROM nodes n
           WHERE n.kind='fact' AND n.notes='archive'
-            AND substr(n.first_seen,1,10) BETWEEN ? AND ?
-          ORDER BY n.first_seen DESC
+            AND coalesce(n.source_day,substr(n.first_seen,1,10)) BETWEEN ? AND ?
+          ORDER BY coalesce(n.source_day,substr(n.first_seen,1,10)) DESC
         `).all(range.lo, range.hi);
         const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows].flatMap((r) => collapseKeys(r.fact, enumerative)));
         const scored = rows.map((r) => {
@@ -627,10 +621,10 @@ async function main() {
       try {
         const rows = db.prepare(`
           SELECT n.id AS id, n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
-                 n.strength AS strength, n.class AS class, n.notes AS notes
+                 n.source_day AS source_day, n.strength AS strength, n.class AS class, n.notes AS notes
           FROM nodes n
-          WHERE n.kind='fact' AND (n.notes IS NULL OR n.notes<>'archive')
-            AND substr(n.first_seen,1,10) BETWEEN ? AND ?
+          WHERE n.kind='fact' AND (n.notes IS NULL OR n.notes NOT IN ('archive','gist'))
+            AND coalesce(n.source_day,substr(n.first_seen,1,10)) BETWEEN ? AND ?
         `).all(range2.lo, range2.hi);
         // Dedup by TEXT only (enumerative=true skips the scope key): the whole point of a
         // date-window pull is to surface the specific dated record even when a scope-mate (e.g.
@@ -728,10 +722,10 @@ async function main() {
   const ANCHOR_COS_FLOOR = 0.30;
   let anchorDayRows = [];
   if (!dateIntent && terms.length) {
-    const dayOf = (fs) => String(fs || "").slice(0, 10);
+    const dayOf = (r) => r.source_day || String(r.first_seen || "").slice(0, 10);
     const isGistRow = (r) => !!(r.notes && /\bgist\b/.test(r.notes));
     const anchorCand = clusterRows
-      .filter((r) => !isGistRow(r) && dayOf(r.first_seen))
+      .filter((r) => !isGistRow(r) && dayOf(r))
       .map((r) => ({ r, cos: cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0 }))
       .sort((a, b) => b.cos - a.cos);
     // The top overall hit being a vagueness-flagged gist is itself a "specifics live elsewhere" signal.
@@ -747,7 +741,7 @@ async function main() {
     if ((specificsIntent || topAnchorIsVagueGist) && anchorCand.length && anchorCand[0].cos >= ANCHOR_COS_FLOOR) {
       const days = [];
       for (const c of anchorCand) {
-        const d = dayOf(c.r.first_seen);
+        const d = dayOf(c.r);
         if (d && !days.includes(d)) days.push(d);
         if (days.length >= 2) break;
       }
@@ -756,10 +750,10 @@ async function main() {
           const dph = days.map(() => "?").join(",");
           const rows = db.prepare(`
             SELECT n.id AS id, n.signature AS signature, n.fact AS fact, n.first_seen AS first_seen,
-                   n.strength AS strength, n.class AS class, n.notes AS notes
+                   n.source_day AS source_day, n.strength AS strength, n.class AS class, n.notes AS notes
             FROM nodes n
-            WHERE n.kind='fact' AND n.notes IN ('detail','gist','harness-ingest')
-              AND substr(n.first_seen,1,10) IN (${dph})
+            WHERE n.kind='fact' AND n.notes IN ('detail','harness-ingest')
+              AND coalesce(n.source_day,substr(n.first_seen,1,10)) IN (${dph})
           `).all(...days);
           const usedKeys = new Set([...detailRows, ...archiveRows, ...archiveVecRows, ...archiveTimeRows, ...activeTimeRows].flatMap((r) => collapseKeys(r.fact, true)));
           const scored = rows.map((r) => {
@@ -801,6 +795,205 @@ async function main() {
     ...anchorDayRows,
   ].map((r) => r.signature));
 
+  const gistEvidenceSpans = new Map();
+  const renderedGists = new Map();
+  try {
+    const spanStmt = db.prepare(`
+      SELECT min(n.source_day) evidence_start, max(n.source_day) evidence_end
+      FROM detail_of d JOIN nodes n ON n.signature=d.detail_sig
+      WHERE d.gist_sig=? AND n.source_day IS NOT NULL
+    `);
+    for (const r of clusterRows.filter((n) => n.notes && /\bgist\b/.test(n.notes))) {
+      const span = spanStmt.get(r.signature);
+      if (span && span.evidence_start) gistEvidenceSpans.set(r.signature, span);
+      renderedGists.set(r.signature, renderNodeEnvelope(db, r));
+    }
+  } catch (e) { /* pre-migration database without source_day/detail_of */ }
+
+  // Independent temporal route lane. Chronicles are embedded first-class nodes,
+  // but they never enter semantic fact clustering. Search them by similarity and
+  // add every chronicle overlapping an explicit query window so a high-scoring
+  // semantic gist cannot hide the relevant period.
+  let temporalRoutes = [];
+  try {
+    const bySig = new Map();
+    const vectorRows = db.prepare(`
+      SELECT n.signature,n.fact,n.kind,n.class,n.strength,n.first_seen,n.notes,
+             n.temporal_form,n.memory_family,c.resolution,c.period_start,c.period_end,
+             c.compression_level,c.covered_event_count,v.distance
+      FROM (SELECT rowid,distance FROM vec_chronicles WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
+      JOIN nodes n ON n.id=v.rowid
+      JOIN chronicles c ON c.node_sig=n.signature
+      WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive'
+      ORDER BY v.distance
+    `).all(qvec, Math.max(args.k * 4, 24));
+    for (const r of vectorRows) bySig.set(r.signature, { ...r, similarity: 1 - r.distance, via: "chronicle_vector" });
+    const archiveVectorRows = db.prepare(`
+      SELECT n.signature,n.fact,n.kind,n.class,n.strength,n.first_seen,n.notes,
+             n.temporal_form,n.memory_family,c.resolution,c.period_start,c.period_end,
+             c.compression_level,c.covered_event_count,v.distance
+      FROM (SELECT rowid,distance FROM vec_chronicles_archive WHERE embedding MATCH ? ORDER BY distance LIMIT ?) v
+      JOIN nodes n ON n.id=v.rowid
+      JOIN chronicles c ON c.node_sig=n.signature
+      JOIN (
+        SELECT resolution,period_start,period_end,max(version) max_version
+        FROM chronicles GROUP BY resolution,period_start,period_end
+      ) latest ON latest.resolution=c.resolution AND latest.period_start=c.period_start
+        AND latest.period_end=c.period_end AND latest.max_version=c.version
+      WHERE n.kind='chronicle' AND n.notes='archive'
+      ORDER BY v.distance
+    `).all(qvec, Math.max(args.k * 2, 12));
+    for (const r of archiveVectorRows) {
+      const similarity = (1 - r.distance) - 0.05;
+      const prev = bySig.get(r.signature);
+      if (!prev || similarity > prev.similarity) bySig.set(r.signature, { ...r, similarity, via: "chronicle_archive_vector" });
+    }
+    if (dateRange) {
+      const overlap = db.prepare(`
+        SELECT n.signature,n.fact,n.kind,n.class,n.strength,n.first_seen,n.notes,
+               n.temporal_form,n.memory_family,c.resolution,c.period_start,c.period_end,
+               c.compression_level,c.covered_event_count
+        FROM chronicles c JOIN nodes n ON n.signature=c.node_sig
+        JOIN (
+          SELECT resolution,period_start,period_end,max(version) max_version
+          FROM chronicles GROUP BY resolution,period_start,period_end
+        ) latest ON latest.resolution=c.resolution AND latest.period_start=c.period_start
+          AND latest.period_end=c.period_end AND latest.max_version=c.version
+        WHERE n.kind='chronicle'
+          AND c.period_start<=? AND c.period_end>=?
+      `).all(dateRange.hi, dateRange.lo);
+      for (const r of overlap) {
+        const prev = bySig.get(r.signature);
+        const floor = r.notes === "archive" ? 0.5 : 0.55;
+        bySig.set(r.signature, {
+          ...r,
+          similarity: Math.max(prev ? prev.similarity : 0, floor),
+          via: r.notes === "archive" ? "chronicle_archive_time" : "chronicle_time",
+        });
+      }
+    }
+    const entryRows = db.prepare(`
+      SELECT n.signature,n.fact,n.kind,n.class,n.strength,n.first_seen,n.notes,
+             n.temporal_form,n.memory_family,c.resolution,c.period_start,c.period_end,
+             c.compression_level,c.covered_event_count,
+             e.slot_label,e.summary entry_summary,e.state_label,e.aspect
+      FROM chronicles c
+      JOIN nodes n ON n.signature=c.node_sig
+      JOIN chronicle_entries e ON e.chronicle_sig=c.node_sig
+      JOIN (
+        SELECT resolution,period_start,period_end,max(version) max_version
+        FROM chronicles GROUP BY resolution,period_start,period_end
+      ) latest ON latest.resolution=c.resolution AND latest.period_start=c.period_start
+        AND latest.period_end=c.period_end AND latest.max_version=c.version
+      WHERE n.kind='chronicle'
+    `).all();
+    for (const r of entryRows) {
+      const text = L.normalizeForMatch([
+        r.slot_label, r.entry_summary, r.state_label, r.aspect,
+      ].filter(Boolean).join(" "));
+      const lexical = terms.reduce((score, term) => {
+        const normalized = L.normalizeForMatch(term);
+        if (!normalized || !text.includes(normalized)) return score;
+        return score + (term.includes("-") || term.includes(" ") ? 6 : (term.length >= 7 ? 1.5 : 1));
+      }, 0);
+      if (lexical < 3) continue;
+      const similarity = 0.45 + Math.min(0.35, lexical * 0.03);
+      const prev = bySig.get(r.signature);
+      if (!prev || similarity > prev.similarity) {
+        bySig.set(r.signature, { ...r, similarity, via: "chronicle_entry_lexical" });
+      }
+    }
+    const routeLimit = Math.max(4, Math.ceil(args.k / 2));
+    const routePool = [...bySig.values()]
+      .map((r) => {
+        const meta = chronicleMetadata(db, r.signature);
+        const activation = (r.similarity || 0) + (dateRange && r.period_start <= dateRange.hi && r.period_end >= dateRange.lo ? 0.2 : 0);
+        return {
+          id: r.signature,
+          kind: "chronicle",
+          class: r.class || "semantic",
+          tier: "chronicle",
+          fact: renderNodeEnvelope(db, r, { maxEntries: 12, maxSummaryChars: 1200, maxEntryChars: 240 }),
+          raw_fact: r.fact,
+          first_seen: null,
+          source_day: null,
+          age_days: null,
+          age: null,
+          temporal_form: "period-bound",
+          memory_family: r.memory_family || `timeline:${r.resolution}:${r.period_start}`,
+          resolution: r.resolution,
+          period_start: r.period_start,
+          period_end: r.period_end,
+          compression_level: r.compression_level,
+          covered_event_count: r.covered_event_count,
+          entries: meta ? meta.entries : [],
+          via: r.via,
+          semantic_similarity: Number((r.similarity || 0).toFixed(4)),
+          activation: Number(activation.toFixed(4)),
+          hops: 0,
+          strength: Number((r.strength || 0).toFixed(4)),
+        };
+      })
+      .sort((a, b) => b.activation - a.activation || b.period_end.localeCompare(a.period_end));
+    if (dateRange) {
+      const selected = [];
+      const selectedIds = new Set();
+      const add = (route) => {
+        if (!route || selectedIds.has(route.id) || selected.length >= routeLimit) return;
+        selectedIds.add(route.id);
+        selected.push(route);
+      };
+      const spanDays = Math.max(1, Math.round((Date.parse(`${dateRange.hi}T00:00:00Z`) - Date.parse(`${dateRange.lo}T00:00:00Z`)) / 86400000) + 1);
+      if (spanDays <= 7) {
+        routePool
+          .filter((route) => route.resolution === "day"
+            && route.period_start >= dateRange.lo && route.period_end <= dateRange.hi)
+          .sort((a, b) => a.period_start.localeCompare(b.period_start))
+          .forEach(add);
+      }
+      const resolutionRank = { day: 0, week: 1, month: 2, quarter: 3, year: 4 };
+      const boundaryRoute = (day) => routePool
+        .filter((route) => route.period_start <= day && route.period_end >= day)
+        .sort((a, b) => (resolutionRank[a.resolution] ?? 9) - (resolutionRank[b.resolution] ?? 9)
+          || b.activation - a.activation)[0];
+      add(boundaryRoute(dateRange.lo));
+      add(boundaryRoute(dateRange.hi));
+      routePool.forEach(add);
+      temporalRoutes = selected;
+    } else {
+      temporalRoutes = routePool.slice(0, routeLimit);
+    }
+  } catch (e) {
+    if (process.env.MEMORY_DEBUG) console.error("chronicle recall:", e);
+    temporalRoutes = [];
+  }
+
+  const selectedDerived = [
+    ...strongGists.map((gist) => {
+      const cosine = cosBySig.has(gist.signature) ? cosBySig.get(gist.signature) : 0;
+      const supersession = supersededBy.get(gist.signature);
+      return describeDerived(db, {
+        ...gist,
+        activation: activationScore(cosine, gist.strength, {
+          dateIntent,
+          histIntent,
+          superseded: !!supersession,
+          dateAdjustment: dateActivationAdjustment(gist.first_seen, dateRange),
+        }),
+      });
+    }),
+    ...temporalRoutes.map((route) => describeDerived(db, route)),
+  ].filter(Boolean);
+  const derivedEvidenceHits = reserveDerivedEvidence(db, selectedDerived, {
+    terms,
+    dateRange,
+    specificsIntent,
+    nowRef,
+    qFloat,
+    k: args.k,
+    L,
+  });
+
   db.close();
 
   // ---- Activation ranking (P11) ------------------------------------------------------------
@@ -835,16 +1028,23 @@ async function main() {
     const sup = supersededBy.get(r.signature);
     const cos = cosBySig.has(r.signature) ? cosBySig.get(r.signature) : 0;
     const isDetail = !!(r.notes && /\bdetail\b/.test(r.notes)) && !lexSeedSet.has(r.signature);
+    const isGist = !!(r.notes && /\bgist\b/.test(r.notes));
+    const span = isGist ? gistEvidenceSpans.get(r.signature) : null;
     const activation = activationOf(cos, r.strength, !!sup, isDetail, r.first_seen);
     return {
       id: r.signature, hops: r.hops, strength: Number(r.strength.toFixed(4)), class: r.class,
-      kind: r.kind, fact: (r.fact || "").trim(),
-      first_seen: r.first_seen || null,
-      age_days: d,
-      age: ageTag(d),
+      kind: r.kind, fact: isGist ? (renderedGists.get(r.signature) || (r.fact || "").trim()) : (r.fact || "").trim(),
+      first_seen: isGist ? null : (r.first_seen || null),
+      source_day: isGist ? null : (r.source_day || String(r.first_seen || "").slice(0, 10) || null),
+      evidence_start: span ? span.evidence_start : undefined,
+      evidence_end: span ? span.evidence_end : undefined,
+      age_days: isGist ? null : d,
+      age: isGist ? null : ageTag(d),
       superseded: !!sup,
       superseded_by: sup ? sup.survivor : null,
-      tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
+      tier: isGist ? "gist" : (r.notes && /\bdetail\b/.test(r.notes)) ? "detail" : "episodic",
+      temporal_form: isGist ? (r.temporal_form || "atemporal") : undefined,
+      memory_family: isGist ? (r.memory_family || r.signature) : undefined,
       vagueness: (r.notes && /\bgist\b/.test(r.notes) && r.vagueness != null) ? Number(r.vagueness.toFixed(3)) : undefined,
       via: r.via || (lexSeedSet.has(r.signature) ? "lexical" : undefined),
       chain_id: chainIdBySig.has(r.signature) ? chainIdBySig.get(r.signature) : undefined,
@@ -869,7 +1069,7 @@ async function main() {
       activation: Number((r.seed_activation != null ? r.seed_activation : activationScore(1 - r.distance, r.strength, { dateIntent, histIntent })).toFixed(4)),
     })),
     cluster: {
-      nodeCount: clusterRows.length + detailRows.length + archiveRows.length + archiveVecRows.length + archiveTimeRows.length + activeTimeRows.length + anchorDayRows.length,
+      nodeCount: clusterRows.length + detailRows.length + derivedEvidenceHits.length + archiveRows.length + archiveVecRows.length + archiveTimeRows.length + activeTimeRows.length + anchorDayRows.length + temporalRoutes.length,
       edgeCount: clusterEdges.length,
       nodes: activeNodes.concat(detailRows.map((r) => {
         // R2 detail constituent reached via the durable gist->detail pointer only after
@@ -881,17 +1081,17 @@ async function main() {
         return {
           id: r.signature, hops: 1, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
           kind: "fact", fact: (r.fact || "").trim(),
-          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          first_seen: r.first_seen || null, source_day: r.source_day || String(r.first_seen || "").slice(0, 10) || null, age_days: d, age: ageTag(d),
           superseded: !!sup, superseded_by: sup ? sup.survivor : null,
           tier: archived ? "archive_detail" : "detail", archived, via: "detail_of", parent: r.parent,
         };
-      })).concat(archiveRows.map((r) => {
+      })).concat(derivedEvidenceHits).concat(archiveRows.map((r) => {
         const d = ageDays(r.first_seen, nowRef);
         const sup = supersededBy.get(r.signature);
         return {
           id: r.signature, hops: 99, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
           kind: "fact", fact: (r.fact || "").trim(),
-          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          first_seen: r.first_seen || null, source_day: r.source_day || String(r.first_seen || "").slice(0, 10) || null, age_days: d, age: ageTag(d),
           superseded: !!sup, superseded_by: sup ? sup.survivor : null, tier: "archive",
         };
       })).concat(archiveVecRows.map((r) => {
@@ -903,7 +1103,7 @@ async function main() {
         return {
           id: r.signature, hops: 99, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
           kind: "fact", fact: (r.fact || "").trim(),
-          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          first_seen: r.first_seen || null, source_day: r.source_day || String(r.first_seen || "").slice(0, 10) || null, age_days: d, age: ageTag(d),
           superseded: !!sup, superseded_by: sup ? sup.survivor : null, tier: "archive", via: "archive_vec",
           avsim: Number((r.sim || 0).toFixed(4)),
         };
@@ -914,7 +1114,7 @@ async function main() {
         return {
           id: r.signature, hops: 99, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
           kind: "fact", fact: (r.fact || "").trim(),
-          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          first_seen: r.first_seen || null, source_day: r.source_day || String(r.first_seen || "").slice(0, 10) || null, age_days: d, age: ageTag(d),
           superseded: !!sup, superseded_by: sup ? sup.survivor : null, tier: "archive", via: "archive_time",
         };
       })).concat(activeTimeRows.map((r) => {
@@ -927,7 +1127,7 @@ async function main() {
         return {
           id: r.signature, hops: 1, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
           kind: "fact", fact: (r.fact || "").trim(),
-          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          first_seen: r.first_seen || null, source_day: r.source_day || String(r.first_seen || "").slice(0, 10) || null, age_days: d, age: ageTag(d),
           superseded: !!sup, superseded_by: sup ? sup.survivor : null,
           tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : "detail",
           via: "active_time",
@@ -945,7 +1145,7 @@ async function main() {
         return {
           id: r.signature, hops: 1, strength: Number((r.strength || 0).toFixed(4)), class: r.class,
           kind: "fact", fact: (r.fact || "").trim(),
-          first_seen: r.first_seen || null, age_days: d, age: ageTag(d),
+          first_seen: r.first_seen || null, source_day: r.source_day || String(r.first_seen || "").slice(0, 10) || null, age_days: d, age: ageTag(d),
           superseded: !!sup, superseded_by: sup ? sup.survivor : null,
           tier: (r.notes && /\bgist\b/.test(r.notes)) ? "gist" : "detail",
           via: "anchor_day",
@@ -961,11 +1161,58 @@ async function main() {
   // ordinary active graph nodes. Appending them after archive rows defeats their
   // bounded date bonus and can make the exact on-date record invisible to consumers
   // that preserve engine order.
+  const authorityOrder = (node) => {
+    if (node.via === "active_time") return 3;
+    if (node.via === "derived_evidence" && node._derivedGuaranteed) return 2;
+    return node.via === "derived_evidence" ? 1 : 0;
+  };
   const rankedActive = out.cluster.nodes
     .filter((n) => Number.isFinite(n.activation))
-    .sort((a, b) => (b.activation - a.activation) || (a.hops - b.hops) || String(a.id).localeCompare(String(b.id)));
+    .sort((a, b) => {
+      if ((a.via === "active_time" && b.via === "derived_evidence")
+        || (a.via === "derived_evidence" && b.via === "active_time")) {
+        return authorityOrder(b) - authorityOrder(a);
+      }
+      return (b.activation - a.activation) || (a.hops - b.hops) || String(a.id).localeCompare(String(b.id));
+    });
   const unranked = out.cluster.nodes.filter((n) => !Number.isFinite(n.activation));
-  out.cluster.nodes = [...rankedActive, ...unranked];
+  // Chronicles are a SEPARATE, opt-in temporal axis (mirror of the eval adapter's
+  // memory_search vs memory_timeline split). A lossy period overview merged into the
+  // default semantic cluster displaces the single precise dated fact that attribution /
+  // "what changed" questions depend on. So chronicles enter cluster.nodes ONLY under
+  // --timeline (the caller LLM's explicit temporal route); plain semantic recall stays
+  // chronicle-free. Chronicle overviews still reach the caller via the always-emitted
+  // out.temporalRoutes bucket and via the Tier-1 flat projection (export-harness), so
+  // nothing is lost — the caller re-issues recall with --timeline to drill into a period.
+  out.cluster.nodes = args.timeline
+    ? [...rankedActive, ...unranked, ...temporalRoutes]
+    : [...rankedActive, ...unranked];
+  out.semanticHits = rankedActive.filter((n) => n.tier === "gist").slice(0, Math.max(4, Math.ceil(args.k / 2)));
+  out.temporalRoutes = temporalRoutes;
+  const evidenceById = new Map();
+  for (const n of [...derivedEvidenceHits, ...rankedActive, ...unranked]) {
+    if (n.kind !== "fact" || n.tier === "gist") continue;
+    const evidenceKey = n.via === "derived_evidence" ? `${n.id}\u0000${n.parent}` : n.id;
+    const prior = evidenceById.get(evidenceKey);
+    if (!prior
+      || authorityOrder(n) > authorityOrder(prior)
+      || (authorityOrder(n) === authorityOrder(prior)
+        && (Number(n.activation) || 0) > (Number(prior.activation) || 0))) {
+      evidenceById.set(evidenceKey, n);
+    }
+  }
+  const evidenceValues = [...evidenceById.values()];
+  const reservedEvidenceSlots = evidenceValues.filter((n) =>
+    n.via === "active_time" || n.via === "derived_evidence").length;
+  out.evidenceHits = evidenceValues
+    .sort((a, b) => {
+      const authority = authorityOrder(b) - authorityOrder(a);
+      if (authority) return authority;
+      const av = Number.isFinite(a.activation) ? a.activation : (a.via === "detail_of" ? 0.45 : 0.3);
+      const bv = Number.isFinite(b.activation) ? b.activation : (b.via === "detail_of" ? 0.45 : 0.3);
+      return bv - av || String(b.source_day || b.first_seen || "").localeCompare(String(a.source_day || a.first_seen || ""));
+    })
+    .slice(0, Math.max(6, args.k, reservedEvidenceSlots));
 
   console.log(JSON.stringify(out, null, 2));
 }

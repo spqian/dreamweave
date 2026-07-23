@@ -95,6 +95,15 @@ active graph, but nothing is truly forgotten.
    (factual −0.6 n=73, synthesis −0.8 n=19). Temporal info rides as metadata, not as a
    reordering of the retrieval result.
 
+6a. **Chronology is a parallel retrieval axis, not a timestamp on a gist.** Immutable
+   dated episodes remain authoritative evidence; semantic gists answer what a memory
+   family means; `chronicle` nodes summarize what happened in fixed calendar windows.
+   Day → week → month → quarter → year chronicles become progressively lossy, retain
+   complete evidence manifests, and archive fine resolutions only after a covering
+   coarser view exists. Recall exposes independent semantic, temporal-route, and exact-
+   evidence lanes. Explicit-date lookup may recover archived fine chronicles and
+   recursively expand them to verbatim evidence.
+
 7. **No fabrication.** Consolidation/canonicalization may only assert what existing
    memories entail. The LLM judge decides types/aliases/merges/importance — it is a
    judge, not an author. Merge judgment is bound to the exact deterministic report via
@@ -226,7 +235,7 @@ active graph, but nothing is truly forgotten.
     ("what was on file by 2026-01-14", "how did X evolve May 27–29") names a *time*, and the
     answer is often a specific active record whose exact-date snapshot carries *lower* cosine
     than the abstract gist that paraphrases it — so pure vector-KNN never reaches it. When the
-    query bears explicit date intent, recall pulls active facts whose `first_seen` falls in the
+    query bears explicit date intent, recall pulls verbatim facts whose `source_day` falls in the
     window (term-gated, bounded, text-deduped so distinct dated records survive scope-collapse)
     and scores them by cosine + a bounded date bonus, so the on-date record surfaces. This is
     *reconstructive temporal navigation entered from the semantic anchor* — it fires ONLY on
@@ -234,16 +243,19 @@ active graph, but nothing is truly forgotten.
     Combined with the cold-bookshelf time-window tier, this is how "I've seen this on that date"
     recall works without a calendar subsystem.
 
-11. **Event time and processing time are different clocks.** `first_seen` records when the
-    remembered event occurred and must remain stable for timeline recall. Incremental eligibility
-    uses engine-owned monotonic revisions (`change_seq`, `ingested_seq`, `dirty_seq`) and stage
-    cursors (`last_*_seq`). A backdated fact ingested today is old in the timeline but new work for
-    every maintenance stage. Never use `first_seen` as a processing watermark.
+11. **Source provenance and processing time are different clocks.** Verbatim episodic/detail
+    traces may carry day-level `source_day`; gists do not. Incremental eligibility uses engine-owned
+    monotonic revisions (`change_seq`, `ingested_seq`, `dirty_seq`) and stage cursors
+    (`last_*_seq`). A backdated fact ingested today is old evidence but new maintenance work.
 
 12. **Salience is continuous importance, not a durability class.** Every harness fact enters
     `class='episodic'`; reactivation may earn `class='semantic'`. Only the nightly caller-judged
     salience surface sets `salience_score ∈ [0,1]`, which continuously extends half-life and marks
     scores ≥0.5 for protection/display. The engine never creates `class='salient'`.
+
+13. **A gist is a timeless routing index, not source evidence.** Recall may use a gist to find
+    a family, but exact dates, numbers, attribution, sequence, and exhaustive lists must come from
+    its retained `detail`/`archive` traces. Any gist evidence span is derived from those children.
 
 Single optimal path: recall features are unconditional — no env feature-flags gate real
 behavior (they are wired on, tuned by validated in-code constants). Only the durable

@@ -82,11 +82,14 @@ function runRecall(query, asOf) {
   // ISO first_seen (so the keyword tier can't catch it) — only parseDateRange + tier 2d can. ----
   const a = runRecall("what happened in late June", "2026-06-30");
   const aTime = a.cluster.nodes.filter((n) => n.via === "archive_time");
-  const aOn26 = aTime.filter((n) => (n.first_seen || "").startsWith("2026-06-26"));
+  const aOn26 = a.cluster.nodes.filter((n) =>
+    (n.first_seen || "").startsWith("2026-06-26")
+    && (n.tier === "archive" || n.tier === "archive_detail")
+  );
   const inWindow = (d) => d >= "2026-06-21" && d <= "2026-06-30";
   console.log(`(A) NL-date query -> archive_time rows: ${aTime.length} [${aTime.map((n) => n.id + "@" + n.first_seen).join(", ")}]`);
   if (aTime.length === 0) fail("(A) time-window tier returned nothing for an NL-date query");
-  if (aOn26.length === 0) fail("(A) no archived fact dated 2026-06-26 was recalled by the time tier");
+  if (aOn26.length === 0) fail("(A) no archived fact dated 2026-06-26 was recalled");
   if (aTime.some((n) => !inWindow((n.first_seen || "").slice(0, 10)))) fail("(A) time tier returned a fact OUTSIDE the late-June window");
   if (aTime.some((n) => n.id === "fact:ppvnet-m5")) fail("(A) out-of-window May fact (m5) leaked into the time tier");
 

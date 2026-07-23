@@ -8,19 +8,21 @@
 const Database = require("better-sqlite3");
 const sqliteVec = require("sqlite-vec");
 const cfg = require("../config");
+const { renderNodeEnvelope } = require("./memory-render");
 
 const includeArchive = process.argv.includes("--include-archive");
 const where = includeArchive
-  ? "kind='fact' AND fact IS NOT NULL AND TRIM(fact)<>''"
-  : "kind='fact' AND (notes IS NULL OR notes<>'archive') AND fact IS NOT NULL AND TRIM(fact)<>''";
+  ? "kind IN ('fact','chronicle') AND fact IS NOT NULL AND TRIM(fact)<>''"
+  : "kind IN ('fact','chronicle') AND (notes IS NULL OR notes<>'archive') AND fact IS NOT NULL AND TRIM(fact)<>''";
 
 const db = new Database(cfg.DB_PATH, { readonly: true });
 try { sqliteVec.load(db); } catch { /* vec not needed for this read */ }
 const rows = db
   .prepare(
-    "SELECT signature, fact, class, salience, notes, first_seen, vagueness FROM nodes WHERE " +
+    "SELECT signature, fact, kind, class, salience, notes, source_day, first_seen, vagueness, temporal_form, memory_family FROM nodes WHERE " +
       where + " ORDER BY first_seen ASC"
   )
-  .all();
+  .all()
+  .map((row) => ({ ...row, raw_fact: row.fact, fact: renderNodeEnvelope(db, row) }));
 process.stdout.write(JSON.stringify(rows));
 db.close();

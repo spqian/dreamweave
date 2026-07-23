@@ -176,10 +176,11 @@ the SURFACE assert importance, and it modelled importance as a one-bit category 
 
 ### P12. SALIENCE IS IMPORTANCE, NOT FREQUENCY, NOT AFFECT — and it is EARNED ONLY AT DREAM TIME.
 Neuroscience frames three DISTINCT axes; the engine must not conflate them:
-- **Durability** (how well-learned): built by repetition/reactivation. This is ACT-R base-level activation
-  and the episodic→semantic promotion path (dream.js reactivation loop). *Frequency ≠ importance* — a fact
-  re-cued every night is well-LEARNED, not necessarily IMPORTANT. Reactivation therefore MUST NOT feed the
-  salience score (folding it back in re-creates the hub-entity pinning bug that kept open loops alive).
+- **Durability** (how well-learned): repetition/reactivation is ACT-R base-level evidence that a semantic
+  pattern may exist, but the verbatim episode is not itself the learned meaning. Threshold-crossing
+  recurrence families are reviewed by the caller during synthesis; the caller-extracted invariant becomes
+  the semantic gist while exact episodes remain recallable detail. *Frequency ≠ importance* — recurrence
+  MUST NOT feed salience, and generic shared-hub recurrence may be rejected rather than generalized.
 - **Importance** (how much it matters): the salience-network relevance filter — anterior insula + dACC gate
   which events get consolidation resources (Seeley et al. 2007, PMID 17329432; Menon & Uddin 2010,
   PMID 20512370). It is driven by **material stakes/consequence** (S2) and **novelty/contradiction/update**
@@ -217,3 +218,32 @@ context needed for S3 (nearest prior fact / supersede relation). The external LL
 and returns `{ salient: [{sig, score}], downgrade: [sig] }`. `apply-salience` stores the score, modulates
 half-life, enforces the ranked cap, runs the spotlight pass, and applies downgrades — all mechanical. Legacy
 `{ salientSigs: [...] }` decisions remain accepted (treated as max score) so no caller breaks.
+
+### P13. A GIST IS A TIMELESS INDEX; THE EPISODE IS THE EVIDENCE.
+Temporal memory is reconstructive: order, event boundaries, and contextual similarity recover *when*;
+a semantic abstraction does not inherit one constituent's objective timestamp. Therefore a gist may orient
+attention and summarize a family, but it is never authoritative evidence for an exact date, number,
+attribution, sequence, or exhaustive list. Those claims must be grounded in retained episodic/detail traces.
+
+Verbatim traces carry optional day-level `source_day` provenance. A gist carries no source day; its evidence
+span is derived from `detail_of` children and is not a citation. Internal processing/order state
+(`first_seen`, `dirty_seq`, decay/reactivation clocks) remains separate and must never be rendered as a
+gist's source date. Recall expands both hot `detail` and cold `archive` children beside a retrieved gist.
+
+Recurrence evidence follows the same boundedness rule: exact cumulative family/member counters are durable,
+while recent cue examples are write-capped. Persisting every `(new episode, old episode, shared hub)` pair is
+quadratic history without additional semantic value and is prohibited.
+
+### P14. CHRONOLOGY IS CONSOLIDATED IN PARALLEL, AT MULTIPLE RESOLUTIONS.
+Semantic consolidation and temporal consolidation answer different questions. A semantic gist captures
+meaning across related evidence; a chronicle preserves the ordered shape of a fixed calendar period. The
+engine therefore builds day, week, month, quarter, and year chronicles as first-class, caller-judged memories.
+Each version is immutable, every reported source must remain linked through a complete evidence manifest, and
+late evidence invalidates only its ancestor path.
+
+Chronicles become progressively lossy with distance. Recent days remain detailed; older periods are represented
+by weeks, months, quarters, then years. Fine-resolution chronicles leave the active vector skyline only after
+active coarser chronicles cover the same period or all of their child evidence, and their vectors move to the
+cold archive rather than being deleted. An explicit temporal query can still recover an archived fine view and
+recursively expand it to exact episodic/detail evidence. Authority remains:
+`episode/detail/archive > chronicle overview > semantic gist`.

@@ -409,7 +409,7 @@ function isEnumerativeQuery(query) { return ENUMERATIVE_RE.test(query || ""); }
 // Broader "the caller wants drill-down specifics, not a paraphrase" signal (recall.js's
 // dateless anchor-day episode-reconstruction tier). recall.js ORs this with
 // isEnumerativeQuery(), so this only needs to carry the EXTRA phrasing.
-const SPECIFICS_INTENT_RE = /\b(exact|exactly|precise|verbatim|specific|list|which|how\s+many|enumerate|that\s+(session|meeting|day|call|week|conversation)|in\s+that\s+(session|meeting|call))\b/i;
+const SPECIFICS_INTENT_RE = /\b(exact|exactly|precise|verbatim|specific|list|which|what(?:\s+[^\s?]+){0,6}\s+date|when|how\s+many|enumerate|that\s+(session|meeting|day|call|week|conversation)|in\s+that\s+(session|meeting|call))\b/i;
 function isSpecificsIntentQuery(query) { return SPECIFICS_INTENT_RE.test(query || ""); }
 
 // Month names PLUS generic event/incident/update vocabulary that recall.js's active
