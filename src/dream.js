@@ -356,6 +356,12 @@ function removeDependentChronicles(db, evidenceSig) {
 const degreeMap = (db) => {
   const d = new Map();
   for (const e of db.prepare("SELECT src, dst FROM edges").all()) { d.set(e.src, (d.get(e.src) || 0) + 1); d.set(e.dst, (d.get(e.dst) || 0) + 1); }
+  // Derived details remain connected through their authoritative gist lineage even
+  // when they do not need a separate semantic edge.
+  for (const e of db.prepare("SELECT detail_sig, gist_sig FROM detail_of").all()) {
+    d.set(e.detail_sig, (d.get(e.detail_sig) || 0) + 1);
+    d.set(e.gist_sig, (d.get(e.gist_sig) || 0) + 1);
+  }
   return d;
 };
 
@@ -406,7 +412,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=?, source_day=?, dirty_seq=? WHERE id=?");
   const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,source_day,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
         VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)`);
-  const res = { harness_count: mems.length, created: 0, refreshed: 0, backfilled: 0, pruned: 0 };
+  const res = { harness_count: mems.length, created: 0, refreshed: 0, backfilled: 0, demoted: 0, pruned: 0 };
   const harnessIds = new Set(mems.map((m) => m.id || m.memory_id).filter(Boolean));
   let ingestSeq = 0;
   const changedSeq = () => {
@@ -511,24 +517,24 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       res.created += 1;
     }
     if (prune) {
-      // Prune tombstones only TIER-1 PROJECTED facts the harness no longer carries (the user
-      // deleted them). detail/archive rows are db-internal tiers ("demote, don't delete") that
-      // are intentionally absent from the flat harness — a demoted member keeps its old memory_id
-      // (apply-merges does not clear it), so WITHOUT this tier filter prune would delete the very
-      // retained detail the tiering promised to keep. Exclude them.
+      // The db is authoritative and the harness is only a bounded projection. An omitted
+      // Tier-1 row may be a deliberate projection eviction or a stale harness id, so demote
+      // it to cold storage rather than deleting evidence or derived lineage.
       const stale = db.prepare("SELECT id, signature, memory_id FROM nodes WHERE kind='fact' AND memory_id<>'' AND (notes IS NULL OR notes NOT IN ('detail','archive'))").all().filter((n) => !harnessIds.has(n.memory_id));
       for (const n of stale) {
-        removeDependentChronicles(db, n.signature);
-        db.prepare("INSERT INTO tombstones(signature,memory_id,forgotten_at,reason) VALUES (?,?,?,?)").run(n.signature, n.memory_id, now, "pruned: left harness");
-        // Delete the node's EDGES too. Without this, a sequence/supersedes/related_to edge
-        // pointing at this pruned fact is left dangling, and the next repairGraph pass used
-        // to resurrect the endpoint as a blank entity stub (the sequence-edge corruption).
+        for (const e of db.prepare("SELECT src,rel,dst,first_seen,last_reinforced FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(n.signature, n.signature)) {
+          preserveEvidenceTransition(db, e.src, e.rel, e.dst, e.first_seen, e.last_reinforced);
+        }
+        const blob = storedVecBlob(db, n.id);
         db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
         db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
-        db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(n.id));
-        db.prepare("DELETE FROM detail_of WHERE detail_sig=? OR gist_sig=?").run(n.signature, n.signature);
-        db.prepare("DELETE FROM nodes WHERE id=?").run(n.id);
-        res.pruned += 1;
+        if (blob) {
+          db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(n.id));
+          db.prepare("INSERT INTO vec_archive(rowid,embedding) VALUES (?,?)").run(BigInt(n.id), blob);
+        }
+        db.prepare("UPDATE nodes SET memory_id='', notes='archive', last_decayed=?, dirty_seq=? WHERE id=?")
+          .run(now, changedSeq(), n.id);
+        res.demoted += 1;
       }
     }
   });
