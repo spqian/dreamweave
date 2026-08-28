@@ -2815,6 +2815,13 @@ function chronicleEntitiesForMembers(db, rows) {
   );
   return bySig;
 }
+function chronicleMemberSet(db, chronicleSig) {
+  return new Set(db.prepare(`
+    SELECT DISTINCT evidence_sig
+    FROM chronicle_evidence
+    WHERE chronicle_sig=?
+  `).all(chronicleSig).map((row) => row.evidence_sig));
+}
 function chronicleCandidates(db, opts = {}) {
   const asOf = isoDay(opts.asOf || new Date().toISOString());
   if (!asOf) return [];
@@ -2854,17 +2861,15 @@ function chronicleCandidates(db, opts = {}) {
     }
   }
   const candidates = [];
-  const orderedPeriods = periods.sort((a, b) => {
-    if (!resummarize) {
-      const byEnd = b.end.localeCompare(a.end);
-      if (byEnd) return byEnd;
-    } else {
-      const byEnd = a.end.localeCompare(b.end);
-      if (byEnd) return byEnd;
-    }
-    return CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution);
-  });
-  for (const period of orderedPeriods) {
+  const stateByPeriod = new Map();
+  const periodKey = (period) => `${period.resolution}:${period.start}:${period.end}`;
+  // Evaluate fine-to-coarse regardless of presentation order. A parent period is not
+  // settled while any child period still needs work; otherwise a week/month can freeze a
+  // partial child set whose later additions have an older coverage_seq than the parent.
+  const evaluationOrder = [...periods].sort((a, b) =>
+    CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution)
+    || a.start.localeCompare(b.start));
+  for (const period of evaluationOrder) {
     let rows;
     if (period.resolution === "day") {
       rows = db.prepare(`
@@ -2878,6 +2883,14 @@ function chronicleCandidates(db, opts = {}) {
       const childResolution = period.resolution === "week" || period.resolution === "month"
         ? "day"
         : (period.resolution === "quarter" ? "month" : "quarter");
+      const childPeriods = periods.filter((candidate) =>
+        candidate.resolution === childResolution
+        && candidate.start >= period.start
+        && candidate.end <= period.end);
+      if (childPeriods.some((child) => !stateByPeriod.get(periodKey(child))?.settled)) {
+        stateByPeriod.set(periodKey(period), { settled: false });
+        continue;
+      }
       rows = latestChronicleRows(db, childResolution, period.start, period.end).map((r) => ({
         sig: r.sig,
         fact: r.fact,
@@ -2888,16 +2901,33 @@ function chronicleCandidates(db, opts = {}) {
         memberKind: "chronicle",
       }));
     }
-    if (!rows.length) continue;
+    if (!rows.length) {
+      stateByPeriod.set(periodKey(period), { settled: false });
+      continue;
+    }
     const coverageSeq = Math.max(0, ...rows.map((r) => Number(r.coverageSeq) || 0));
     const current = db.prepare(`
-      SELECT max(version) version,max(coverage_seq) coverage_seq,max(created_at) created_at
-      FROM chronicles WHERE resolution=? AND period_start=? AND period_end=?
+      SELECT node_sig,version,coverage_seq,created_at
+      FROM chronicles
+      WHERE resolution=? AND period_start=? AND period_end=?
+      ORDER BY version DESC LIMIT 1
     `).get(period.resolution, period.start, period.end);
-    const covered = current && Number(current.version) > 0 && Number(current.coverage_seq) >= coverageSeq;
+    let membersMatch = true;
+    if (current && period.resolution !== "day") {
+      const coveredMembers = chronicleMemberSet(db, current.node_sig);
+      membersMatch = coveredMembers.size === rows.length
+        && rows.every((row) => coveredMembers.has(row.sig));
+    }
+    const covered = current && Number(current.version) > 0
+      && Number(current.coverage_seq) >= coverageSeq
+      && membersMatch;
     const reopen = (resummarize === "*" || resummarize === period.resolution)
       && (!resummarizeBefore || String((current && current.created_at) || "") < resummarizeBefore);
-    if (covered && !reopen) continue;
+    if (covered && !reopen) {
+      stateByPeriod.set(periodKey(period), { settled: true });
+      continue;
+    }
+    stateByPeriod.set(periodKey(period), { settled: false });
     const entitiesBySig = chronicleEntitiesForMembers(db, rows);
     const members = rows.map((r) => ({
       sig: r.sig,
@@ -2917,9 +2947,36 @@ function chronicleCandidates(db, opts = {}) {
       coverageSeq,
       members,
     });
-    if (candidates.length >= maxCandidates) break;
   }
-  return candidates;
+  if (resummarize) {
+    return candidates
+      .sort((a, b) => a.periodEnd.localeCompare(b.periodEnd)
+        || CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution))
+      .slice(0, maxCandidates);
+  }
+
+  const byRecency = (a, b) => b.periodEnd.localeCompare(a.periodEnd)
+    || CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution);
+  candidates.sort(byRecency);
+  const selected = [];
+  const selectedIds = new Set();
+  const add = (candidate) => {
+    if (!candidate || selected.length >= maxCandidates || selectedIds.has(candidate.periodId)) return;
+    selected.push(candidate);
+    selectedIds.add(candidate.periodId);
+  };
+  add(candidates.find((candidate) => candidate.resolution === "day"));
+  for (const resolution of CHRONICLE_RESOLUTIONS.slice(1)) {
+    add(candidates.find((candidate) => candidate.resolution === resolution));
+  }
+  // Spend the remaining report budget from the oldest backlog forward. Repeated edits to
+  // recent days must not keep occupying every slot and permanently strand older children.
+  for (const candidate of [...candidates].sort((a, b) =>
+    a.periodEnd.localeCompare(b.periodEnd)
+    || CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution))) {
+    add(candidate);
+  }
+  return selected;
 }
 function reportChronicles(db, opts = {}) {
   const candidates = chronicleCandidates(db, opts);
