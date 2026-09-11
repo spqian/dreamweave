@@ -12,6 +12,8 @@
   },
   "scripts": {
     "setup": "node setup.js",
+    "setup:scout": "node harness-adapters/MicrosoftScout/scripts/install-skills.js",
+    "test:hermes": "node harness-adapters/hermes-agent/tests/adapter-snapshot.test.js && python3 -m unittest discover -s harness-adapters/hermes-agent/tests -v",
     "dream": "node src/dream.js dream",
     "recall": "node src/recall.js",
     "doctor": "node src/dream.js doctor",

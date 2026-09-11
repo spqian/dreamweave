@@ -1,6 +1,6 @@
 # dreamweave
 
-**A nightly memory engine for [OpenClaw](https://github.com/openclaw/openclaw)-based agents (including Microsoft Scout / Clawpilot).**
+**A host-independent nightly memory engine with adapters for Microsoft Scout and [Hermes Agent](https://hermes-agent.nousresearch.com/docs/).**
 
 Most agent memory is a flat text file that grows unbounded and gets RAG'd. **dreamweave** is different: your agent *dreams*. A nightly pass **weaves a brain-faithful graph+vector memory** and consolidates it like sleep — a forgetting curve drops noise, duplicates **merge**, and survivors **weave** into one connected graph — across three tiers (instinct / recall / archive). The **recall** path then answers with semantic vector search **plus graph-neighbor expansion**.
 
@@ -57,7 +57,7 @@ graph maintenance, candidate generation, and decision application locally. For j
 regex cannot make, it emits bounded `report-*` JSON; the host agent reads that report and returns
 decision JSON to the matching `apply-*` command.
 
-The caller judges five surfaces in order: entities, aliases, salience, merges, and synthesis.
+The caller judges six surfaces in order: entities, aliases, salience, merges, synthesis, and chronicles.
 The model is a **judge, not an author**: decisions may only type, group, score, or consolidate
 content present in the report. This keeps provider credentials and model choice outside the
 engine and gives the live harness and evaluation harness one shared execution path.
@@ -67,11 +67,12 @@ engine and gives the live harness and evaluation harness one shared execution pa
 ## Architecture (one minute)
 
 - **`memory.db`** (SQLite + `sqlite-vec`) is the durable source of truth and retrieval index.
-- Two node kinds:
+- Three node kinds:
   - **fact** — an atomic memory (`kind='fact'`), carries a forgetting-curve `strength`, **projects
     back to your agent's memory bank**.
   - **entity** — a connector hub (`person:`/`team:`/`system:`/…), no decay, **never projects**;
     pure graph scaffolding that links facts so nothing is an island.
+  - **chronicle** — an evidence-linked account of a day or coarser period, providing a temporal recall axis.
 - A parallel `vec_nodes` (vec0, cosine, 384-dim) holds each node's embedding.
 - The **host agent's memory bank is a disposable nightly projection** of the db. Daytime, the agent
   adds memories normally; the nightly **dream** ingests them, consolidates, and projects the curated
@@ -91,15 +92,16 @@ engine and gives the live harness and evaluation harness one shared execution pa
 
 ## Install
 
-Requirements: **Node ≥ 18** and a toolchain that can build `better-sqlite3` (prebuilt binaries cover
+Requirements: **Node ≥ 20** and a toolchain that can build `better-sqlite3` (prebuilt binaries cover
 most platforms; otherwise you need Python + a C++ compiler).
 
 ### Option A — download a release zip (recommended for users)
 
 Grab the latest `dreamweave-vX.Y.Z.zip` from the [**Releases**](https://github.com/spqian/dreamweave/releases)
-page, unzip it, and tell your OpenClaw/Scout agent to *"import this"* — it detects
-[`INSTALL.md`](INSTALL.md) and runs the whole setup (install deps, create the store, install the
-`dream` + `graph-recall` skills, then interview you on the four behavioral knobs). Or do it by hand:
+page, unzip it, and tell your assistant to *"import this"*. The root
+[`INSTALL.md`](INSTALL.md) first confirms the target harness, then follows its adapter guide.
+Older release zips may predate the Hermes adapter; use a checkout or release containing
+`harness-adapters/hermes-agent/`. Shared engine bootstrap can also be run by hand:
 
 ```bash
 cd dreamweave-vX.Y.Z
@@ -121,12 +123,61 @@ npm run setup
 
 `npm run setup` verifies dependencies, creates the data dir, initializes a fresh `memory.db` with the
 full schema, and warms the embedding model (first run downloads ~90 MB once, then it's cached).
+It does not install host skills automatically. Continue with the selected adapter below.
+
+### Harness adapters
+
+| Target | Installation guide | Integration boundary |
+| --- | --- | --- |
+| Microsoft Scout | [MicrosoftScout/install.md](harness-adapters/MicrosoftScout/install.md) | Scout skill installation and native memory-tool workflow |
+| Hermes Agent | [hermes-agent/install.md](harness-adapters/hermes-agent/install.md) | Profile-local memory transport, skills and checkpointed host-LLM judgment |
+
+The Hermes adapter preserves whole `§`-delimited memory cards, uses stable content-derived
+source IDs, and records a projection manifest so generated summaries are not ingested as
+new observations. Its helper checks report freshness, audited decisions, engine acceptance,
+sync and graph health before publishing the next projection. It **does not contain an LLM
+client**: a normal Hermes agent performs the judgments. Uncertain evidence can be explicitly
+deferred without mutation; bounded backlog is reported rather than called complete.
+
+#### Hermes memory budget: characters, tokens and projected entries
+
+There are separate limits; changing one does not change the others:
+
+| Setting | Larger-assistant example | Meaning |
+| --- | ---: | --- |
+| `memory.memory_char_limit` | 250000 | Hermes `MEMORY.md` character limit, **not a token limit** |
+| `memory.user_char_limit` | 15000 | Separate Hermes `USER.md` character limit |
+| `MEMORY_ENTRY_TARGET` | 200 | Desired Dreamweave projection entry count |
+| `MEMORY_ENTRY_MAX` | 200 | Maximum projection entry count; not total database capacity |
+
+With user approval, configure the **selected Hermes profile**, for example:
+
+```bash
+hermes config set memory.memory_char_limit 250000
+hermes config set memory.user_char_limit 15000
+```
+
+Configure the adapter's projection budget to match the intended entry target/cap, and its
+publication character budget to fit the selected profile; see the adapter guide. Use the
+`MEMORY_ENTRY_*` overrides consistently across a cycle, not only at export. The standard
+engine capacity preset is otherwise unchanged. **200 entries is a cap/target, not a promise
+that every export contains exactly 200**, nor a promise that 200 arbitrarily long entries
+fit the character budget. Retained detail stays in the database for recall.
+
+The larger profile above has been exercised with a 200-entry projection, but is **opt-in**,
+not a universal default. At the rough English-text heuristic of four characters per token,
+250,000 characters is about **62,500 tokens**; actual tokenization depends on the model,
+language and content. Leave room for the conversation, tools, reports, reasoning and output.
+Larger injected memory increases latency, cost and compaction pressure. For a small-context
+model, select a smaller projection and rely more on graph recall. Do not disable compaction
+or silently truncate memory to fit. Judgment and context-compression models are separate
+Hermes settings; verify both are available through the chosen provider.
 
 ### Where data lives (all overridable)
 
 | Env var | Default | What |
 | --- | --- | --- |
-| `AGENT_MEMORY_DIR` | `~/.agent-memory` | per-user data dir (db, model cache, rendered viz) |
+| `DREAM_MEMORY_DIR` (or `AGENT_MEMORY_DIR`) | `~/.dream-memory` | per-user data dir (db, model cache, rendered viz) |
 | `MEMORY_DB` | `<dir>/memory.db` | the SQLite store |
 | `MEMORY_VIZ` | `<dir>/memory-graph.html` | rendered 3D explorer output |
 | `MEMORY_MODEL_CACHE` | `<dir>/model-cache` | embedding model weights |
@@ -167,10 +218,10 @@ node src/dream.js verify-sync   --file snapshot.json   # exit 3 if any memory is
 node src/dream.js dream
 
 # 4. REPORT → HOST JUDGES → APPLY, in this order:
-#    entities, aliases, salience, merges, synthesis
+#    entities, aliases, salience, merges, synthesis, chronicles
 node src/dream.js report-entities --as-of <iso>
 node src/dream.js apply-entities --file decisions.json --as-of <iso>
-#    ...repeat for aliases, salience, merges, synthesis
+#    ...repeat for aliases, salience, merges, synthesis, chronicles
 #    For merges, preserve the report identity:
 #    report-merges -> { report_id, clusters }
 #    apply-merges file -> { report_id, decisions:[...] }
@@ -230,8 +281,12 @@ To wire it into an agent:
 ```
 agent-memory/
   config.js                 # env-overridable paths + model config
-  setup.js                  # one-command bootstrap
+  setup.js                  # host-neutral engine bootstrap
   package.json
+  INSTALL.md                # asks which harness, then routes to its guide
+  harness-adapters/
+    MicrosoftScout/         # Scout installation guide + skill installer
+    hermes-agent/           # Hermes installer, transport, judged-cycle helper + tests
   src/
     dream.js                # the consolidation engine (all subcommands)
     recall.js               # vector + graph recall (read path) — temporal parsing/tokenization via langsvc

@@ -1,6 +1,10 @@
 # dependencies
 node_modules/
 
+# Python adapter bytecode — never package local paths/caches
+__pycache__/
+*.py[cod]
+
 # per-user runtime data (db, model cache, rendered viz) — never commit
 /data/
 *.db

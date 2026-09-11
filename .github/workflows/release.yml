@@ -1,8 +1,8 @@
 name: Release package
 
 # Builds a downloadable, source-only install zip that a user can unzip and
-# hand to their OpenClaw/Scout agent ("import this") — the agent follows
-# INSTALL.md, runs `npm install && npm run setup`, and wires up the skills.
+# hand to their Microsoft Scout or Hermes agent ("import this") — the agent follows
+# INSTALL.md, selects the target harness, and follows its adapter guide.
 #
 # The zip is intentionally source-only: the native deps (better-sqlite3,
 # sqlite-vec) are platform/arch/Node-version specific and are built by the
@@ -39,11 +39,19 @@ jobs:
           node-version: "20"
           cache: npm
 
+      - name: Setup Python for the Hermes adapter
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install dependencies
         run: npm ci
 
       - name: Smoke test (native build + engine)
         run: npm test
+
+      - name: Hermes adapter regressions
+        run: npm run test:hermes
 
       - name: Resolve version + package name
         id: ver
@@ -83,7 +91,17 @@ jobs:
             "${NAME}/config.js" \
             "${NAME}/src/dream.js" \
             "${NAME}/skills/dream/SKILL.md" \
-            "${NAME}/skills/graph-recall/SKILL.md"; do
+            "${NAME}/skills/graph-recall/SKILL.md" \
+            "${NAME}/harness-adapters/MicrosoftScout/install.md" \
+            "${NAME}/harness-adapters/MicrosoftScout/scripts/install-skills.js" \
+            "${NAME}/harness-adapters/hermes-agent/install.md" \
+            "${NAME}/harness-adapters/hermes-agent/scripts/install.py" \
+            "${NAME}/harness-adapters/hermes-agent/scripts/dreamweave_harness.py" \
+            "${NAME}/harness-adapters/hermes-agent/scripts/dreamweave.py" \
+            "${NAME}/harness-adapters/hermes-agent/scripts/adapter-snapshot.js" \
+            "${NAME}/harness-adapters/hermes-agent/skills/graph-recall/SKILL.md" \
+            "${NAME}/harness-adapters/hermes-agent/skills/dream/references/nightly-harness.md" \
+            "${NAME}/harness-adapters/hermes-agent/skills/dream/SKILL.md"; do
             if ! unzip -l "${NAME}.zip" | grep -qE " ${f}\$"; then
               echo "::error::missing required file in package: ${f}"
               exit 1
@@ -107,9 +125,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NOTES="Download **${{ env.ZIP }}** below, unzip it, and tell your OpenClaw/Scout (Clawpilot) agent to *import this* — it will detect \`INSTALL.md\` and set everything up (\`npm install && npm run setup\`, install the \`dream\` + \`graph-recall\` skills, then interview you on the five behavioral knobs).
+          NOTES="Download **${{ env.ZIP }}** below, unzip it, and tell your Microsoft Scout or Hermes Agent assistant to *import this* — it will detect \`INSTALL.md\`, confirm the harness, follow its adapter installer, and interview you on the four behavioral knobs.
 
-          **Prerequisites:** Node >= 18, and a toolchain that can build \`better-sqlite3\` (prebuilt binaries cover most platforms). First run downloads a small embedding model once, then works offline.
+          **Prerequisites:** Node >= 20 (current LTS recommended), Python >= 3.11 for Hermes (POSIX), and a toolchain that can build \`better-sqlite3\` (prebuilt binaries cover most platforms). First run downloads a small embedding model once, then works offline.
 
           Source-only by design: native deps are built by your \`npm install\`."
 
