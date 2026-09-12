@@ -242,9 +242,9 @@ node src/dream.js export-viz          # renders $MEMORY_VIZ
 Helpers: `node src/dream.js stats` · `budget` (entry-count pressure + forecast) · `init` (just create
 the db).
 
-See **`skills/dream/SKILL.md`** for the full algorithm (strength model, schema-accelerated
-consolidation, the projection budget, salience rules) and **`skills/graph-recall/SKILL.md`** for the
-recall contract. Those two files are the agent-facing instructions.
+See **`docs/JUDGMENT-SURFACES.md`** for the host-neutral report/judgment/apply contract.
+Runnable `dream` and `graph-recall` skills belong to the selected host adapter; the repository
+root deliberately exports no globally named skills.
 
 ---
 
@@ -265,14 +265,13 @@ to force a theme.
 The engine is **host-agnostic** — it only reads a snapshot JSON and writes an inject-ready export.
 To wire it into an agent:
 
-1. **Install the two skills.** Point your agent at `skills/dream/` and `skills/graph-recall/`
-   (copy or symlink into wherever it loads skills from). They reference the engine as
-   `node <AGENT_MEMORY>/src/dream.js` / `src/recall.js`.
-2. **Map the memory tools.** The dream algorithm uses three host operations — *list all memories*,
-   *add a memory*, *remove a memory*. Substitute your agent's equivalents (the SKILL.md uses Microsoft
-   Scout's `m_list_memories` / `m_remember` / `m_forget` as the reference).
-3. **Schedule it.** Run the nightly loop on a timer (cron / the agent's scheduler).
-4. **Co-locate data** via `AGENT_MEMORY_DIR` if you want the store beside the agent's other state.
+1. **Select a host adapter.** Install its own `dream` and `graph-recall` skills. Do not install
+   another adapter's same-named skills into the same namespace. The adapter binds the
+   host-neutral engine contract to that harness's transport, projection, and tool model.
+2. **Follow that adapter's guide.** It owns memory transport, projection, skill installation,
+   scheduling, and host-specific safety gates. For a new harness, implement these against the
+   engine's snapshot/export interface and the canonical judgment contract.
+3. **Co-locate data** via `AGENT_MEMORY_DIR` if you want the store beside the agent's other state.
 
 ---
 
@@ -285,8 +284,8 @@ agent-memory/
   package.json
   INSTALL.md                # asks which harness, then routes to its guide
   harness-adapters/
-    MicrosoftScout/         # Scout installation guide + skill installer
-    hermes-agent/           # Hermes installer, transport, judged-cycle helper + tests
+    MicrosoftScout/         # Scout installation guide, installer, dream + recall skills
+    hermes-agent/           # Hermes installer, transport, dream + recall skills, helper + tests
   src/
     dream.js                # the consolidation engine (all subcommands)
     recall.js               # vector + graph recall (read path) — temporal parsing/tokenization via langsvc
@@ -302,9 +301,8 @@ agent-memory/
   viz/
     graph-store-visualization.html   # explorer template (empty data line)
     lib-3d-force-graph.min.js        # vendored 3D engine (MIT)
-  skills/
-    dream/SKILL.md          # nightly consolidation instructions (agent-facing)
-    graph-recall/SKILL.md   # recall instructions (agent-facing)
+  docs/
+    JUDGMENT-SURFACES.md    # canonical host-neutral report/judge/apply contract
 ```
 
 ---

@@ -1,13 +1,13 @@
 # Projection sync — writing the consolidated db back into the harness
 
-This is the runbook the **host LLM** (Clawpilot / Scout / any caller) follows for **stage 7 (PROJECT)**
+This is the runbook the **Microsoft Scout caller LLM** follows for **stage 7 (PROJECT)**
 of the nightly dream: reconcile the flat harness memory with the engine's consolidated projection, and
 teach the db the harness ids it assigns. It is the step that finally produces a **non-zero diff** once
 consolidation is routed through `apply-*` (see `SKILL.md` stage 5).
 
 > All engine calls: `node <AGENT_MEMORY>/src/dream.js <cmd>` with `AGENT_MEMORY_DIR` pointing at the live
-> data dir (default `~/.dream-memory`). Host memory ops are shown as `m_list_memories` / `m_remember` /
-> `m_forget` — substitute your host's equivalents.
+> data dir (default `~/.dream-memory`). Scout memory operations are
+> `m_list_memories` / `m_remember` / `m_forget`.
 
 ## Mental model
 - **The db is the source of truth. The harness is a disposable projection of it.** After consolidation,

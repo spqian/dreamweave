@@ -90,10 +90,12 @@ jobs:
             "${NAME}/setup.js" \
             "${NAME}/config.js" \
             "${NAME}/src/dream.js" \
-            "${NAME}/skills/dream/SKILL.md" \
-            "${NAME}/skills/graph-recall/SKILL.md" \
+            "${NAME}/docs/JUDGMENT-SURFACES.md" \
             "${NAME}/harness-adapters/MicrosoftScout/install.md" \
             "${NAME}/harness-adapters/MicrosoftScout/scripts/install-skills.js" \
+            "${NAME}/harness-adapters/MicrosoftScout/skills/dream/SKILL.md" \
+            "${NAME}/harness-adapters/MicrosoftScout/skills/dream/projection-sync.md" \
+            "${NAME}/harness-adapters/MicrosoftScout/skills/graph-recall/SKILL.md" \
             "${NAME}/harness-adapters/hermes-agent/install.md" \
             "${NAME}/harness-adapters/hermes-agent/scripts/install.py" \
             "${NAME}/harness-adapters/hermes-agent/scripts/dreamweave_harness.py" \

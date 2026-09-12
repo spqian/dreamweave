@@ -454,7 +454,7 @@ class Harness:
         meta = {'surface': surface, 'report_path': str(folder / 'report.json'), 'digest': digest(value),
                 'report_id': value.get('report_id'), 'item_count': len(keys),
                 'review_index': str(folder / 'review-keys.json'), 'chunks': chunks,
-                'schema_path': str(self.engine / 'skills/dream/SKILL.md'), 'schema_lines': '183-335',
+                'schema_path': str(self.engine / 'docs/JUDGMENT-SURFACES.md'), 'schema_lines': '1-end',
                 'as_of': self.state['as_of'], 'manifest_path': str(folder / 'manifest.json')}
         save(folder / 'manifest.json', meta)
         return meta

@@ -47,7 +47,8 @@ Its direct equivalent, also from the repository root, is:
 node harness-adapters/MicrosoftScout/scripts/install-skills.js
 ```
 
-The explicit Scout installer copies `skills/dream/` and `skills/graph-recall/` (including
+The explicit Scout installer copies `harness-adapters/MicrosoftScout/skills/dream/` and
+`harness-adapters/MicrosoftScout/skills/graph-recall/` (including
 supporting Markdown files) into Scout's skills directory and replaces `<AGENT_MEMORY>` with
 the absolute repository root, using forward slashes. Discovery checks existing
 `~/.copilot/m-skills/` then `~/.scout/m-skills/`; if neither exists, it creates `m-skills/`

@@ -215,6 +215,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(result['digest'], self.h.digest(report))
         self.assertEqual(result['item_count'], 0)
         self.assertTrue(Path(result['schema_path']).is_file())
+        self.assertEqual(Path(result['schema_path']), self.runner.engine / 'docs/JUDGMENT-SURFACES.md')
         self.assertTrue(Path(result['review_index']).is_file())
         with self.assertRaises(self.h.Refused):
             self.runner.run('report', surface='salience')

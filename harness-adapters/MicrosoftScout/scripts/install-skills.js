@@ -9,6 +9,26 @@ const os = require("node:os");
 const ENGINE_ROOT = path.resolve(__dirname, "../../..");
 const SKILLS = ["dream", "graph-recall"];
 
+function resolveProspectivePath(target) {
+  let cursor = path.resolve(target);
+  const missing = [];
+  for (;;) {
+    const entry = fs.lstatSync(cursor, { throwIfNoEntry: false });
+    if (entry) return path.join(fs.realpathSync(cursor), ...missing);
+    const parent = path.dirname(cursor);
+    if (parent === cursor) throw new Error(`Cannot resolve install target: ${target}`);
+    missing.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+}
+
+function assertOutsideSource(sourceRoot, target) {
+  const relative = path.relative(sourceRoot, target);
+  if (!relative || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(".." + path.sep))) {
+    throw new Error("The install target must not be inside the package's source skills directory");
+  }
+}
+
 function installSkills({
   target = process.env.SCOUT_SKILLS_DIR, home = os.homedir(),
   engineRoot = ENGINE_ROOT, force = false,
@@ -23,14 +43,10 @@ function installSkills({
     }
   }
   if (!target) throw new Error("no ~/.copilot or ~/.scout directory found; set SCOUT_SKILLS_DIR to the intended Microsoft Scout skills directory");
-  const dir = path.resolve(target);
+  let dir = resolveProspectivePath(target);
   const engine = path.resolve(engineRoot).replace(/\\/g, "/");
-  const sourceRoot = fs.realpathSync(path.join(engineRoot, "skills"));
-  const resolvedTarget = fs.existsSync(dir) ? fs.realpathSync(dir) : dir;
-  const relative = path.relative(sourceRoot, resolvedTarget);
-  if (!relative || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(".." + path.sep))) {
-    throw new Error("The install target must not be inside the package's source skills directory");
-  }
+  const sourceRoot = fs.realpathSync(path.join(engineRoot, "harness-adapters/MicrosoftScout/skills"));
+  assertOutsideSource(sourceRoot, dir);
   // Check every destination before writing either skill.
   const existing = SKILLS.filter((skill) => fs.lstatSync(path.join(dir, skill), { throwIfNoEntry: false }));
   if (existing.length && !force) {
@@ -39,7 +55,7 @@ function installSkills({
   // Read every shipped file before changing destinations, so an incomplete
   // package cannot displace a working customized installation.
   const bundles = SKILLS.map((skill) => {
-    const source = path.join(engineRoot, "skills", skill);
+    const source = path.join(sourceRoot, skill);
     const files = fs.readdirSync(source).map((name) => {
       let content = fs.readFileSync(path.join(source, name));
       if (name.toLowerCase().endsWith(".md")) {
@@ -50,6 +66,8 @@ function installSkills({
     return { skill, files };
   });
   fs.mkdirSync(dir, { recursive: true });
+  dir = fs.realpathSync(dir);
+  assertOutsideSource(sourceRoot, dir);
   let backup = null;
   if (existing.length) {
     backup = fs.mkdtempSync(path.join(dir, ".dreamweave-backup-"));

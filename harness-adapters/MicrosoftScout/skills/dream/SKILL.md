@@ -52,7 +52,11 @@ Important flags verified against `src/dream.js`:
 - `export-harness [--as-of <iso>]`
 - `record-projection --file <projection.json>`
 
-> **Host-agent integration.** This skill is host-agnostic. The only host-specific pieces are the memory read/write calls in the nightly algorithm below — shown here as `m_list_memories` / `m_remember` / `m_forget` (Microsoft Scout's tools). On another agent, substitute the equivalent "dump all memories to JSON" and "add/remove a memory" operations. The engine itself only reads snapshot JSON (`[{ id, fact, category }]`) and writes an inject-ready export; it never calls the host directly.
+> **Microsoft Scout integration.** This adapter skill uses Scout's
+> `m_list_memories` / `m_remember` / `m_forget` operations. Other harnesses must
+> install their own adapter skill rather than loading this same-named Scout skill.
+> The engine itself only reads snapshot JSON (`[{ id, fact, category }]`) and
+> writes an inject-ready export; it never calls Scout directly.
 
 ### Path and configuration resolution
 `config.js` is authoritative:

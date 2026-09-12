@@ -71,8 +71,9 @@ test("CLI help and unknown arguments never perform installation", (t) => {
 test("incomplete source package fails before moving customized skills", (t) => {
   const f = fixture(t);
   const engineRoot = path.join(f.dir, "incomplete engine");
-  fs.mkdirSync(path.join(engineRoot, "skills", "dream"), { recursive: true });
-  fs.writeFileSync(path.join(engineRoot, "skills", "dream", "SKILL.md"), "<AGENT_MEMORY>");
+  const sourceRoot = path.join(engineRoot, "harness-adapters/MicrosoftScout/skills");
+  fs.mkdirSync(path.join(sourceRoot, "dream"), { recursive: true });
+  fs.writeFileSync(path.join(sourceRoot, "dream", "SKILL.md"), "<AGENT_MEMORY>");
   fs.mkdirSync(path.join(f.target, "dream"), { recursive: true });
   fs.writeFileSync(path.join(f.target, "dream", "SKILL.md"), "custom dream");
   assert.throws(() => installSkills({ target: f.target, home: f.home, engineRoot, force: true }), /ENOENT/);
@@ -83,12 +84,28 @@ test("incomplete source package fails before moving customized skills", (t) => {
 test("a forced install cannot replace the package's source skills", (t) => {
   const f = fixture(t);
   const engineRoot = path.join(f.dir, "engine");
-  fs.cpSync(path.join(root, "skills"), path.join(engineRoot, "skills"), { recursive: true });
-  const target = path.join(engineRoot, "skills");
+  const source = path.join(root, "harness-adapters/MicrosoftScout/skills");
+  const target = path.join(engineRoot, "harness-adapters/MicrosoftScout/skills");
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.cpSync(source, target, { recursive: true });
   const before = fs.readFileSync(path.join(target, "dream", "SKILL.md"), "utf8");
   assert.throws(() => installSkills({ target, engineRoot, home: f.home, force: true }), /source skills/);
   assert.equal(fs.readFileSync(path.join(target, "dream", "SKILL.md"), "utf8"), before);
   assert.deepEqual(fs.readdirSync(target).sort(), ["dream", "graph-recall"]);
+});
+
+test("a nonexistent target beneath a symlink cannot enter source skills", (t) => {
+  const f = fixture(t);
+  const engineRoot = path.join(f.dir, "engine");
+  const source = path.join(root, "harness-adapters/MicrosoftScout/skills");
+  const sourceRoot = path.join(engineRoot, "harness-adapters/MicrosoftScout/skills");
+  fs.mkdirSync(path.dirname(sourceRoot), { recursive: true });
+  fs.cpSync(source, sourceRoot, { recursive: true });
+  const link = path.join(f.dir, "source-link");
+  fs.symlinkSync(sourceRoot, link, "dir");
+  const target = path.join(link, "nested-install");
+  assert.throws(() => installSkills({ target, engineRoot, home: f.home, force: true }), /source skills/);
+  assert.equal(fs.existsSync(path.join(sourceRoot, "nested-install")), false);
 });
 
 test("a pinned destination wins over discovery and never falls back on error", (t) => {
@@ -137,6 +154,17 @@ test("Scout guide preserves the interview and later host setup steps", () => {
   assert.equal(require("../package.json").scripts["setup:scout"], "node harness-adapters/MicrosoftScout/scripts/install-skills.js");
 });
 
+test("host skill bundles are owned by their adapters, not the repository root", () => {
+  for (const skill of ["dream", "graph-recall"]) {
+    assert.equal(fs.existsSync(path.join(root, "skills", skill)), false,
+      `root skill namespace must not contain ${skill}`);
+    assert.equal(fs.existsSync(path.join(root, "harness-adapters/MicrosoftScout/skills", skill, "SKILL.md")), true,
+      `Microsoft Scout must own its ${skill} skill`);
+    assert.equal(fs.existsSync(path.join(root, "harness-adapters/hermes-agent/skills", skill, "SKILL.md")), true,
+      `Hermes Agent must own its ${skill} skill`);
+  }
+});
+
 function cli(f, args = []) {
   return spawnSync(process.execPath, [script, ...args], {
     cwd: f.dir,
@@ -150,9 +178,10 @@ test("explicit Scout install copies both skills and substitutes absolute engine 
   const result = cli(f);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(fs.readdirSync(f.target).sort(), ["dream", "graph-recall"]);
+  const sourceRoot = path.join(root, "harness-adapters/MicrosoftScout/skills");
   for (const skill of ["dream", "graph-recall"]) {
-    for (const file of fs.readdirSync(path.join(root, "skills", skill))) {
-      const source = fs.readFileSync(path.join(root, "skills", skill, file), "utf8");
+    for (const file of fs.readdirSync(path.join(sourceRoot, skill))) {
+      const source = fs.readFileSync(path.join(sourceRoot, skill, file), "utf8");
       const installed = fs.readFileSync(path.join(f.target, skill, file), "utf8");
       assert.equal(installed, source.split("<AGENT_MEMORY>").join(root.replace(/\\/g, "/")));
     }
