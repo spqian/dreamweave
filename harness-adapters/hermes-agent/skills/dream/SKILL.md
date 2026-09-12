@@ -52,6 +52,13 @@ decisions, blanket approvals, generic declines or boilerplate rationales.
 - Use the exact report's schema and index; aliases are a bare array and salience
   uses `salient`/`downgrade`. Neither has a report_id.
 - Preserve explicit deferrals instead of forcing uncertain identity changes.
+- Assemble entity mutations by hub, not by fact mention: collapse repeated mentions
+  of the same exact sig into one decision. A hub audited `defer` must be absent from
+  every create, augment and retype target so deferral leaves it untouched.
+- Before the first `apply`, deterministically preflight the caller-authored files for
+  unique entity sigs, no deferred mutation targets, exact audit-key coverage, and
+  exact chronicle member coverage. Validation may organize and hash explicit caller
+  judgments, but must never choose or infer them.
 - Synthesis is bounded to three accepted turns; chronicles to three accepted
   periods, with one full candidate per report. State residual backlog honestly.
 - Treat every nonzero exit (including 3), `complete:false`, rejected result or

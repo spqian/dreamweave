@@ -209,6 +209,10 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
          hub's own base/full-phrase form — that requires `retype`/`reject` instead); only
          facts that matched solely via the removed alias lose their mention edge.
      decision file: `{report_id, decisions:[{sig, type, forms:[...]}], hub_reviews:[{sig, action, ...}]}`
+     `decisions[]` is keyed by entity hub sig, not by source fact. If several facts
+     mention the same entity, emit one consolidated create/augment decision for that
+     exact sig, combining only caller-approved forms. Duplicate decisions for a sig
+     are invalid and reject the apply.
      (the legacy bare array `[{sig,type,forms}]` — entity **create/augment only**, no hub
      review — is still accepted unchanged). `apply-entities` is atomic on the hub-review half:
      any stale `report_id` or invalid `hub_reviews` entry (unknown sig, bad action/type/forms)

@@ -76,6 +76,16 @@ Exactly one audit review for **every** index key; omissions, unknown keys and du
 
 Use canonical schema documentation for nested fields. No legacy/silent-sanitization payload forms are accepted. Empty decision arrays are legal only with complete explicit audited review or truly empty input. Empty entities fact decisions do not excuse unreviewed hubs. When samples are unrelated, incomplete or ambiguous, explicitly audit `defer` and omit that hub from engine hub_reviews; do not force keep/reject/retype or stop the whole cycle. Deferred identities are left unchanged and reported under pending.entities. This is not a certification that those identities are correct. Salience remains sparse; do not manufacture scores for a quota. Audit and payload digests bind a specific judgment to its evidence and submitted action.
 
+Assemble entity mutations at **hub granularity**, not fact-mention granularity.
+Several reviewed facts may name the same hub; collapse them into one create/augment
+decision for that exact sig, combining only caller-approved forms. Before the first
+`apply`, run a deterministic consistency preflight over the caller-authored payload
+and audit: entity mutation sigs must be unique, deferred hubs must be absent from the
+complete mutation footprint (including retype targets), audit keys must exactly equal
+the review index, and chronicle evidence sigs must exactly cover the candidate member
+set. The preflight may validate, organize, serialize and hash explicit judgments; it
+must not infer entity types, actions, scores, merges or narratives.
+
 ## Bounded loops and completion
 
 An audit outcome of `defer` must not target a mutation in the same apply. Omit
@@ -96,6 +106,11 @@ structural entity work in that payload is refused conservatively because reweavi
 could affect that fact. Reconcile the evidence rather than relabeling the deferral
 to bypass validation. Other audit outcomes remain unchanged; sparse judgments and
 unrelated permitted actions are not forced into a new outcome vocabulary.
+
+Duplicate entity mutations are also invalid even when they came from different
+reviewed facts: one hub sig receives at most one create/augment decision. Deduplicate
+before hashing and submission; do not rely on the rejected apply as normal control
+flow.
 
 - Synthesis loops until an accepted turn creates zero concepts, no candidates remain, or three accepted turns have occurred. Residual pools are recorded, not called cleared.
 - Chronicle report **and apply** always use `--max-candidates 1`, never force-resummarization. Process at most **three accepted periods** per cycle. The engine's ordering selects the current candidate; preserve its complete dated evidence coverage. Re-report after each accepted apply. After three periods, or no remaining candidates, mark the stage done and record residual backlog. `has_more:true` with `observed_pending_minimum:1` is a lower bound, **not an exact backlog total**.
