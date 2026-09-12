@@ -52,7 +52,11 @@ Important flags verified against `src/dream.js`:
 - `export-harness [--as-of <iso>]`
 - `record-projection --file <projection.json>`
 
-> **Host-agent integration.** This skill is host-agnostic. The only host-specific pieces are the memory read/write calls in the nightly algorithm below — shown here as `m_list_memories` / `m_remember` / `m_forget` (Microsoft Scout's tools). On another agent, substitute the equivalent "dump all memories to JSON" and "add/remove a memory" operations. The engine itself only reads snapshot JSON (`[{ id, fact, category }]`) and writes an inject-ready export; it never calls the host directly.
+> **Microsoft Scout integration.** This adapter skill uses Scout's
+> `m_list_memories` / `m_remember` / `m_forget` operations. Other harnesses must
+> install their own adapter skill rather than loading this same-named Scout skill.
+> The engine itself only reads snapshot JSON (`[{ id, fact, category }]`) and
+> writes an inject-ready export; it never calls Scout directly.
 
 ### Path and configuration resolution
 `config.js` is authoritative:
@@ -209,6 +213,10 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
          hub's own base/full-phrase form — that requires `retype`/`reject` instead); only
          facts that matched solely via the removed alias lose their mention edge.
      decision file: `{report_id, decisions:[{sig, type, forms:[...]}], hub_reviews:[{sig, action, ...}]}`
+     `decisions[]` is keyed by entity hub sig, not by source fact. If several facts
+     mention the same entity, emit one consolidated create/augment decision for that
+     exact sig, combining only caller-approved forms. Duplicate decisions for a sig
+     are invalid and reject the apply.
      (the legacy bare array `[{sig,type,forms}]` — entity **create/augment only**, no hub
      review — is still accepted unchanged). `apply-entities` is atomic on the hub-review half:
      any stale `report_id` or invalid `hub_reviews` entry (unknown sig, bad action/type/forms)

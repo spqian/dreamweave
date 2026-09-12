@@ -124,10 +124,10 @@ if (!(dispersed.mean_pairwise_cosine < collapsed.mean_pairwise_cosine)) {
 }
 db.close();
 
-// --- 4. the judge contract must ask for a retrieval surface --------------------
-const skill = fs.readFileSync(path.join(__dirname, "..", "skills", "dream", "SKILL.md"), "utf8");
-const chronicleSection = skill.slice(skill.indexOf("- **chronicles**"), skill.indexOf("Apply commands validate"));
-if (!chronicleSection) fail("could not locate the chronicles section of SKILL.md");
+// --- 4. the canonical judge contract must ask for a retrieval surface ----------
+const contract = fs.readFileSync(path.join(__dirname, "..", "docs", "JUDGMENT-SURFACES.md"), "utf8");
+const chronicleSection = contract.slice(contract.indexOf("- **chronicles**"), contract.indexOf("Apply commands validate"));
+if (!chronicleSection) fail("could not locate the chronicles section of JUDGMENT-SURFACES.md");
 const required = [
   [/retrieval surface/i, "summary is not described as the retrieval surface it is embedded into"],
   [/when did .{0,20}first/i, "contract does not mention the \"when did X first\" query it must answer"],
