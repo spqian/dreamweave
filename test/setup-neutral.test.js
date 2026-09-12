@@ -87,3 +87,11 @@ test("shared bootstrap directs host integration to the adapter router", async (t
   assert.match(output, /INSTALL\.md.*adapter/);
   assert.doesNotMatch(output, /skills\/dream\/SKILL\.md/);
 });
+
+test("adapter router uses the known current harness and asks only when uncertain", () => {
+  const install = fs.readFileSync(path.join(root, "INSTALL.md"), "utf8");
+  assert.match(install, /current live runtime.*select.*adapter/is);
+  assert.match(install, /ask.*only.*uncertain|only.*ask.*uncertain/is);
+  assert.doesNotMatch(install, /Ask the user \*\*which harness they want to install into\*\*/);
+  assert.match(install, /existing `.copilot`,\s*`.scout` or `.hermes` directory.*not sufficient/is);
+});

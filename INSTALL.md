@@ -4,19 +4,24 @@ This is the entry point for an assistant asked to **“import this”** or **“
 Dreamweave's engine is host-independent; installation, memory transport, skills and
 scheduling are specific to the target harness.
 
-## 1. Confirm the target harness
+## 1. Select the target harness
 
-Ask the user **which harness they want to install into**:
+The assistant running this installer normally already knows its harness from the
+current live runtime and tool contract. When that runtime clearly identifies one
+of the supported harnesses, select its adapter directly without asking:
 
 - **Microsoft Scout** → [Microsoft Scout installation](harness-adapters/MicrosoftScout/install.md)
 - **Hermes Agent** → [Hermes Agent installation](harness-adapters/hermes-agent/install.md)
 
-If the user already specified the target, use that answer without asking again.
-Runtime information may suggest a default, but the current assistant's harness is
-not necessarily the user's installation target. Do not infer the answer merely
-from an existing `.copilot`, `.scout` or `.hermes` directory. If neither adapter
-matches, stop and explain the [host integration contract](README.md#integrating-with-a-host-agent)
-rather than applying another harness's instructions.
+An explicit user-specified target overrides the current runtime. Ask the user only
+when the target is genuinely uncertain—for example, the runtime identity is absent
+or ambiguous, the user is preparing an installation for another machine, or their
+request conflicts with the current harness. The presence of an existing `.copilot`,
+`.scout` or `.hermes` directory is not sufficient evidence by itself.
+
+If neither adapter matches after resolving genuine uncertainty, stop and explain
+the [host integration contract](README.md#integrating-with-a-host-agent) rather than
+applying another harness's instructions.
 
 ## 2. Read and follow the selected guide
 

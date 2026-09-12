@@ -99,7 +99,8 @@ most platforms; otherwise you need Python + a C++ compiler).
 
 Grab the latest `dreamweave-vX.Y.Z.zip` from the [**Releases**](https://github.com/spqian/dreamweave/releases)
 page, unzip it, and tell your assistant to *"import this"*. The root
-[`INSTALL.md`](INSTALL.md) first confirms the target harness, then follows its adapter guide.
+[`INSTALL.md`](INSTALL.md) uses the current runtime's known harness, asks only when
+that identity is uncertain, and then follows the selected adapter guide.
 Older release zips may predate the Hermes adapter; use a checkout or release containing
 `harness-adapters/hermes-agent/`. Shared engine bootstrap can also be run by hand:
 
@@ -282,7 +283,7 @@ agent-memory/
   config.js                 # env-overridable paths + model config
   setup.js                  # host-neutral engine bootstrap
   package.json
-  INSTALL.md                # asks which harness, then routes to its guide
+  INSTALL.md                # selects the known harness; asks only if uncertain
   harness-adapters/
     MicrosoftScout/         # Scout installation guide, installer, dream + recall skills
     hermes-agent/           # Hermes installer, transport, dream + recall skills, helper + tests
